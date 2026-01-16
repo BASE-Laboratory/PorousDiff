@@ -1,0 +1,17 @@
+name: porousdiff
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch=2.1
+  - torchvision
+  - pytorch-cuda=12.1
+  - pip
+  - pip:
+      - monai-generative 
+      - hydra-core
+      - wandb
+      - porespy
+      - zarr
