@@ -228,3 +228,101 @@ Next Steps:
 - Compare generated slices with original slices.
 - Scale training to multiple materials.
 - Investigate streaking artifacts reported in diffusion literature.
+
+
+## Experiment 10: Improved 3D DDPM Architecture
+
+Objective:
+
+- Investigate whether modifying the 3D DDPM architecture reduces the horizontal streaking artifacts observed in the baseline TiO₂ DDPM outputs.
+
+Initial Architecture Attempt:
+
+- A larger DDPM architecture was first tested using increased channel width and additional attention:
+
+```python
+num_channels = (64, 128, 256)
+attention_levels = (False, True, True)
+num_res_blocks = 2
+````
+
+- This configuration failed due to CUDA out-of-memory on the NVIDIA GH200 GPU.
+- The failure indicates that 3D diffusion models with high channel widths and attention layers are memory-intensive, even on high-memory accelerators.
+
+Final Tested Architecture:
+
+- To reduce memory cost, the original channel widths were retained.
+- Network depth was increased by changing `num_res_blocks` from 1 to 2.
+- Patch size remained 64×64×64.
+- Dataset size remained approximately 1200 TiO₂ patches.
+- Diffusion schedule, optimizer, learning rate, and training duration were kept the same as the baseline model.
+
+Model Configuration:
+
+```python
+num_channels = (32, 64, 128)
+attention_levels = (False, False, True)
+num_res_blocks = 2
+```
+
+Training Results:
+
+- Training completed successfully for 100 epochs.
+- Final average loss: 0.001562.
+- Checkpoints were saved every 10 epochs.
+- Generated 20 synthetic samples for qualitative evaluation.
+
+Observations:
+
+- Horizontal streaking artifacts remained visible in the generated samples.
+- Generated structures appeared smoother and blurrier than the baseline DDPM outputs.
+- Increasing residual depth alone did not improve the reproduction of elongated TiO₂ particle morphology.
+- The generated samples appeared to capture low-frequency intensity bands rather than fine microstructural geometry.
+- The result suggests that model depth alone is not the primary factor causing the artifact.
+
+Conclusion:
+
+- Increasing `num_res_blocks` from 1 to 2 was insufficient to reduce horizontal streaking.
+- A larger channel-width model with additional attention was not feasible due to GPU memory limitations.
+- These results suggest that the main bottleneck may be related to patch size, dataset diversity, preprocessing strategy, or the training data itself rather than only network depth.
+- Future experiments will focus on training separate and combined TiO₂ datasets, followed by multi-material training to investigate whether increased data diversity reduces the artifact.
+
+
+## Experiment 11: Baseline DDPM on Op026mVV
+
+Objective:
+
+- Evaluate whether a different TiO₂ tomography dataset exhibits the same generation artifacts observed in Op001mVV.
+
+Dataset:
+
+- Op026mVV TiO₂
+- 800 TIFF slices
+- ~1200 patches
+- Patch size: 64×64×64
+
+Model:
+
+- Baseline DDPM
+- num_channels=(32,64,128)
+- num_res_blocks=1
+- 100 epochs
+
+Training Results:
+
+- Final average loss ≈ 0.0028
+- Stable convergence throughout training
+- Checkpoints saved every 10 epochs
+
+Observations:
+
+- Horizontal streaking artifacts were reduced compared with Op001.
+- Generated samples appeared more isotropic and blob-like.
+- Fine microstructural details remained absent.
+- Samples remained blurry and lacked clear particle boundaries.
+
+Conclusion:
+
+- Dataset characteristics appear to influence generated morphology.
+- Artifact reduction was achieved without architectural changes.
+- Results suggest data diversity may have greater impact than increasing network depth.
