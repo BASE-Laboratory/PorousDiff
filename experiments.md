@@ -326,3 +326,105 @@ Conclusion:
 - Dataset characteristics appear to influence generated morphology.
 - Artifact reduction was achieved without architectural changes.
 - Results suggest data diversity may have greater impact than increasing network depth.
+
+## Experiment 12: Binary 3D DDPM on Op001mVV — 64³
+
+**Status:** Completed — preliminary physical evaluation
+
+### Objective
+Investigate whether binary segmentation improves 3D diffusion generation compared with the earlier grayscale experiments.
+
+### Dataset and preprocessing
+- Material: TiO₂ (Op001mVV)
+- Input: 800 XCT TIFF slices
+- Background correction: Gaussian filtering (sigma = 30)
+- Intensity normalization: percentile clipping (1st–99th)
+- Segmentation: Otsu thresholding
+- Binary convention: 1 = solid, 0 = pore
+- Patch size: 64 × 64 × 64
+- Training patches: 960
+- Validation patches: 240
+
+### Model and training
+- Architecture: MONAI DiffusionModelUNet
+- Channels: (32, 64, 128)
+- Attention levels: (False, False, True)
+- Residual blocks: 1
+- Diffusion timesteps: 1000
+- Optimizer: AdamW
+- Learning rate: 0.0001
+- Batch size: 1
+- Training epochs: 100
+
+### Results
+- Final training loss: 0.004893
+- Final validation loss: 0.003762
+- Generated samples evaluated: 10
+- Mean real training-patch solid fraction: 0.1318
+- Mean generated solid fraction: 0.3948
+
+### Observations
+- The model completed 100 epochs and generated binary 3D volumes.
+- Generated samples substantially overestimated the solid fraction.
+- Preliminary morphological comparisons indicated differences in spatial structure and connectivity.
+- Low noise-prediction loss did not guarantee physically representative microstructures.
+
+### Conclusion
+Binary segmentation enabled a more direct comparison of pore and solid phases, but the generated volumes did not reproduce the training solid-fraction distribution.
+
+Physical fidelity remains insufficient for claiming realistic digital twins.
+
+
+## Experiment 13: Binary 3D DDPM on Op001mVV — 96³
+
+**Status:** Completed — preliminary physical evaluation
+
+### Objective
+Investigate whether increasing patch size from 64³ to 96³ improves the fidelity of binary 3D microstructure generation.
+
+### Dataset
+- Material: TiO₂ (Op001mVV)
+- Input: 800 segmented XCT TIFF slices
+- Patch size: 96 × 96 × 96
+- Training patches: 960
+- Validation patches: 240
+- Binary convention: 1 = solid, 0 = pore
+
+### Model and training
+- Architecture: MONAI DiffusionModelUNet
+- Channels: (32, 64, 128)
+- Attention levels: (False, False, True)
+- Residual blocks: 1
+- Diffusion timesteps: 1000
+- Optimizer: AdamW
+- Learning rate: 0.0001
+- Batch size: 1
+- Training epochs: 100
+- GPU: NVIDIA GH200
+
+### Results
+- Final training loss: 0.003370
+- Final validation loss: 0.003983
+- Training duration: approximately 9 hours 46 minutes
+- Generated samples evaluated: 10
+- Mean real training-patch solid fraction: 0.0984
+- Mean generated solid fraction: 0.2806
+- Generated solid-fraction range: 0.0438–0.8830
+
+### Observations
+- Training and inference completed successfully.
+- Generated solid fractions varied substantially across samples.
+- Some generated samples had solid fractions close to the training mean.
+- Real-versus-generated orthogonal views nevertheless showed notable morphological differences, including fragmented solid structures.
+- Larger patch size alone did not resolve physical-fidelity limitations.
+
+### Limitations
+- Only 10 generated volumes were evaluated.
+- The 64³ and 96³ training datasets had different solid-fraction distributions, limiting direct comparison.
+- Full 3D connectivity, spatial-correlation and tortuosity validation remain incomplete.
+- Segmentation quality requires further validation against the original XCT data.
+
+### Conclusion
+Increasing patch size to 96³ was computationally feasible on the GH200 but did not consistently reproduce the physical characteristics of the training microstructures.
+
+Future work will investigate compression-conditioned generation using CuCHF datasets with three experimentally measured load-cell conditions.

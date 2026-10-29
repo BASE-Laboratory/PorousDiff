@@ -1,4 +1,3 @@
-
 #!/bin/bash
 #SBATCH --job-name=op001-patches
 #SBATCH --account=brics.u6uc
