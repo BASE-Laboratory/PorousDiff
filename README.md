@@ -86,28 +86,44 @@ pytest -v
        --datasets tio2_sample_folder cuhcf_sample_folder \
        --auto-multiphase --preview-only
    ```
-2. **Full Multi-Electrode REV Bundle** (`2×` binned `96³` patches + `bundle_manifest.json` + single `.zip` upload archive):
+2. **Full Multi-Electrode REV Bundle** (recursively discovers nested `Virgin/`, `TiO2/Op001mVV`, `CuHCF/` folders, shares lowest-load thresholds per electrode, supports `--resume`, and writes a single `.zip` upload archive):
    ```bash
    python scripts/preprocessing/prepare_local_drive_bundle.py \
        --drive-root "D:/dry_samples" \
        --output-dir "D:/porousdiff_upload_bundle" \
        --auto-multiphase --spatial-bin 2 \
        --voxel-size-um 1.6 --kpa-per-mvv 8500 \
-       --zip
+       --beamline "DLS_I12" --resume --zip
+
+   # Optional: merge a second drive/beamline (e.g. DLS K11 DIAD) into the SAME manifest without overwriting:
+   python scripts/preprocessing/prepare_local_drive_bundle.py \
+       --drive-root "E:/K11_DIAD_samples" \
+       --output-dir "D:/porousdiff_upload_bundle" \
+       --auto-multiphase --auto-calibrate-carbon \
+       --voxel-size-um 0.54 --punch-diameter-mm 10.0 \
+       --beamline "DLS_K11_DIAD" --append --resume --zip
    ```
 
-### 3. Training, Sampling & Beamtime-Multiplier Evaluation (Isambard-AI)
+### 3. Training, Sampling, OpenImpala Transport & DIAD XRD Evaluation (Isambard-AI)
 
 ```bash
-# Milestone 1: Single-material 3-state or Virgin Felt pilot
-sbatch slurm/test_carbon_conditional_96.slurm
-sbatch slurm/train_carbon_conditional_96.slurm
-sbatch slurm/sample_carbon_conditional_96.slurm
-
 # Core Paper Run: Unified Multi-Electrode Beamtime Multiplier (hold out intermediate TiO2 & CuHCF loads,
-# sample all states, and benchmark head-to-head against Affine Z-Squashing & Pillar Pore-Deletion)
+# sample all states, export OpenImpala .tif + INI/batch suite, and benchmark vs. Affine & Pillar Z-Squashing)
 sbatch --export=ALL,EXPERIMENT="beamtime_fewshot_96",HELDOUT_STATES="tio2_0p018mVV tio2_0p033mVV cuhcf_0p018mVV cuhcf_0p033mVV" \
     slurm/run_beamtime_multiplier.slurm
+
+# Run generated OpenImpala continuum diffusion/conduction jobs & aggregate parity plots:
+bash results/beamtime_fewshot_96/beamtime_benchmark/openimpala_suite/run_openimpala_batch.sh
+python scripts/evaluation/parse_openimpala_suite.py \
+    --suite-dir results/beamtime_fewshot_96/beamtime_benchmark/openimpala_suite
+
+# Optional: correlate co-registered DLS K11 DIAD XRD lattice strain / FWHM with 3D EASA & TPB:
+python scripts/evaluation/evaluate_beamtime_multiplier.py \
+    --experiments porousdiff=beamtime_fewshot_96 \
+    --data-root /projects/u6uc/asif/data/beamtime_v03 \
+    --manifest-json /projects/u6uc/asif/data/beamtime_v03/bundle_manifest.json \
+    --include-repeats --beamline DLS_K11_DIAD \
+    --xrd-csv /projects/u6uc/asif/data/diad_xrd_summary.csv
 ```
 
 ---

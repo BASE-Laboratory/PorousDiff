@@ -32,6 +32,7 @@ if str(REPO_ROOT) not in sys.path:
 from porousdiff.preprocessing import (
     CalibrationMetadata,
     build_stratified_patch_plan,
+    calibrate_delta_threshold,
     calibrate_multiphase_thresholds,
     compute_pore_referenced_delta,
     compute_radial_ring_score,
@@ -39,8 +40,10 @@ from porousdiff.preprocessing import (
     downsample_volume_rev,
     enumerate_cylinder_xy_positions,
     infer_material_name,
+    load_overrides_table,
     make_circular_mask,
-    parse_load_value,
+    make_collision_safe_state_name,
+    parse_load_with_unit,
     resolve_tiff_directory,
     segment_slice_multiphase,
     split_z_intervals_with_buffer,
@@ -51,13 +54,9 @@ SPYDER_OUTPUT_DIR = Path("D:/porousdiff_upload_bundle")
 PHASE_CMAP = ListedColormap(["#0b0e14", "#38bdf8", "#facc15"])
 
 
-def _clean_state_name(folder_name: str) -> str:
-    return folder_name.strip().rstrip("_")
-
-
-def _is_repeat_or_secondary(folder_name: str) -> bool:
-    low = folder_name.lower()
-    return ("rep" in low) or ("virgin_2" in low) or ("sample2" in low)
+def _is_repeat_or_secondary(folder_or_path: str) -> bool:
+    low = folder_or_path.lower()
+    return ("rep" in low) or ("virgin_2" in low) or ("sample2" in low) or ("diad" in low and "rep" in low)
 
 
 def _save_multiphase_preview(
@@ -161,29 +160,62 @@ def _save_z_plot(
     plt.close(fig)
 
 
-def discover_scan_folders(drive_root: Path) -> list[Path]:
+def _clean_ref_indices(num_files: int) -> list[int]:
+    """Select clean upper-middle Z slice indices (`20%`, `32%`, `45%`) avoiding top edge & bottom plunger."""
+    if num_files <= 3:
+        return list(range(num_files))
+    raw = [int(0.20 * num_files), int(0.32 * num_files), int(0.45 * num_files)]
+    return sorted({min(max(0, i), num_files - 1) for i in raw})
+
+
+def discover_scan_folders(
+    drive_root: Path,
+    max_depth: int = 3,
+    overrides: dict[str, tuple[float, str]] | None = None,
+) -> list[Path]:
+    """Recursively discover XCT scan folders up to `max_depth` levels under `drive_root`."""
     candidates: list[Path] = []
-    for entry in sorted(drive_root.iterdir()):
-        if not entry.is_dir():
-            continue
-        try:
-            resolve_tiff_directory(entry)
-            parse_load_value(entry.name)
-            candidates.append(entry)
-        except (FileNotFoundError, ValueError):
-            continue
+
+    def _walk(curr: Path, depth: int) -> None:
+        if depth > max_depth or not curr.is_dir():
+            return
+        for entry in sorted(curr.iterdir()):
+            if not entry.is_dir() or entry.name.startswith(".") or entry.name in ("qa", "rec_16bit_Paganin"):
+                continue
+            rel_key = str(entry.relative_to(drive_root)).replace("\\", "/")
+            has_tiffs = False
+            try:
+                resolve_tiff_directory(entry)
+                has_tiffs = True
+            except FileNotFoundError:
+                has_tiffs = False
+
+            if has_tiffs:
+                try:
+                    parse_load_with_unit(rel_key, overrides=overrides)
+                    candidates.append(entry)
+                    continue
+                except ValueError:
+                    pass
+            _walk(entry, depth + 1)
+
+    _walk(drive_root, 1)
     return candidates
 
 
 def stream_bundle_single_scan(
     scan_dir: Path,
     output_dir: Path,
+    state_name: str | None = None,
     version: str = "carbon_calibrated_v1",
     material: str = "auto",
     num_phases: int = 2,
     auto_multiphase: bool = False,
+    auto_calibrate_carbon: bool = False,
     delta_threshold: float = 5500.0,
     delta_coating_threshold: float = 0.0,
+    precalibrated_thresholds: tuple[float, float | None] | None = None,
+    load_overrides: dict[str, tuple[float, str]] | None = None,
     sigma: float = 32.0,
     roi_radius_fraction: float = 0.70,
     patch_size: int = 96,
@@ -199,23 +231,46 @@ def stream_bundle_single_scan(
     seam_margin: int = 12,
     calibration: CalibrationMetadata | None = None,
     preview_only: bool = False,
+    resume: bool = False,
     seed: int = 42,
 ) -> dict[str, object]:
     calib = calibration or CalibrationMetadata(spatial_bin=spatial_bin)
-    state_name = _clean_state_name(scan_dir.name)
-    resolved_material = infer_material_name(state_name) if material == "auto" else material
-    load_mv = parse_load_value(state_name)
-    stress_kpa = calib.load_to_stress_kpa(load_mv)
+    resolved_material = infer_material_name(scan_dir) if material == "auto" else material
+    resolved_state = state_name or make_collision_safe_state_name(
+        scan_dir, material=resolved_material, beamline=calib.beamline
+    )
+    load_val, load_unit = parse_load_with_unit(str(scan_dir), overrides=load_overrides)
+    stress_kpa = calib.resolve_stress_kpa(load_val, unit=load_unit)
+    load_mv = load_val if load_unit == "mv_per_v" else (
+        (stress_kpa / calib.kpa_per_mvv)
+        if (stress_kpa is not None and calib.kpa_per_mvv)
+        else load_val
+    )
 
     use_three_phase = (num_phases == 3) or (auto_multiphase and resolved_material != "virgin_carbon")
     eff_num_phases = 3 if (use_three_phase and resolved_material != "virgin_carbon") else 2
+
+    patch_dir = output_dir / f"{resolved_state}_binary_patches{patch_size}_{version}"
+    qa_dir = patch_dir / "qa"
+    report_path = qa_dir / "segmentation_report.json"
+
+    if (
+        resume
+        and not preview_only
+        and (patch_dir / "train" / "patches.npy").is_file()
+        and (patch_dir / "val" / "patches.npy").is_file()
+        and report_path.is_file()
+    ):
+        cached = json.loads(report_path.read_text())
+        print(f"[{resolved_state}] Resuming: reusing existing patches in {patch_dir.name}", flush=True)
+        return cached
 
     tiff_dir = resolve_tiff_directory(scan_dir)
     files = sorted(list(tiff_dir.glob("*.tif")) + list(tiff_dir.glob("*.tiff")))
     raw_window = patch_size * max(1, spatial_bin)
     if not preview_only and len(files) < 2 * raw_window:
         raise RuntimeError(
-            f"[{state_name}] Need >= {2 * raw_window} slices in {tiff_dir}, found {len(files)}"
+            f"[{resolved_state}] Need >= {2 * raw_window} slices in {tiff_dir}, found {len(files)}"
         )
 
     with tifffile.TiffFile(files[0]) as first_tif:
@@ -224,64 +279,73 @@ def stream_bundle_single_scan(
 
     roi_mask = make_circular_mask(shape_hw, radius_fraction=roi_radius_fraction)
 
-    # Calibrate active-coating threshold if 3-phase is active
-    delta_coating: float | None = None
-    if eff_num_phases == 3:
-        if delta_coating_threshold > delta_threshold:
-            delta_coating = float(delta_coating_threshold)
-        else:
-            ref_indices = sorted({len(files) // 4, len(files) // 2, (3 * len(files)) // 4})
-            ref_slices = [tifffile.imread(files[i]) for i in ref_indices]
-            _, delta_coating = calibrate_multiphase_thresholds(
+    if precalibrated_thresholds is not None:
+        eff_delta_carbon, delta_coating = precalibrated_thresholds
+    else:
+        ref_slices = [tifffile.imread(files[i]) for i in _clean_ref_indices(len(files))]
+        if eff_num_phases == 3:
+            eff_delta_carbon, auto_coat = calibrate_multiphase_thresholds(
                 ref_slices,
                 roi_mask=roi_mask,
                 sigma=sigma,
-                fixed_delta_carbon=delta_threshold,
+                fixed_delta_carbon=None if auto_calibrate_carbon else delta_threshold,
             )
+            delta_coating = (
+                float(delta_coating_threshold)
+                if delta_coating_threshold > eff_delta_carbon
+                else auto_coat
+            )
+        else:
+            eff_delta_carbon = (
+                calibrate_delta_threshold(ref_slices, roi_mask=roi_mask, sigma=sigma)
+                if auto_calibrate_carbon
+                else float(delta_threshold)
+            )
+            delta_coating = None
 
-    patch_dir = output_dir / f"{state_name}_binary_patches{patch_size}_{version}"
-    qa_dir = patch_dir / "qa"
     qa_dir.mkdir(parents=True, exist_ok=True)
 
-    mid_idx = len(files) // 2
+    mid_idx = int(0.35 * len(files)) if len(files) >= 16 else (len(files) // 2)
     mid_raw = tifffile.imread(files[mid_idx])
     mid_delta, _, _ = compute_pore_referenced_delta(mid_raw, roi_mask=roi_mask, sigma=sigma)
     mid_seg, mid_stats = segment_slice_multiphase(
         mid_raw,
-        delta_carbon=delta_threshold,
+        delta_carbon=eff_delta_carbon,
         delta_coating=delta_coating,
         roi_mask=roi_mask,
         sigma=sigma,
     )
     _save_multiphase_preview(
         out_path=qa_dir / "multiphase_overlay_diagnostic.png",
-        state_name=state_name,
+        state_name=resolved_state,
         material=resolved_material,
         raw_slice=mid_raw,
         seg_slice=mid_seg,
         delta_slice=mid_delta,
         roi_mask=roi_mask,
-        delta_carbon=delta_threshold,
+        delta_carbon=eff_delta_carbon,
         delta_coating=delta_coating,
     )
 
     if preview_only:
         preview_info: dict[str, object] = {
-            "state": state_name,
+            "state": resolved_state,
             "material": resolved_material,
             "beamline": calib.beamline,
             "load_mv_per_v": load_mv,
+            "load_raw_value": load_val,
+            "load_unit": load_unit,
             "stress_kpa": stress_kpa,
             "effective_voxel_size_um": calib.effective_voxel_size_um,
             "num_phases": eff_num_phases,
-            "delta_carbon": delta_threshold,
+            "delta_carbon": eff_delta_carbon,
             "delta_coating": delta_coating,
             "mid_slice_stats": mid_stats,
             "preview_figure": str(qa_dir / "multiphase_overlay_diagnostic.png"),
         }
         with (qa_dir / "preview_summary.json").open("w") as f:
             json.dump(preview_info, f, indent=2)
-        print(f"[{state_name}] Saved preview -> {qa_dir / 'multiphase_overlay_diagnostic.png'}", flush=True)
+        print(f"[{resolved_state}] Saved preview -> {qa_dir / 'multiphase_overlay_diagnostic.png'}", flush=True)
         return preview_info
 
     raw_stride_xy = stride_xy * max(1, spatial_bin)
@@ -293,11 +357,11 @@ def stream_bundle_single_scan(
         radius_fraction=roi_radius_fraction,
     )
     if not xy_positions:
-        raise RuntimeError(f"[{state_name}] No valid {raw_window}^2 XY positions inside ROI")
+        raise RuntimeError(f"[{resolved_state}] No valid {raw_window}^2 XY positions inside ROI")
 
     print(
-        f"[{state_name}] Pass 1/2: scanning {len(files)} slices "
-        f"(material={resolved_material}, phases={eff_num_phases}, load={load_mv:.4f} mV/V)...",
+        f"[{resolved_state}] Pass 1/2: scanning {len(files)} slices "
+        f"(material={resolved_material}, phases={eff_num_phases}, load={load_val:.4f} {load_unit})...",
         flush=True,
     )
     solid_fractions: list[float] = []
@@ -311,7 +375,7 @@ def stream_bundle_single_scan(
         img = tifffile.imread(path)
         _, stats = segment_slice_multiphase(
             img,
-            delta_carbon=delta_threshold,
+            delta_carbon=eff_delta_carbon,
             delta_coating=delta_coating,
             roi_mask=roi_mask,
             sigma=sigma,
@@ -326,7 +390,7 @@ def stream_bundle_single_scan(
         prev_sub = curr_sub
 
         if idx % 250 == 0 or idx == len(files):
-            print(f"  [{state_name}] Scanned {idx}/{len(files)} slices", flush=True)
+            print(f"  [{resolved_state}] Scanned {idx}/{len(files)} slices", flush=True)
 
     if len(slice_jumps) > 1:
         slice_jumps[0] = slice_jumps[1]
@@ -349,7 +413,7 @@ def stream_bundle_single_scan(
 
     _save_z_plot(
         out_path=qa_dir / "z_quality_diagnostic.png",
-        state_name=state_name,
+        state_name=resolved_state,
         solid_fractions=solid_fractions,
         coating_fractions=coating_fractions,
         ring_scores=ring_scores,
@@ -365,7 +429,7 @@ def stream_bundle_single_scan(
     split_sf_means: dict[str, float] = {}
     split_coat_means: dict[str, float] = {}
 
-    print(f"[{state_name}] Pass 2/2: streaming clean 3D patches -> {patch_dir.name}", flush=True)
+    print(f"[{resolved_state}] Pass 2/2: streaming clean 3D patches -> {patch_dir.name}", flush=True)
     for split_name in ("train", "val"):
         plan = build_stratified_patch_plan(
             z_intervals=split_intervals[split_name],
@@ -389,7 +453,7 @@ def stream_bundle_single_scan(
                     raw_slc = tifffile.imread(files[z_idx])
                     seg_slc, _ = segment_slice_multiphase(
                         raw_slc,
-                        delta_carbon=delta_threshold,
+                        delta_carbon=eff_delta_carbon,
                         delta_coating=delta_coating,
                         roi_mask=roi_mask,
                         sigma=sigma,
@@ -409,7 +473,7 @@ def stream_bundle_single_scan(
                     accepted.append(patch)
 
         if not accepted:
-            raise RuntimeError(f"[{state_name}] 0 {split_name} patches passed filter [{min_white}, {max_white}]")
+            raise RuntimeError(f"[{resolved_state}] 0 {split_name} patches passed filter [{min_white}, {max_white}]")
 
         stacked = np.stack(accepted, axis=0)
         split_out = patch_dir / split_name
@@ -419,7 +483,7 @@ def stream_bundle_single_scan(
         split_sf_means[split_name] = float((stacked >= 1).mean())
         split_coat_means[split_name] = float((stacked == 2).mean())
         print(
-            f"  [{state_name}] {split_name}: {stacked.shape[0]} patches "
+            f"  [{resolved_state}] {split_name}: {stacked.shape[0]} patches "
             f"(solid={split_sf_means[split_name]:.4f}, coating={split_coat_means[split_name]:.4f})",
             flush=True,
         )
@@ -431,21 +495,23 @@ def stream_bundle_single_scan(
     clean_slices = int(valid_mask.sum())
 
     summary: dict[str, object] = {
-        "state": state_name,
+        "state": resolved_state,
         "material": resolved_material,
         "beamline": calib.beamline,
         "source_folder": str(scan_dir),
         "patch_dir_name": patch_dir.name,
         "load_mv_per_v": load_mv,
+        "load_raw_value": load_val,
+        "load_unit": load_unit,
         "stress_kpa": stress_kpa,
         "strain_z": calib.estimate_strain_z(clean_slices),
         "voxel_size_um": calib.voxel_size_um,
         "spatial_bin": spatial_bin,
         "effective_voxel_size_um": calib.effective_voxel_size_um,
         "num_phases": eff_num_phases,
-        "delta_carbon": delta_threshold,
+        "delta_carbon": eff_delta_carbon,
         "delta_coating": delta_coating,
-        "is_repeat_or_secondary": _is_repeat_or_secondary(state_name),
+        "is_repeat_or_secondary": _is_repeat_or_secondary(resolved_state),
         "version": version,
         "patch_size": patch_size,
         "input_dtype": str(dtype),
@@ -470,7 +536,7 @@ def stream_bundle_single_scan(
     with (qa_dir / "valid_slices.json").open("w") as f:
         json.dump(
             {
-                "dataset": state_name,
+                "dataset": resolved_state,
                 "material": resolved_material,
                 "load_mv_per_v": load_mv,
                 "stress_kpa": stress_kpa,
@@ -484,6 +550,45 @@ def stream_bundle_single_scan(
     return summary
 
 
+def _calibrate_group_thresholds(
+    ref_scan_dir: Path,
+    eff_num_phases: int,
+    auto_calibrate_carbon: bool,
+    delta_threshold: float,
+    delta_coating_threshold: float,
+    roi_radius_fraction: float,
+    sigma: float,
+) -> tuple[float, float | None]:
+    """Calibrate one shared `(delta_carbon, delta_coating)` pair on a group's lowest-load scan."""
+    tiff_dir = resolve_tiff_directory(ref_scan_dir)
+    files = sorted(list(tiff_dir.glob("*.tif")) + list(tiff_dir.glob("*.tiff")))
+    with tifffile.TiffFile(files[0]) as first_tif:
+        shape_hw = tuple(first_tif.pages[0].shape)
+    roi_mask = make_circular_mask(shape_hw, radius_fraction=roi_radius_fraction)
+    ref_slices = [tifffile.imread(files[i]) for i in _clean_ref_indices(len(files))]
+
+    if eff_num_phases == 3:
+        d_carb, auto_coat = calibrate_multiphase_thresholds(
+            ref_slices,
+            roi_mask=roi_mask,
+            sigma=sigma,
+            fixed_delta_carbon=None if auto_calibrate_carbon else delta_threshold,
+        )
+        d_coat = (
+            float(delta_coating_threshold)
+            if delta_coating_threshold > d_carb
+            else auto_coat
+        )
+        return float(d_carb), float(d_coat)
+
+    d_carb = (
+        calibrate_delta_threshold(ref_slices, roi_mask=roi_mask, sigma=sigma)
+        if auto_calibrate_carbon
+        else float(delta_threshold)
+    )
+    return float(d_carb), None
+
+
 def build_bundle(
     drive_root: Path,
     output_dir: Path,
@@ -492,8 +597,10 @@ def build_bundle(
     material: str = "auto",
     num_phases: int = 2,
     auto_multiphase: bool = False,
+    auto_calibrate_carbon: bool = False,
     delta_threshold: float = 5500.0,
     delta_coating_threshold: float = 0.0,
+    loads_csv: Path | None = None,
     sigma: float = 32.0,
     roi_radius_fraction: float = 0.70,
     patch_size: int = 96,
@@ -505,37 +612,102 @@ def build_bundle(
     seam_margin: int = 12,
     voxel_size_um: float = 1.0,
     kpa_per_mvv: float | None = None,
+    punch_diameter_mm: float | None = None,
     beamline: str = "primary",
     preview_only: bool = False,
+    append: bool = False,
+    resume: bool = False,
     make_zip: bool = True,
 ) -> Path:
-    scan_dirs = [drive_root / d for d in datasets] if datasets else discover_scan_folders(drive_root)
+    overrides = load_overrides_table(loads_csv) if loads_csv is not None else None
+    scan_dirs = (
+        [drive_root / d for d in datasets]
+        if datasets
+        else discover_scan_folders(drive_root, overrides=overrides)
+    )
     if not scan_dirs:
         raise FileNotFoundError(f"No XCT scan folders discovered under {drive_root}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    calib = CalibrationMetadata(
-        voxel_size_um=voxel_size_um,
-        spatial_bin=spatial_bin,
-        kpa_per_mvv=kpa_per_mvv,
-        beamline=beamline,
-    )
+    existing_scans_by_state: dict[str, dict[str, object]] = {}
+    manifest_path = output_dir / "bundle_manifest.json"
+    if append and not preview_only and manifest_path.is_file():
+        prev_manifest = json.loads(manifest_path.read_text())
+        for prev_sc in prev_manifest.get("scans", []):
+            existing_scans_by_state[str(prev_sc["state"])] = dict(prev_sc)
 
-    primary_states: dict[str, float] = {}
-    repeat_states: dict[str, float] = {}
-    by_material: dict[str, dict[str, float]] = {}
-    scan_summaries: list[dict[str, object]] = []
-
+    # Plan canonical state names and group by (material, beamline) sorted by ascending load
+    seen_names: set[str] = set()
+    planned: list[dict[str, object]] = []
     for scan_dir in scan_dirs:
-        summary = stream_bundle_single_scan(
-            scan_dir=scan_dir,
-            output_dir=output_dir,
-            version=version,
-            material=material,
-            num_phases=num_phases,
-            auto_multiphase=auto_multiphase,
+        try:
+            rel_key = str(scan_dir.relative_to(drive_root)).replace("\\", "/")
+        except ValueError:
+            rel_key = str(scan_dir)
+        res_mat = infer_material_name(rel_key) if material == "auto" else material
+        st_name = make_collision_safe_state_name(
+            scan_dir, material=res_mat, beamline=beamline, existing_names=seen_names
+        )
+        seen_names.add(st_name)
+        lv, lu = parse_load_with_unit(rel_key, overrides=overrides)
+        planned.append(
+            {
+                "scan_dir": scan_dir,
+                "state_name": st_name,
+                "material": res_mat,
+                "load_val": lv,
+                "load_unit": lu,
+            }
+        )
+
+    planned.sort(key=lambda item: (str(item["material"]), float(item["load_val"])))  # type: ignore[arg-type]
+
+    # Calibrate ONE shared (delta_carbon, delta_coating) pair per (material, beamline) from lowest-load scan
+    group_thresholds: dict[tuple[str, str], tuple[float, float | None]] = {}
+    for item in planned:
+        res_mat = str(item["material"])
+        grp_key = (res_mat, beamline)
+        if grp_key in group_thresholds:
+            continue
+        use_3p = (num_phases == 3) or (auto_multiphase and res_mat != "virgin_carbon")
+        eff_nph = 3 if (use_3p and res_mat != "virgin_carbon") else 2
+        group_thresholds[grp_key] = _calibrate_group_thresholds(
+            ref_scan_dir=item["scan_dir"],  # type: ignore[arg-type]
+            eff_num_phases=eff_nph,
+            auto_calibrate_carbon=auto_calibrate_carbon,
             delta_threshold=delta_threshold,
             delta_coating_threshold=delta_coating_threshold,
+            roi_radius_fraction=roi_radius_fraction,
+            sigma=sigma,
+        )
+
+    ref_thickness_by_group: dict[tuple[str, str], int] = {}
+    new_summaries: list[dict[str, object]] = []
+
+    for item in planned:
+        res_mat = str(item["material"])
+        grp_key = (res_mat, beamline)
+        calib = CalibrationMetadata(
+            voxel_size_um=voxel_size_um,
+            spatial_bin=spatial_bin,
+            kpa_per_mvv=kpa_per_mvv,
+            punch_diameter_mm=punch_diameter_mm,
+            reference_thickness_slices=ref_thickness_by_group.get(grp_key),
+            beamline=beamline,
+        )
+        summary = stream_bundle_single_scan(
+            scan_dir=item["scan_dir"],  # type: ignore[arg-type]
+            output_dir=output_dir,
+            state_name=str(item["state_name"]),
+            version=version,
+            material=res_mat,
+            num_phases=num_phases,
+            auto_multiphase=auto_multiphase,
+            auto_calibrate_carbon=auto_calibrate_carbon,
+            delta_threshold=delta_threshold,
+            delta_coating_threshold=delta_coating_threshold,
+            precalibrated_thresholds=group_thresholds[grp_key],
+            load_overrides=overrides,
             sigma=sigma,
             roi_radius_fraction=roi_radius_fraction,
             patch_size=patch_size,
@@ -547,11 +719,33 @@ def build_bundle(
             seam_margin=seam_margin,
             calibration=calib,
             preview_only=preview_only,
+            resume=resume,
         )
-        scan_summaries.append(summary)
-        if preview_only:
-            continue
+        if not preview_only and grp_key not in ref_thickness_by_group:
+            ref_slices = int(summary["slices_valid_clean"])  # type: ignore[arg-type]
+            ref_thickness_by_group[grp_key] = ref_slices
+            summary["strain_z"] = 0.0
+            qa_rep = output_dir / str(summary["patch_dir_name"]) / "qa" / "segmentation_report.json"
+            if qa_rep.is_file():
+                with qa_rep.open("w") as f:
+                    json.dump(summary, f, indent=2)
 
+        new_summaries.append(summary)
+
+    if preview_only:
+        preview_manifest = output_dir / "preview_manifest.json"
+        with preview_manifest.open("w") as f:
+            json.dump({"previews": new_summaries}, f, indent=2)
+        return preview_manifest
+
+    for summary in new_summaries:
+        existing_scans_by_state[str(summary["state"])] = summary
+    scan_summaries = list(existing_scans_by_state.values())
+
+    primary_states: dict[str, float] = {}
+    repeat_states: dict[str, float] = {}
+    by_material: dict[str, dict[str, float]] = {}
+    for summary in scan_summaries:
         st_name = str(summary["state"])
         mat_name = str(summary["material"])
         mv = float(summary["load_mv_per_v"])  # type: ignore[arg-type]
@@ -561,12 +755,6 @@ def build_bundle(
             primary_states[st_name] = mv
             by_material.setdefault(mat_name, {})[st_name] = mv
 
-    if preview_only:
-        preview_manifest = output_dir / "preview_manifest.json"
-        with preview_manifest.open("w") as f:
-            json.dump({"previews": scan_summaries}, f, indent=2)
-        return preview_manifest
-
     with (output_dir / "primary_states.json").open("w") as f:
         json.dump(dict(sorted(primary_states.items(), key=lambda kv: kv[1])), f, indent=2)
 
@@ -575,8 +763,9 @@ def build_bundle(
         "patch_size": patch_size,
         "spatial_bin": spatial_bin,
         "voxel_size_um": voxel_size_um,
-        "effective_voxel_size_um": calib.effective_voxel_size_um,
+        "effective_voxel_size_um": float(voxel_size_um * max(1, spatial_bin)),
         "kpa_per_mvv": kpa_per_mvv,
+        "punch_diameter_mm": punch_diameter_mm,
         "beamline": beamline,
         "delta_threshold": delta_threshold,
         "primary_states": dict(sorted(primary_states.items(), key=lambda kv: kv[1])),
@@ -586,7 +775,6 @@ def build_bundle(
         "repeat_and_secondary_states": dict(sorted(repeat_states.items(), key=lambda kv: kv[1])),
         "scans": scan_summaries,
     }
-    manifest_path = output_dir / "bundle_manifest.json"
     with manifest_path.open("w") as f:
         json.dump(manifest, f, indent=2)
 
@@ -611,6 +799,7 @@ def main() -> None:
             output_dir=SPYDER_OUTPUT_DIR,
             auto_multiphase=True,
             spatial_bin=2,
+            resume=True,
             make_zip=True,
         )
         return
@@ -633,12 +822,23 @@ def main() -> None:
         action="store_true",
         help="Automatically segment TiO2 and CuHCF scans into 3 phases {pore, carbon, coating} and Virgin into 2 phases",
     )
+    parser.add_argument(
+        "--auto-calibrate-carbon",
+        action="store_true",
+        help="Auto-calibrate delta_carbon per (material, beamline) from lowest-load scan (recommended for K11 DIAD)",
+    )
     parser.add_argument("--delta-threshold", type=float, default=5500.0)
     parser.add_argument(
         "--delta-coating-threshold",
         type=float,
         default=0.0,
         help="Explicit coating delta threshold (> delta-threshold); 0 auto-calibrates via 2-stage solid Otsu",
+    )
+    parser.add_argument(
+        "--loads-csv",
+        type=Path,
+        default=None,
+        help="Optional CSV/JSON lookup table mapping folder names to load values/units",
     )
     parser.add_argument("--sigma", type=float, default=32.0)
     parser.add_argument("--roi-radius-fraction", type=float, default=0.70)
@@ -651,11 +851,22 @@ def main() -> None:
     parser.add_argument("--seam-margin", type=int, default=12)
     parser.add_argument("--voxel-size-um", type=float, default=1.0)
     parser.add_argument("--kpa-per-mvv", type=float, default=None)
+    parser.add_argument("--punch-diameter-mm", type=float, default=None)
     parser.add_argument("--beamline", default="primary")
     parser.add_argument(
         "--preview-only",
         action="store_true",
         help="Fast 10s check: save multiphase_overlay_diagnostic.png without extracting 3D patches",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="Merge newly bundled scans into an existing bundle_manifest.json (for multi-drive / K11 DIAD workflows)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip scans whose train/val patches.npy and segmentation_report.json already exist",
     )
     parser.add_argument("--zip", action="store_true", help="Compress output directory into a single .zip archive")
     args = parser.parse_args()
@@ -668,8 +879,10 @@ def main() -> None:
         material=args.material,
         num_phases=args.num_phases,
         auto_multiphase=args.auto_multiphase,
+        auto_calibrate_carbon=args.auto_calibrate_carbon,
         delta_threshold=args.delta_threshold,
         delta_coating_threshold=args.delta_coating_threshold,
+        loads_csv=args.loads_csv,
         sigma=args.sigma,
         roi_radius_fraction=args.roi_radius_fraction,
         patch_size=args.patch_size,
@@ -681,8 +894,11 @@ def main() -> None:
         seam_margin=args.seam_margin,
         voxel_size_um=args.voxel_size_um,
         kpa_per_mvv=args.kpa_per_mvv,
+        punch_diameter_mm=args.punch_diameter_mm,
         beamline=args.beamline,
         preview_only=args.preview_only,
+        append=args.append,
+        resume=args.resume,
         make_zip=args.zip,
     )
 

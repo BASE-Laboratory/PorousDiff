@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import csv
 from dataclasses import dataclass
+import json
 import re
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -19,6 +21,7 @@ class CalibrationMetadata:
     voxel_size_um: float = 1.0
     spatial_bin: int = 1
     kpa_per_mvv: float | None = None
+    punch_diameter_mm: float | None = None
     zero_offset_mvv: float = 0.0
     reference_thickness_slices: int | None = None
     beamline: str = "primary"
@@ -32,6 +35,19 @@ class CalibrationMetadata:
             return None
         return float(max(0.0, (load_mv_v - self.zero_offset_mvv) * self.kpa_per_mvv))
 
+    def resolve_stress_kpa(self, value: float, unit: str = "mv_per_v") -> float | None:
+        """Convert parsed load (`mv_per_v`, `kpa`, or `newton`) to mechanical stress in kPa."""
+        u = unit.lower()
+        if u == "kpa":
+            return float(max(0.0, value))
+        if u == "newton":
+            if self.punch_diameter_mm is None or self.punch_diameter_mm <= 0:
+                return None
+            radius_m = 0.5 * float(self.punch_diameter_mm) * 1e-3
+            area_m2 = float(np.pi * (radius_m**2))
+            return float(max(0.0, (value / area_m2) * 1e-3))
+        return self.load_to_stress_kpa(value)
+
     def estimate_strain_z(self, clean_thickness_slices: int) -> float | None:
         if self.reference_thickness_slices is None or self.reference_thickness_slices <= 0:
             return None
@@ -39,35 +55,161 @@ class CalibrationMetadata:
         return float(np.clip(1.0 - ratio, 0.0, 0.95))
 
 
-def infer_material_name(name: str) -> str:
-    """Infer canonical electrode material key from dataset/folder name."""
-    low = name.lower()
-    if "tio2" in low or "anode" in low:
+def has_explicit_material_keyword(text: str) -> bool:
+    """Return True if `text` explicitly names TiO2/anode, CuHCF/cathode, or virgin/carbon."""
+    low = text.lower()
+    keywords = (
+        "tio2",
+        "titania",
+        "anode",
+        "cuhcf",
+        "cuchf",
+        "hexacyano",
+        "prussian",
+        "cathode",
+        "virgin",
+        "crbon",
+        "carbon",
+    )
+    return any(k in low for k in keywords)
+
+
+def infer_material_name(name_or_path: str | Path) -> str:
+    """Infer canonical electrode material key from folder name or relative/full path."""
+    low = str(name_or_path).replace("\\", "/").lower()
+    if any(k in low for k in ("tio2", "titania", "anode")):
         return "tio2_anode"
-    if "cuhcf" in low or "cuchf" in low or "hexacyano" in low or "cathode" in low:
+    if any(k in low for k in ("cuhcf", "cuchf", "hexacyano", "prussian", "cathode")):
         return "cuhcf_cathode"
     return "virgin_carbon"
 
 
-def parse_load_value(name: str) -> float:
-    """Parse load-cell reading in mV/V from folder/state names.
+def make_collision_safe_state_name(
+    scan_dir: Path | str,
+    material: str,
+    beamline: str = "primary",
+    existing_names: set[str] | None = None,
+) -> str:
+    """Build a canonical state key avoiding collisions across generic leaf folders (e.g. `Op001mVV`)."""
+    leaf = Path(scan_dir).name.strip().rstrip("_")
+    parts: list[str] = []
+    if beamline and beamline != "primary" and beamline.lower() not in leaf.lower():
+        parts.append(beamline.strip())
+    if material != "virgin_carbon" and not has_explicit_material_keyword(leaf):
+        parts.append(material)
+    parts.append(leaf)
+    candidate = "__".join(parts)
 
-    Handles both Diamond synchrotron naming (`crbon_virgin_1_0p048mVV_`, `0p008mVV`)
-    and Isambard shorthand (`Op008mVV` -> `0.008`, `Op033mVV` -> `0.033`).
+    if existing_names is not None and candidate in existing_names:
+        if material not in candidate:
+            candidate = f"{material}__{candidate}"
+        idx = 2
+        base = candidate
+        while candidate in existing_names:
+            candidate = f"{base}_{idx}"
+            idx += 1
+    return candidate
+
+
+def _decode_p_number(token: str) -> float:
+    norm = re.sub(r"^[Oo](?=p\d)", "0", token.strip())
+    return float(norm.replace("p", ".").replace("P", "."))
+
+
+def load_overrides_table(path: Path) -> dict[str, tuple[float, str]]:
+    """Load explicit folder->`(value, unit)` overrides from a `.csv` or `.json` file."""
+    if path.suffix.lower() == ".json":
+        raw = json.loads(path.read_text())
+        out: dict[str, tuple[float, str]] = {}
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                out[str(k)] = (float(v["value"]), str(v.get("unit", "mv_per_v")))
+            else:
+                out[str(k)] = (float(v), "mv_per_v")
+        return out
+
+    out = {}
+    with path.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            key = (
+                row.get("state")
+                or row.get("folder")
+                or row.get("dataset")
+                or row.get("scan")
+                or ""
+            ).strip()
+            val_str = (
+                row.get("load")
+                or row.get("value")
+                or row.get("stress_kpa")
+                or row.get("load_mv_per_v")
+                or ""
+            ).strip()
+            if not key or not val_str:
+                continue
+            default_unit = "kpa" if ("stress_kpa" in row and row.get("stress_kpa")) else "mv_per_v"
+            unit = (row.get("unit") or default_unit).strip()
+            out[key] = (float(val_str), unit)
+    return out
+
+
+def parse_load_with_unit(
+    name: str,
+    overrides: dict[str, tuple[float, str]] | None = None,
+) -> tuple[float, str]:
+    """Parse mechanical load and physical unit (`mv_per_v`, `kpa`, or `newton`) from folder/path.
+
+    Supports:
+      - `0p048mVV`, `Op026mVV`, `15mV` -> `("mv_per_v")`
+      - `200kPa`, `0p25MPa` (`250 kPa`), `2p5bar` (`250 kPa`) -> `("kpa")`
+      - `50N`, `12p5N` -> `("newton")`
+      - Explicit CSV/JSON override table entries
     """
-    match = re.search(r"(?:0|[Oo])p(\d+)mVV", name)
-    if match:
-        digits = match.group(1)
-        return float(f"0.{digits}")
+    clean = name.strip().rstrip("_")
+    leaf = Path(clean.replace("\\", "/")).name
+    if overrides:
+        for candidate in (clean, name, leaf):
+            if candidate in overrides:
+                return overrides[candidate]
 
-    match_num = re.search(r"(\d+(?:\.\d+)?)\s*mV", name, flags=re.IGNORECASE)
-    if match_num:
-        val = float(match_num.group(1))
-        return val / 1000.0 if val >= 1.0 else val
+    match_mvv = re.search(r"((?:0|[Oo]|\d+)p\d+|\d+(?:\.\d+)?)mVV", clean)
+    if match_mvv:
+        return _decode_p_number(match_mvv.group(1)), "mv_per_v"
+
+    match_mv = re.search(r"((?:0|[Oo]|\d+)p\d+|\d+(?:\.\d+)?)\s*mV(?!V)", clean, flags=re.IGNORECASE)
+    if match_mv:
+        val = _decode_p_number(match_mv.group(1))
+        return (val / 1000.0 if val >= 1.0 else val), "mv_per_v"
+
+    match_mpa = re.search(r"((?:0|[Oo]|\d+)p\d+|\d+(?:\.\d+)?)\s*MPa", clean, flags=re.IGNORECASE)
+    if match_mpa:
+        return _decode_p_number(match_mpa.group(1)) * 1000.0, "kpa"
+
+    match_kpa = re.search(r"((?:0|[Oo]|\d+)p\d+|\d+(?:\.\d+)?)\s*kPa", clean, flags=re.IGNORECASE)
+    if match_kpa:
+        return _decode_p_number(match_kpa.group(1)), "kpa"
+
+    match_bar = re.search(r"((?:0|[Oo]|\d+)p\d+|\d+(?:\.\d+)?)\s*bar", clean, flags=re.IGNORECASE)
+    if match_bar:
+        return _decode_p_number(match_bar.group(1)) * 100.0, "kpa"
+
+    match_n = re.search(r"(?:^|[_\-\s])((?:0|[Oo]|\d+)p\d+|\d+(?:\.\d+)?)\s*N(?:$|[_\-\s])", clean)
+    if match_n:
+        return _decode_p_number(match_n.group(1)), "newton"
 
     raise ValueError(
-        f"Cannot parse load value from {name!r}; supply an explicit states mapping."
+        f"Cannot parse load value from {name!r}; supply --loads-csv or an explicit states mapping."
     )
+
+
+def parse_load_value(
+    name: str,
+    overrides: dict[str, tuple[float, str]] | None = None,
+) -> float:
+    """Parse scalar load value from folder/state names (`mV/V`, `kPa`, `MPa`, `bar`, `N`)."""
+    val, _ = parse_load_with_unit(name, overrides=overrides)
+    return val
 
 
 def resolve_tiff_directory(dataset_path: Path) -> Path:
@@ -159,30 +301,6 @@ def compute_pore_referenced_delta(
     return delta, pore_mode, pore_std
 
 
-def calibrate_delta_threshold(
-    reference_slices: Iterable[np.ndarray],
-    roi_mask: np.ndarray | None = None,
-    sigma: float = 32.0,
-) -> float:
-    """Calibrate a single shared `delta_threshold` from reference XCT slices."""
-    pooled = []
-    rng = np.random.default_rng(0)
-    for slc in reference_slices:
-        delta, _, _ = compute_pore_referenced_delta(slc, roi_mask=roi_mask, sigma=sigma)
-        vals = delta[roi_mask] if roi_mask is not None else delta.ravel()
-        if vals.size > 50_000:
-            vals = rng.choice(vals, size=50_000, replace=False)
-        pooled.append(vals)
-
-    if not pooled:
-        raise ValueError("No reference slices provided for threshold calibration")
-
-    all_vals = np.concatenate(pooled)
-    lo, hi = np.percentile(all_vals, [1.0, 99.8])
-    clipped = all_vals[(all_vals >= lo) & (all_vals <= hi)]
-    return float(threshold_otsu(clipped))
-
-
 def _plateau_isodata_threshold(vals: np.ndarray, nbins: int = 512) -> float:
     """Compute a gap-centered Otsu threshold refined to the half-maximum class midpoint.
 
@@ -215,6 +333,33 @@ def _plateau_isodata_threshold(vals: np.ndarray, nbins: int = 512) -> float:
             break
         thresh = float(0.5 * (lo.mean() + hi.mean()))
     return thresh
+
+
+def calibrate_delta_threshold(
+    reference_slices: Iterable[np.ndarray],
+    roi_mask: np.ndarray | None = None,
+    sigma: float = 32.0,
+) -> float:
+    """Calibrate a single shared `delta_threshold` from reference XCT slices."""
+    pooled = []
+    pore_stds: list[float] = []
+    rng = np.random.default_rng(0)
+    for slc in reference_slices:
+        delta, _, p_std = compute_pore_referenced_delta(slc, roi_mask=roi_mask, sigma=sigma)
+        pore_stds.append(p_std)
+        vals = delta[roi_mask] if roi_mask is not None else delta.ravel()
+        if vals.size > 50_000:
+            vals = rng.choice(vals, size=50_000, replace=False)
+        pooled.append(vals)
+
+    if not pooled:
+        raise ValueError("No reference slices provided for threshold calibration")
+
+    all_vals = np.concatenate(pooled)
+    med_pstd = max(float(np.median(pore_stds)), 1.0)
+    lo, hi = np.percentile(all_vals, [1.0, 99.8])
+    clipped = all_vals[(all_vals >= lo) & (all_vals <= hi)]
+    return float(max(_plateau_isodata_threshold(clipped), 3.5 * med_pstd))
 
 
 def calibrate_multiphase_thresholds(

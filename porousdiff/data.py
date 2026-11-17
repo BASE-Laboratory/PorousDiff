@@ -116,12 +116,18 @@ def resolve_patch_split_dir(
     patch_size: int,
     version: str,
     split: str,
+    patch_dir_name: str | None = None,
 ) -> Path:
     """Resolve `<state>_{binary,multiphase}_patches<P>_<version>/<split>` directory."""
-    candidates = [
-        data_root / f"{state_name}_binary_patches{patch_size}_{version}" / split,
-        data_root / f"{state_name}_multiphase_patches{patch_size}_{version}" / split,
-    ]
+    candidates: list[Path] = []
+    if patch_dir_name:
+        candidates.append(data_root / patch_dir_name / split)
+    candidates.extend(
+        [
+            data_root / f"{state_name}_binary_patches{patch_size}_{version}" / split,
+            data_root / f"{state_name}_multiphase_patches{patch_size}_{version}" / split,
+        ]
+    )
     for cand in candidates:
         if cand.is_dir():
             return cand

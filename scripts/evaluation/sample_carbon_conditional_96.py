@@ -166,7 +166,13 @@ def _build_eval_specs(
             st = str(scan["state"])
             if filter_set is not None and st not in filter_set:
                 continue
-            if filter_set is None and bool(scan.get("is_repeat_or_secondary", False)):
+            if args.beamline and str(scan.get("beamline", "primary")) != args.beamline:
+                continue
+            if (
+                filter_set is None
+                and not args.include_repeats
+                and bool(scan.get("is_repeat_or_secondary", False))
+            ):
                 continue
             lv = (
                 float(scan["stress_kpa"])
@@ -236,6 +242,8 @@ def main() -> None:
     parser.add_argument("--num-samples", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--eval-states", nargs="+", default=None)
+    parser.add_argument("--include-repeats", action="store_true")
+    parser.add_argument("--beamline", default=None, help="Optional beamline filter (e.g. DLS_K11_DIAD)")
     parser.add_argument(
         "--material",
         default="auto",

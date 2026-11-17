@@ -393,3 +393,293 @@ def test_end_to_end_beamtime_multiplier_cli(tmp_path: Path) -> None:
     }
     assert (bm_dir / "baseline_vs_porousdiff_table.csv").is_file()
     assert (bm_dir / "beamtime_multiplier_comparison.png").is_file()
+    assert (bm_dir / "openimpala_suite" / "openimpala_jobs.json").is_file()
+    assert (bm_dir / "openimpala_suite" / "run_openimpala_batch.sh").is_file()
+
+
+def _write_synthetic_multiphase_stack(
+    scan_dir: Path,
+    n_slices: int,
+    hw: int,
+    carbon_prob: float,
+    coating_prob: float,
+    rng: np.random.Generator,
+) -> None:
+    import tifffile
+
+    scan_dir.mkdir(parents=True, exist_ok=True)
+    yy, xx = np.indices((hw, hw))
+    c = hw / 2.0
+    r = 0.44 * hw
+    in_circle = ((yy - c) ** 2 + (xx - c) ** 2) <= (r**2)
+
+    vol = (30_000.0 + rng.normal(0.0, 280.0, size=(n_slices, hw, hw))).astype(np.float32)
+    u = rng.random((n_slices, hw, hw))
+    vol[u < carbon_prob] += 8_500.0
+    vol[(u >= carbon_prob) & (u < carbon_prob + coating_prob)] += 20_500.0
+    vol_u16 = vol.clip(0, 65535).astype(np.uint16)
+    for z_idx in range(n_slices):
+        slc = vol_u16[z_idx].copy()
+        slc[~in_circle] = 30_050
+        tifffile.imwrite(scan_dir / f"slice_{z_idx:04d}.tif", slc)
+
+
+def test_nested_discovery_group_calibration_append_and_resume(tmp_path: Path) -> None:
+    """Verify nested Op001mVV collision safety, shared lowest-load threshold calibration
+    (immune to high-load bottom plunger), --resume cache reuse, and --append K11 DIAD merge."""
+    rng = np.random.default_rng(77)
+    i12_root = tmp_path / "i12_drive"
+    diad_root = tmp_path / "diad_drive"
+    bundle_dir = tmp_path / "unified_bundle"
+
+    # Nested folders with identical leaf names (`Op001mVV`) under `TiO2/` and `CuHCF/`,
+    # plus high-load `TiO2/Op045mVV` containing a bright solid metal plunger in bottom 30% of Z!
+    _write_synthetic_multiphase_stack(
+        i12_root / "TiO2_Anode" / "Op001mVV",
+        n_slices=52,
+        hw=56,
+        carbon_prob=0.14,
+        coating_prob=0.06,
+        rng=rng,
+    )
+    high_load_dir = i12_root / "TiO2_Anode" / "Op045mVV"
+    _write_synthetic_multiphase_stack(
+        high_load_dir,
+        n_slices=52,
+        hw=56,
+        carbon_prob=0.28,
+        coating_prob=0.11,
+        rng=rng,
+    )
+    # Contaminate Z >= 36 (`3N/4 = 39`) of high-load scan with a saturated 62,000-count plunger
+    import tifffile
+
+    for z_idx in range(36, 52):
+        p = high_load_dir / f"slice_{z_idx:04d}.tif"
+        tifffile.imwrite(p, np.full((56, 56), 62_000, dtype=np.uint16))
+
+    _write_synthetic_multiphase_stack(
+        i12_root / "CuHCF_Cathode" / "Op001mVV",
+        n_slices=52,
+        hw=56,
+        carbon_prob=0.15,
+        coating_prob=0.07,
+        rng=rng,
+    )
+
+    base_cmd = [
+        sys.executable,
+        str(REPO_ROOT / "scripts/preprocessing/prepare_local_drive_bundle.py"),
+        "--output-dir",
+        str(bundle_dir),
+        "--version",
+        "v03_test",
+        "--auto-multiphase",
+        "--delta-threshold",
+        "4500",
+        "--sigma",
+        "10",
+        "--roi-radius-fraction",
+        "0.80",
+        "--patch-size",
+        "16",
+        "--stride-xy",
+        "12",
+        "--stride-z",
+        "8",
+        "--max-patches",
+        "6",
+        "--min-interval-length",
+        "16",
+        "--seam-margin",
+        "2",
+    ]
+
+    subprocess.run(
+        base_cmd
+        + [
+            "--drive-root",
+            str(i12_root),
+            "--voxel-size-um",
+            "1.6",
+            "--kpa-per-mvv",
+            "8000",
+            "--beamline",
+            "DLS_I12",
+        ],
+        check=True,
+    )
+
+    m1 = json.loads((bundle_dir / "bundle_manifest.json").read_text())
+    scans_by_state = {sc["state"]: sc for sc in m1["scans"]}
+    assert "DLS_I12__tio2_anode__Op001mVV" in scans_by_state
+    assert "DLS_I12__tio2_anode__Op045mVV" in scans_by_state
+    assert "DLS_I12__cuhcf_cathode__Op001mVV" in scans_by_state
+
+    # Both TiO2 loads MUST share the exact same delta_coating calibrated on Op001mVV (not plunger!)
+    t_low = scans_by_state["DLS_I12__tio2_anode__Op001mVV"]
+    t_high = scans_by_state["DLS_I12__tio2_anode__Op045mVV"]
+    assert t_low["delta_coating"] == t_high["delta_coating"]
+    assert 9_000.0 < float(t_high["delta_coating"]) < 19_000.0
+    assert float(t_low["strain_z"]) == 0.0
+    assert float(t_high["strain_z"]) > 0.15  # Plunger slices gated out -> positive axial compression strain
+
+    # Test --resume (should reuse existing patches instantaneously)
+    res_proc = subprocess.run(
+        base_cmd
+        + [
+            "--drive-root",
+            str(i12_root),
+            "--voxel-size-um",
+            "1.6",
+            "--kpa-per-mvv",
+            "8000",
+            "--beamline",
+            "DLS_I12",
+            "--resume",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "Resuming: reusing existing patches" in res_proc.stdout
+
+    # Test --append from a second beamline (K11 DIAD) with Newton load (`50N` on `10 mm` punch) + --auto-calibrate-carbon
+    _write_synthetic_multiphase_stack(
+        diad_root / "TiO2" / "scan_50N",
+        n_slices=52,
+        hw=56,
+        carbon_prob=0.20,
+        coating_prob=0.08,
+        rng=rng,
+    )
+    subprocess.run(
+        base_cmd
+        + [
+            "--drive-root",
+            str(diad_root),
+            "--voxel-size-um",
+            "0.54",
+            "--punch-diameter-mm",
+            "10.0",
+            "--beamline",
+            "DLS_K11_DIAD",
+            "--auto-calibrate-carbon",
+            "--append",
+        ],
+        check=True,
+    )
+
+    m2 = json.loads((bundle_dir / "bundle_manifest.json").read_text())
+    merged_states = {sc["state"]: sc for sc in m2["scans"]}
+    assert len(merged_states) == 4
+    diad_sc = merged_states["DLS_K11_DIAD__tio2_anode__scan_50N"]
+    # 50 N over pi * (5 mm)^2 = 636.62 kPa
+    assert np.isclose(float(diad_sc["stress_kpa"]), 50.0 / (np.pi * (0.005**2)) * 1e-3, rtol=1e-3)
+    assert np.isclose(float(diad_sc["effective_voxel_size_um"]), 0.54)
+
+
+def test_openimpala_suite_and_diad_xrd_correlation(tmp_path: Path) -> None:
+    """Verify OpenImpala output ingestion CLI and K11 DIAD XRD correlation analysis."""
+    from porousdiff.metrics import export_openimpala_tiff
+    from porousdiff.transport_and_xrd import (
+        correlate_xrd_with_microstructure,
+        generate_openimpala_job_suite,
+    )
+
+    vol = np.zeros((16, 16, 16), dtype=np.uint8)
+    vol[:, 4:10, 4:10] = 1
+    vol[:, 6:8, 6:8] = 2
+    tif_path = tmp_path / "tiffs" / "sample_001.tif"
+    export_openimpala_tiff(vol, tif_path, preserve_multiphase=True)
+
+    suite_dir = tmp_path / "openimpala_suite"
+    info = generate_openimpala_job_suite(
+        [
+            {
+                "method": "real",
+                "state": "diad_s1",
+                "material": "tio2_anode",
+                "beamline": "DLS_K11_DIAD",
+                "load_value": 100.0,
+                "tiff_path": tif_path,
+                "num_phases": 3,
+            },
+            {
+                "method": "porousdiff",
+                "state": "diad_s1",
+                "material": "tio2_anode",
+                "beamline": "DLS_K11_DIAD",
+                "load_value": 100.0,
+                "tiff_path": tif_path,
+                "num_phases": 3,
+            },
+        ],
+        suite_dir=suite_dir,
+    )
+    assert info["num_jobs"] == 6  # 2 methods * 3 phases (pore_ionic, carbon_electronic, coating_active)
+
+    # Write mock OpenImpala solver outputs (both JSON and key=value log formats)
+    jobs = json.loads((suite_dir / "openimpala_jobs.json").read_text())["jobs"]
+    Path(jobs[0]["output_json"]).write_text(
+        json.dumps({"d_eff_z": 0.42, "tau_z": 1.65, "volume_fraction": 0.70})
+    )
+    (suite_dir / "outputs" / f"{jobs[3]['job_id']}.log").write_text(
+        "volume_fraction = 0.69\nd_eff_z = 0.41\ntortuosity_z = 1.68\n"
+    )
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts/evaluation/parse_openimpala_suite.py"),
+            "--suite-dir",
+            str(suite_dir),
+        ],
+        check=True,
+    )
+    assert (suite_dir / "openimpala_transport_parity.csv").is_file()
+    assert (suite_dir / "openimpala_transport_parity.png").is_file()
+
+    # Test DIAD XRD correlation across 4 compression states
+    mock_report: dict[str, object] = {}
+    xrd_lines = ["state,lattice_strain_pct,fwhm_deg"]
+    for idx, lv in enumerate([50.0, 150.0, 300.0, 500.0]):
+        st = f"DLS_K11_DIAD__tio2_s{idx}"
+        easa_real = 0.30 - 0.04 * idx
+        easa_pred = 0.295 - 0.039 * idx
+        tpb_real = 0.12 - 0.015 * idx
+        tau_real = 1.15 + 0.12 * idx
+        metrics_real = {
+            "solid_fraction": {"mean": 0.10 + 0.05 * idx},
+            "coating_fraction": {"mean": 0.04 + 0.01 * idx},
+            "ssa_pore_coating": {"mean": easa_real},
+            "tpb_density": {"mean": tpb_real},
+            "wired_coating_fraction": {"mean": 0.85 + 0.03 * idx},
+            "geodesic_tortuosity_z": {"mean": tau_real},
+        }
+        metrics_pred = {
+            "solid_fraction": {"mean": 0.105 + 0.05 * idx},
+            "coating_fraction": {"mean": 0.041 + 0.01 * idx},
+            "ssa_pore_coating": {"mean": easa_pred},
+            "tpb_density": {"mean": tpb_real - 0.002},
+            "wired_coating_fraction": {"mean": 0.84 + 0.03 * idx},
+            "geodesic_tortuosity_z": {"mean": tau_real + 0.01},
+        }
+        mock_report[st] = {
+            "material": "tio2_anode",
+            "load_value": lv,
+            "real": {"metrics": metrics_real},
+            "methods": {"porousdiff": {"metrics": metrics_pred}},
+        }
+        xrd_lines.append(f"tio2_s{idx},{0.05 + 0.08 * idx:.4f},{0.22 + 0.03 * idx:.4f}")
+
+    xrd_csv = tmp_path / "diad_xrd.csv"
+    xrd_csv.write_text("\n".join(xrd_lines) + "\n")
+    xrd_out = tmp_path / "xrd_out"
+    corr = correlate_xrd_with_microstructure(xrd_csv, mock_report, xrd_out)
+    assert corr["num_matched_states"] == 4
+    r_easa = corr["correlations"]["lattice_strain_pct"]["pred_ssa_pore_coating"]["pearson_r"]
+    assert r_easa < -0.99
+    assert (xrd_out / "xrd_microstructure_merged.csv").is_file()
+    assert (xrd_out / "diad_xrd_microstructure_correlation.png").is_file()
+

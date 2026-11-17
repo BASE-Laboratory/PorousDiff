@@ -37,6 +37,11 @@ from porousdiff.metrics import (
     summarize_metric_records,
 )
 from porousdiff.preprocessing import infer_material_name, parse_load_value
+from porousdiff.transport_and_xrd import (
+    correlate_xrd_with_microstructure,
+    generate_openimpala_job_suite,
+    parse_openimpala_results,
+)
 
 
 def _load_generated_volumes(samples_dir: Path, state_name: str) -> np.ndarray:
@@ -96,9 +101,23 @@ def main() -> None:
     parser.add_argument("--patch-size", type=int, default=96)
     parser.add_argument("--states", nargs="*", default=None, help="Fallback state=load list if no --manifest-json")
     parser.add_argument("--heldout-states", nargs="*", default=None)
+    parser.add_argument("--include-repeats", action="store_true")
+    parser.add_argument("--beamline", default=None, help="Optional beamline filter (e.g. DLS_K11_DIAD)")
     parser.add_argument("--max-real-samples", type=int, default=20)
+    parser.add_argument("--max-openimpala-per-method", type=int, default=5)
     parser.add_argument("--voxel-size-um", type=float, default=1.0)
     parser.add_argument("--export-real-openimpala", action="store_true")
+    parser.add_argument(
+        "--generate-openimpala-suite",
+        action="store_true",
+        help="Generate OpenImpala INI configs and run_openimpala_batch.sh across Real, Baselines & PorousDiff",
+    )
+    parser.add_argument(
+        "--xrd-csv",
+        type=Path,
+        default=None,
+        help="Optional DLS K11 DIAD co-registered XRD CSV to correlate against 3D microstructural observables",
+    )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -112,20 +131,25 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     heldout_set = set(args.heldout_states or [])
 
-    # Build state specification list grouped by material
+    # Build state specification list grouped by (material, beamline)
     state_specs: list[dict[str, object]] = []
     if args.manifest_json is not None:
         manifest = json.loads(args.manifest_json.read_text())
         for sc in manifest.get("scans", []):
-            if bool(sc.get("is_repeat_or_secondary", False)):
+            if not args.include_repeats and bool(sc.get("is_repeat_or_secondary", False)):
+                continue
+            sc_beam = str(sc.get("beamline", "primary"))
+            if args.beamline and sc_beam != args.beamline:
                 continue
             state_specs.append(
                 {
                     "state": str(sc["state"]),
                     "material": str(sc.get("material", "virgin_carbon")),
+                    "beamline": sc_beam,
                     "load_value": float(sc.get("stress_kpa") or sc["load_mv_per_v"]),
                     "voxel_size_um": float(sc.get("effective_voxel_size_um", args.voxel_size_um)),
                     "num_phases": int(sc.get("num_phases", 2)),
+                    "patch_dir_name": sc.get("patch_dir_name"),
                 }
             )
     elif args.states:
@@ -140,37 +164,47 @@ def main() -> None:
                 {
                     "state": st,
                     "material": infer_material_name(st),
+                    "beamline": args.beamline or "primary",
                     "load_value": lv,
                     "voxel_size_um": args.voxel_size_um,
                     "num_phases": 3 if infer_material_name(st) != "virgin_carbon" else 2,
+                    "patch_dir_name": None,
                 }
             )
     else:
         raise ValueError("Provide either --manifest-json or --states")
 
-    state_specs.sort(key=lambda s: (str(s["material"]), float(s["load_value"])))  # type: ignore[arg-type]
+    state_specs.sort(
+        key=lambda s: (str(s["material"]), str(s["beamline"]), float(s["load_value"]))  # type: ignore[arg-type]
+    )
 
-    # Identify lowest-load reference real validation patches per material for Z-compression baselines
+    # Identify lowest-load reference real validation patches per (material, beamline)
     rng = np.random.default_rng(args.seed)
     expected_shape = (args.patch_size, args.patch_size, args.patch_size)
     real_cache: dict[str, np.ndarray] = {}
-    lowest_state_by_mat: dict[str, str] = {}
+    lowest_state_by_group: dict[tuple[str, str], str] = {}
 
     for spec in state_specs:
         st = str(spec["state"])
         mat = str(spec["material"])
-        split_dir = resolve_patch_split_dir(args.data_root, st, args.patch_size, args.version, "val")
+        beam = str(spec["beamline"])
+        pdir_hint = str(spec["patch_dir_name"]) if spec.get("patch_dir_name") else None
+        split_dir = resolve_patch_split_dir(
+            args.data_root, st, args.patch_size, args.version, "val", patch_dir_name=pdir_hint
+        )
         vols = load_split_patches(split_dir, expected_shape=expected_shape)
         if vols.shape[0] > args.max_real_samples:
             idx = np.sort(rng.choice(vols.shape[0], size=args.max_real_samples, replace=False))
             vols = vols[idx]
         real_cache[st] = vols
-        if mat not in lowest_state_by_mat:
-            lowest_state_by_mat[mat] = st
+        if (mat, beam) not in lowest_state_by_group:
+            lowest_state_by_group[(mat, beam)] = st
 
     max_lag = min(32, args.patch_size // 2)
     report: dict[str, object] = {}
     csv_rows: list[dict[str, object]] = []
+    openimpala_entries: list[dict[str, object]] = []
+    want_openimpala = args.export_real_openimpala or args.generate_openimpala_suite
 
     key_metrics = [
         "solid_fraction",
@@ -185,18 +219,27 @@ def main() -> None:
     for spec in state_specs:
         st = str(spec["state"])
         mat = str(spec["material"])
+        beam = str(spec["beamline"])
         lv = float(spec["load_value"])  # type: ignore[arg-type]
         vox = float(spec["voxel_size_um"])  # type: ignore[arg-type]
         n_ph = int(spec["num_phases"])  # type: ignore[arg-type]
         is_heldout = st in heldout_set
 
         real_vols = real_cache[st]
-        if args.export_real_openimpala:
-            for r_i, rv in enumerate(real_vols[:5], start=1):
-                export_openimpala_tiff(
-                    rv,
-                    out_dir / "openimpala_real" / st / f"real_val_{r_i:03d}.tif",
-                    preserve_multiphase=(n_ph == 3),
+        if want_openimpala:
+            for r_i, rv in enumerate(real_vols[: args.max_openimpala_per_method], start=1):
+                tif_p = out_dir / "openimpala_real" / st / f"real_val_{r_i:03d}.tif"
+                export_openimpala_tiff(rv, tif_p, preserve_multiphase=(n_ph == 3))
+                openimpala_entries.append(
+                    {
+                        "method": "real",
+                        "state": st,
+                        "material": mat,
+                        "beamline": beam,
+                        "load_value": lv,
+                        "tiff_path": tif_p,
+                        "num_phases": n_ph,
+                    }
                 )
 
         real_recs = [evaluate_multiphase_physics(v, voxel_size=vox) for v in real_vols]
@@ -204,8 +247,8 @@ def main() -> None:
         real_s2 = _mean_s2_curves(real_vols, max_lag=max_lag)
         target_sf = float(real_sum["solid_fraction"]["mean"])
 
-        # Construct literature Z-compression baselines from uncompressed scan of same material
-        ref_st = lowest_state_by_mat[mat]
+        # Construct literature Z-compression baselines from uncompressed scan of same (material, beamline)
+        ref_st = lowest_state_by_group[(mat, beam)]
         ref_vols = real_cache[ref_st]
         affine_vols = np.stack(
             [
@@ -238,6 +281,23 @@ def main() -> None:
             if (samples_dir / st).is_dir():
                 methods_vols[lbl] = _load_generated_volumes(samples_dir, st)
 
+        if want_openimpala:
+            for m_name, m_vols in methods_vols.items():
+                for b_i, mv_vol in enumerate(m_vols[: args.max_openimpala_per_method], start=1):
+                    tif_p = out_dir / "openimpala_methods" / m_name / st / f"{m_name}_{b_i:03d}.tif"
+                    export_openimpala_tiff(mv_vol, tif_p, preserve_multiphase=(n_ph == 3))
+                    openimpala_entries.append(
+                        {
+                            "method": m_name,
+                            "state": st,
+                            "material": mat,
+                            "beamline": beam,
+                            "load_value": lv,
+                            "tiff_path": tif_p,
+                            "num_phases": n_ph,
+                        }
+                    )
+
         methods_summary: dict[str, object] = {}
         for m_name, m_vols in methods_vols.items():
             m_recs = [evaluate_multiphase_physics(v, voxel_size=vox) for v in m_vols]
@@ -254,6 +314,7 @@ def main() -> None:
             row: dict[str, object] = {
                 "state": st,
                 "material": mat,
+                "beamline": beam,
                 "load_value": lv,
                 "is_heldout": is_heldout,
                 "method": m_name,
@@ -273,6 +334,7 @@ def main() -> None:
 
         report[st] = {
             "material": mat,
+            "beamline": beam,
             "load_value": lv,
             "voxel_size_um": vox,
             "is_heldout": is_heldout,
@@ -281,7 +343,7 @@ def main() -> None:
             "methods": methods_summary,
         }
         print(
-            f"[{st} | {mat} | heldout={is_heldout}] real φ_s={target_sf:.4f} | "
+            f"[{st} | {mat} ({beam}) | heldout={is_heldout}] real φ_s={target_sf:.4f} | "
             + " | ".join(
                 f"{m}: s2_rmse={methods_summary[m]['s2_rmse']:.4f}"  # type: ignore[index]
                 for m in methods_summary
@@ -297,6 +359,32 @@ def main() -> None:
             writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
             writer.writeheader()
             writer.writerows(csv_rows)
+
+    if want_openimpala and openimpala_entries:
+        suite_info = generate_openimpala_job_suite(
+            tiff_entries=openimpala_entries,
+            suite_dir=out_dir / "openimpala_suite",
+        )
+        print(
+            f"Generated OpenImpala batch suite ({suite_info['num_jobs']} jobs) -> {suite_info['script_path']}",
+            flush=True,
+        )
+        if (out_dir / "openimpala_suite" / "outputs").is_dir():
+            parse_openimpala_results(
+                suite_dir=out_dir / "openimpala_suite",
+                out_csv=out_dir / "openimpala_transport_parity.csv",
+            )
+
+    if args.xrd_csv is not None:
+        xrd_summary = correlate_xrd_with_microstructure(
+            xrd_csv_path=args.xrd_csv,
+            benchmark_report=report,
+            out_dir=out_dir / "diad_xrd_analysis",
+        )
+        print(
+            f"Saved DIAD XRD correlation ({xrd_summary['num_matched_states']} states) -> {out_dir / 'diad_xrd_analysis'}",
+            flush=True,
+        )
 
     # Plot Real XCT vs Baselines vs PorousDiff across loads per material
     materials = sorted({str(s["material"]) for s in state_specs})
