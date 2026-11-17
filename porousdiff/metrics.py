@@ -208,6 +208,89 @@ def geodesic_pore_tortuosity(volume: np.ndarray, axis: int = 0) -> float:
     return float(reached.mean() / (depth - 1))
 
 
+def _count_tpb_edges_along_axis(vol: np.ndarray, axis: int) -> int:
+    """Count voxel grid edges along `axis` whose 2x2 incident voxels contain {0, 1, 2}."""
+    v = np.moveaxis(vol, axis, 0)
+    # Incident 2x2 voxels around each interior grid line parallel to axis 0
+    c00 = v[:, :-1, :-1]
+    c01 = v[:, :-1, 1:]
+    c10 = v[:, 1:, :-1]
+    c11 = v[:, 1:, 1:]
+
+    has0 = (c00 == 0) | (c01 == 0) | (c10 == 0) | (c11 == 0)
+    has1 = (c00 == 1) | (c01 == 1) | (c10 == 1) | (c11 == 1)
+    has2 = (c00 == 2) | (c01 == 2) | (c10 == 2) | (c11 == 2)
+    return int(np.count_nonzero(has0 & has1 & has2))
+
+
+def multiphase_interfacial_metrics(volume: np.ndarray, voxel_size: float = 1.0) -> dict[str, float]:
+    """Compute 3-phase coated-electrode electrochemical descriptors (`0=pore, 1=carbon, 2=coating`).
+
+    Returns:
+      - `carbon_fraction`, `coating_fraction`, `coating_to_carbon_ratio`
+      - `ssa_pore_coating`: Electrochemically Active Surface Area (EASA, 1/voxel_size)
+      - `ssa_pore_carbon`: Bare carbon-electrolyte surface area (1/voxel_size)
+      - `ssa_carbon_coating`: Electronic current-collector/coating contact area (1/voxel_size)
+      - `tpb_density`: Triple-Phase Boundary length per unit volume (1/voxel_size^2)
+      - `wired_coating_fraction`: Fraction of active coating electrically wired to Z boundaries
+    """
+    if voxel_size <= 0:
+        raise ValueError("voxel_size must be positive")
+    vol = np.asarray(volume, dtype=np.uint8)
+    if vol.ndim != 3:
+        raise ValueError(f"Expected 3D volume (Z, Y, X), got shape {vol.shape}")
+
+    n_voxels = float(vol.size)
+    area_norm = n_voxels * voxel_size
+    carbon_frac = float((vol == 1).mean())
+    coat_frac = float((vol == 2).mean())
+
+    def _pair_faces(a: int, b: int) -> float:
+        total = 0
+        for sl1, sl2 in (
+            (vol[1:, :, :], vol[:-1, :, :]),
+            (vol[:, 1:, :], vol[:, :-1, :]),
+            (vol[:, :, 1:], vol[:, :, :-1]),
+        ):
+            total += int(np.count_nonzero(((sl1 == a) & (sl2 == b)) | ((sl1 == b) & (sl2 == a))))
+        return float(total) / area_norm
+
+    tpb_edges = (
+        _count_tpb_edges_along_axis(vol, 0)
+        + _count_tpb_edges_along_axis(vol, 1)
+        + _count_tpb_edges_along_axis(vol, 2)
+    )
+    tpb_density = float(tpb_edges) / (n_voxels * (voxel_size**2))
+
+    # Electrical percolation of active coating via 6-connected solid backbone (phase >= 1) to Z=0 or Z=D-1
+    total_coat = int(np.count_nonzero(vol == 2))
+    if total_coat == 0:
+        wired_frac = 0.0
+    else:
+        struct6 = np.zeros((3, 3, 3), dtype=np.uint8)
+        struct6[1, 1, :] = 1
+        struct6[1, :, 1] = 1
+        struct6[:, 1, 1] = 1
+        solid_lbl, _ = label(vol >= 1, structure=struct6)
+        boundary_ids = (set(np.unique(solid_lbl[0, :, :])) | set(np.unique(solid_lbl[-1, :, :]))) - {0}
+        if not boundary_ids:
+            wired_frac = 0.0
+        else:
+            wired_mask = np.isin(solid_lbl, list(boundary_ids)) & (vol == 2)
+            wired_frac = float(np.count_nonzero(wired_mask) / total_coat)
+
+    return {
+        "carbon_fraction": carbon_frac,
+        "coating_fraction": coat_frac,
+        "coating_to_carbon_ratio": coat_frac / max(carbon_frac, 1e-8) if coat_frac > 0 else 0.0,
+        "ssa_pore_coating": _pair_faces(0, 2),
+        "ssa_pore_carbon": _pair_faces(0, 1),
+        "ssa_carbon_coating": _pair_faces(1, 2),
+        "tpb_density": tpb_density,
+        "wired_coating_fraction": wired_frac,
+    }
+
+
 def evaluate_volume_physics(volume: np.ndarray, voxel_size: float = 1.0) -> dict[str, float]:
     """Compute the full scalar physics validation suite on a single 3D binary volume."""
     vol = validate_binary_volume(volume)
@@ -223,6 +306,14 @@ def evaluate_volume_physics(volume: np.ndarray, voxel_size: float = 1.0) -> dict
     metrics["geodesic_tortuosity_z"] = geodesic_pore_tortuosity(vol, axis=0)
     metrics["geodesic_tortuosity_y"] = geodesic_pore_tortuosity(vol, axis=1)
     metrics["geodesic_tortuosity_x"] = geodesic_pore_tortuosity(vol, axis=2)
+    return metrics
+
+
+def evaluate_multiphase_physics(volume: np.ndarray, voxel_size: float = 1.0) -> dict[str, float]:
+    """Compute combined pore-transport + 3-phase electrochemical metrics on `{0, 1, 2}` volumes."""
+    vol = np.asarray(volume, dtype=np.uint8)
+    metrics = evaluate_volume_physics(vol >= 1, voxel_size=voxel_size)
+    metrics.update(multiphase_interfacial_metrics(vol, voxel_size=voxel_size))
     return metrics
 
 
@@ -248,10 +339,21 @@ def summarize_metric_records(records: Sequence[dict[str, float]]) -> dict[str, d
     return summary
 
 
-def export_openimpala_tiff(volume: np.ndarray, output_path: Path, pore_label: int = 0, solid_label: int = 1) -> Path:
+def export_openimpala_tiff(
+    volume: np.ndarray,
+    output_path: Path,
+    pore_label: int = 0,
+    solid_label: int = 1,
+    preserve_multiphase: bool = False,
+) -> Path:
     """Export a 3D multi-page `uint8` TIFF stack formatted for OpenImpala transport solvers."""
-    vol = validate_binary_volume(volume)
-    mapped = np.where(vol > 0, solid_label, pore_label).astype(np.uint8)
+    vol = np.asarray(volume)
+    if vol.ndim != 3:
+        raise ValueError(f"Expected 3D volume (Z, Y, X), got shape {vol.shape}")
+    if preserve_multiphase:
+        mapped = np.clip(vol, 0, 255).astype(np.uint8)
+    else:
+        mapped = np.where(vol > 0, solid_label, pore_label).astype(np.uint8)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tifffile.imwrite(output_path, mapped)

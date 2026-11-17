@@ -8,32 +8,27 @@ Developed by [BASE Laboratory](https://github.com/BASE-Laboratory) using NVIDIA 
 
 ## Overview
 
-PorousDiff trains a physics-validated 3D denoising diffusion model across synchrotron XCT scans of carbon-felt electrodes acquired under progressive mechanical compression (`0.008` to `0.053 mV/V` load-cell states). Once trained, the model acts as a **virtual compression rig**: given *any* continuous scalar load value—including unseen intermediate compressions—it generates 3D binary porous microstructures (`1 = solid fiber`, `0 = pore`) matching experimental solid fraction, specific surface area, through-plane (`Z`) vs. in-plane (`XY`) chord-length anisotropy, two-point spatial correlation $S_2(r)$, 3D solid/pore percolation, and geodesic pore tortuosity. Generated volumes export directly as multi-page `uint8` TIFF stacks for downstream transport simulations in OpenImpala.
+PorousDiff trains a physics-validated 3D denoising diffusion surrogate across multi-resolution synchrotron XCT compression scans of porous battery electrodes—spanning **Virgin Carbon Felt**, **$\text{TiO}_2$-coated Carbon Felt Anodes**, and **Copper Hexacyanoferrate (CuHCF) Coated Cathodes** (plus **Diamond K11 DIAD** co-registered XCT/XRD scans).
+
+Once trained, PorousDiff acts as a **synchrotron beamtime multiplier & virtual compression rig**:
+1. **Continuous Mechanical Compression & Non-Affine Physics:** Given *any* compressive stress (`kPa`) or load (`mV/V`), generates 3D multi-phase microstructures (`0 = pore`, `1 = carbon fiber`, `2 = active TiO2/CuHCF coating`) at physical Representative Elementary Volume (REV) scale, capturing fiber buckling, `XY/Z` anisotropy, active-coating occlusion ($\text{SSA}_{\text{pore–coating}}$), triple-phase boundaries ($L_{\text{TPB}}$), electrical wiring, and geodesic tortuosity where heuristic numerical Z-squashing fails.
+2. **Few-Shot Cross-Electrode Transfer:** Combines 1 densely scanned mechanical reference felt (Virgin Carbon Felt) with **only 2–3 sparse beamtime loads** of functionalized coated electrodes ($\text{TiO}_2$ or CuHCF) to predict intermediate coated-electrode compression states—cutting required synchrotron beamtime per new electrode chemistry by **3×–4×**.
 
 ---
 
-## Key Capabilities (`v0.2` Conditional Pipeline)
+## Key Capabilities (`v0.3` Unified Multi-Electrode Pipeline)
 
-1. **Calibrated XCT Segmentation & Automatic Artifact Gating** (`porousdiff/preprocessing.py`, `scripts/preprocessing/segment_carbon_xct.py`)
-   - Masks out exterior air surrounding the circular electrode punch (`--roi-radius-fraction 0.70`).
-   - Subtracts a pore-mode-clamped low-frequency background and applies a single physical `delta_threshold` across all compression states, preventing sparse low-load slices (`0.008 mV/V`) from suffering per-slice Otsu inversion while preserving fiber densification under heavy compression.
-   - Automatically detects and excludes non-physical mid-stack bullseye ring/stitch seams (via azimuthal radial variance scoring) and the rising bottom compression plunger (`valid_slices.json`).
+1. **Calibrated 2-Phase & 3-Phase XCT Segmentation, Artifact Gating & REV Binning** (`porousdiff/preprocessing.py`, `scripts/preprocessing/prepare_local_drive_bundle.py`)
+   - Masks exterior air outside the circular electrode punch (`--roi-radius-fraction 0.70`), subtracts pore-mode-clamped background, and applies consistent physical thresholds (`delta_carbon`, `delta_coating`) separating pore (`0`), carbon scaffold (`1`), and high-$Z$ active deposits (`2`: $\text{TiO}_2$ / CuHCF), with a 10-second `--preview-only` Spyder diagnostic overlay (`qa/multiphase_overlay_diagnostic.png`).
+   - Automatically excludes bullseye ring seams (`compute_radial_ring_score`) and compression plungers (`valid_slices.json`), and supports topology-preserving `--spatial-bin 2` REV pooling (`~260–380 µm` physical cubes).
 
-2. **Z-Stratified, Leak-Free 3D Patch Extraction** (`scripts/preprocessing/extract_carbon_3d_patches.py`)
-   - Enforces a spatial buffer of at least `patch_size` slices between `train` and `val` Z-slabs so zero voxels or adjacent boundary fibers leak across splits.
-   - Uses round-robin Z-window stratification so `max_patches` spans the entire clean thickness of the felt rather than saturating inside the top few Z windows.
-   - Writes stacked `patches.npy` archives for fast single-read RAM caching on HPC lustre filesystems.
+2. **Hierarchical Multi-Phase + Multi-Modal Conditioning (`v`-prediction + Zero-SNR)** (`porousdiff/models.py`, `porousdiff/data.py`)
+   - **Hierarchical 2-channel Zero-SNR representation (`c_solid`, `c_coating`):** Unifies 2-phase Virgin Felt and 3-phase $\text{TiO}_2$/CuHCF electrodes so Channel 0 transfers mechanical scaffold compression directly into sparse-load coated electrodes while Channel 1 learns active-coating morphology and triple-phase contacts.
+   - **Multi-modal conditioning (`MultiModalConditionEmbedder`):** Conditions every UNet ResBlock on normalized **compressive stress / load**, **electrode chemistry ID** (`virgin_carbon`, `tio2_anode`, `cuhcf_cathode`), and **physical voxel size** ($\log(\Delta x / \Delta x_{\text{ref}})$ for cross-beamline DIAD compatibility), paired with Zero-Terminal-SNR schedules, `v_prediction`, EMA (`0.9995`), and $D_4(XY) \times \mathbb{Z}_2(Z)$ compression-safe symmetry.
 
-3. **Continuous Scalar Load-Conditioned 3D Diffusion (`v`-prediction + Zero-SNR)** (`porousdiff/models.py`, `scripts/training/train_carbon_conditional_96.py`)
-   - **Multi-scale conditioning (`ContinuousLoadConditionedUNet`):** Maps normalized continuous load into a smooth Fourier/sinusoidal embedding injected into `temb` across every encoder, bottleneck, and decoder ResBlock (`96³`, `48³`, `24³`), paired with 3-channel input concatenation `[x_t, cond_norm * mask, mask]` (`in_channels = 3`). Eliminates the 1-token cross-attention softmax degeneracy (`softmax([s]) == 1`) and prevents midpoint (`0.0`) vs. unconditional CFG (`mask = 0`) collisions.
-   - **Unbiased porosity (`zero_snr_scaled_linear` + `v_prediction` + EMA):** Rescales the noise schedule to exact zero terminal SNR ($\bar{\alpha}_{T-1} = 0$) with velocity (`v`) prediction and EMA (`0.9995`) weights, eliminating residual signal leakage that previously biased generated solid fractions ~3× upward toward `0.50`.
-   - **Anisotropy-preserving 3D augmentation:** Samples from the 16-element symmetry group $D_4(XY) \times \mathbb{Z}_2(Z)$ that rotates/flips in-plane `XY` and flips `Z` without ever swapping the vertical compression axis `Z` with `X` or `Y`.
-   - **GH200 `bf16` throughput:** `torch.amp.autocast('cuda', dtype=torch.bfloat16)` with `batch_size=4, grad_accum=2` completes 100 epochs on `96³` patches inside a single 6-hour GH200 Slurm allocation, with full RNG/EMA/optimizer `--resume` support.
-
-4. **Unseen Load Interpolation & 3D Physics Validation** (`scripts/evaluation/sample_carbon_conditional_96.py`, `scripts/evaluation/evaluate_carbon_physics.py`)
-   - Supports fast 100-step DDIM (`set_alpha_to_one=False`) and 1000-step DDPM sampling with classifier-free guidance (`--guidance-scale 1.5`).
-   - Generates fixed-seed continuous compression sweeps (`--sweep-loads`) showing the same fiber network progressively compressing along `Z`.
-   - Evaluates and plots real vs. generated **solid fraction**, **specific surface area (SSA)**, **directional pore/solid chord lengths & `XY/Z` anisotropy**, **directional $S_2(r)$**, **6-connected solid integrity & pore percolation**, and **3D geodesic pore tortuosity** (`--heldout-states` highlights unseen interpolated loads).
+3. **Head-to-Head Numerical Z-Compression Baselines & 3-Phase Electrochemical Suite** (`porousdiff/baselines.py`, `porousdiff/metrics.py`, `scripts/evaluation/evaluate_beamtime_multiplier.py`)
+   - Directly benchmarks PorousDiff against standard literature heuristics (`affine_z_compress_to_target` and `pillar_pore_deletion_compress`) on real held-out synchrotron loads.
+   - Evaluates **solid & coating fractions**, **EASA ($\text{SSA}_{\text{pore–coating}}$)**, **electronic contact area ($\text{SSA}_{\text{carbon–coating}}$)**, **triple-phase boundary density ($L_{\text{TPB}}$)**, **wired coating fraction**, **directional chord anisotropy**, **$S_2(r)$ RMSE**, **3D percolation**, **geodesic tortuosity**, and **OpenImpala** multi-page TIFF stacks.
 
 ---
 
@@ -43,23 +38,25 @@ PorousDiff trains a physics-validated 3D denoising diffusion model across synchr
 PorousDiff/
 ├── porousdiff/
 │   ├── __init__.py
-│   ├── preprocessing.py      # Circular ROI, pore-referenced segmentation, ring/plunger gating, Z-stratified planning
-│   ├── data.py               # RAM-cached dataset, D4(XY)xZ2(Z) symmetries, RNG checkpoint helpers
-│   ├── models.py             # Zero-SNR schedule, ContinuousScalarLoadEmbedder, ContinuousLoadConditionedUNet, EMA
-│   └── metrics.py            # Solid fraction, SSA, chords, anisotropy, FFT S2(r), percolation, geodesic tortuosity, OpenImpala export
+│   ├── preprocessing.py      # Circular ROI, 2/3-phase segmentation, ring/plunger gating, 2x REV binning, kPa calibration
+│   ├── baselines.py          # Literature heuristics: affine Z-rescaling & vertical pillar pore-deletion compression
+│   ├── data.py               # Hierarchical {0,1,2} <-> [-1,1]^2 encoding, balanced MultiElectrodePatchDataset, symmetries
+│   ├── models.py             # Zero-SNR schedule, MultiModalConditionEmbedder (stress + material + voxel size), 3D UNet, EMA
+│   └── metrics.py            # Porosity, EASA, TPB density, wired coating, chords, S2(r), percolation, tortuosity, OpenImpala
 ├── scripts/
 │   ├── preprocessing/
-│   │   ├── prepare_local_drive_bundle.py  # Local Windows/Spyder stream-bundler (318 GB raw -> ~800 MB patch zip)
+│   │   ├── prepare_local_drive_bundle.py   # Spyder/CLI multi-electrode stream-bundler + 10s --preview-only overlay
 │   │   ├── segment_carbon_xct.py
 │   │   └── extract_carbon_3d_patches.py
 │   ├── training/
-│   │   └── train_carbon_conditional_96.py
+│   │   └── train_carbon_conditional_96.py  # Single-material or multi-electrode 3-phase training + Few-Shot filtering
 │   └── evaluation/
 │       ├── sample_carbon_conditional_96.py
-│       └── evaluate_carbon_physics.py
-├── slurm/                    # Isambard-AI GH200 Slurm batch scripts
+│       ├── evaluate_carbon_physics.py
+│       └── evaluate_beamtime_multiplier.py # Real XCT vs. Affine/Pillar Z-Squash vs. PorousDiff benchmark
+├── slurm/                    # Isambard-AI GH200 Slurm batch scripts (including run_beamtime_multiplier.slurm)
 ├── tests/                    # Automated pytest unit + end-to-end pipeline verification
-├── experiments.md            # Chronological experimental log (Experiments 1–14)
+├── experiments.md            # Chronological experimental log
 ├── pyproject.toml
 ├── environment.yml
 └── requirements-isambard.txt
@@ -67,86 +64,57 @@ PorousDiff/
 
 ---
 
-## Isambard-AI (GH200) Quickstart & Handover Guide
+## Quickstart & Handover Guide
 
-### 1. Environment Setup (one-time)
+### 1. Environment Setup (Isambard-AI GH200)
 
 ```bash
 cd /projects/u6uc/asif/code/PorousDiff
-git fetch origin
-git checkout feature/paper-ready-conditional
-
+git fetch origin && git checkout feature/paper-ready-conditional && git pull
 source /projects/u6uc/asif/.venv/bin/activate
 pip install --no-build-isolation --no-deps -e .
-
-# Run local CPU verification suite (~45s) before submitting GPU jobs
 pytest -v
 ```
 
-> All scripts resolve data and results relative to `POROUSDIFF_ROOT` (defaults automatically to `/projects/u6uc/asif` when present, or current directory otherwise).
+### 2. Local Drive Bundling (Windows Lab PC / Spyder)
 
-### 2. Data Preparation (Two Options)
+1. **10-Second 3-Phase Threshold Preview** (verify `pore = black`, `carbon = cyan`, `TiO2/CuHCF = gold` on 1 scan per material first):
+   ```bash
+   python scripts/preprocessing/prepare_local_drive_bundle.py \
+       --drive-root "D:/dry_samples" \
+       --output-dir "D:/porousdiff_upload_bundle" \
+       --datasets tio2_sample_folder cuhcf_sample_folder \
+       --auto-multiphase --preview-only
+   ```
+2. **Full Multi-Electrode REV Bundle** (`2×` binned `96³` patches + `bundle_manifest.json` + single `.zip` upload archive):
+   ```bash
+   python scripts/preprocessing/prepare_local_drive_bundle.py \
+       --drive-root "D:/dry_samples" \
+       --output-dir "D:/porousdiff_upload_bundle" \
+       --auto-multiphase --spatial-bin 2 \
+       --voxel-size-um 1.6 --kpa-per-mvv 8500 \
+       --zip
+   ```
 
-#### Option A: Local Windows / Spyder Stream-Bundler (avoids uploading 300+ GB of raw TIFFs)
-On the lab machine holding `D:\dry_samples`, open `scripts/preprocessing/prepare_local_drive_bundle.py` in Spyder and press **F5** (or run from Anaconda Prompt):
-
-```bash
-python scripts/preprocessing/prepare_local_drive_bundle.py \
-    --drive-root "D:/dry_samples" \
-    --output-dir "D:/porousdiff_upload_bundle" \
-    --zip
-```
-
-This stream-segments every `crbon_virgin_*` scan, gates out bullseye/plunger slices, separates `primary_states.json` (`crbon_virgin_1_*`) from repeat scans (`rep2`, `crbon_virgin_2_*`), and packs `D:\porousdiff_upload_bundle.zip` (~`800 MB`), which unzips directly into `/projects/u6uc/asif/data/carbon_virgin/`.
-
-#### Option B: Direct Segmentation & Patch Extraction on Isambard-AI
-For raw scans staged directly on Isambard-AI (`Op008mVV`, `Op018mVV`, `Op033mVV`, or `0p008mVV`..`0p053mVV` — both `data/raw/<name>/*.tif` and `data/raw/<name>/rec_16bit_Paganin/*.tif` are supported automatically):
-
-```bash
-sbatch slurm/segment_carbon_xct.slurm
-sbatch slurm/extract_carbon_96.slurm
-```
-
-Inspect `<POROUSDIFF_ROOT>/data/carbon_virgin/<dataset>_binary_corrected_carbon_calibrated_v1/z_quality_diagnostic.png`, `segmentation_report.json`, and `valid_slices.json` to confirm monotonic clean solid fractions and excluded ring/plunger intervals.
-
-### 3. Training (Observed + Held-Out Interpolation + Ablations)
-
-Run a quick 4-step GPU smoke test first, then launch the 100-epoch `bf16` training job (if pre-empted or extended, resubmitting the **exact same** `train_carbon_conditional_96.slurm` automatically detects `latest.pth` and resumes):
+### 3. Training, Sampling & Beamtime-Multiplier Evaluation (Isambard-AI)
 
 ```bash
-# 3-state baseline verification:
+# Milestone 1: Single-material 3-state or Virgin Felt pilot
 sbatch slurm/test_carbon_conditional_96.slurm
 sbatch slurm/train_carbon_conditional_96.slurm
-
-# Paper interpolation experiment (train on primary loads while holding out 0.015, 0.028, 0.043 mV/V):
-sbatch --export=ALL,EXPERIMENT="carbon_cond96_interp_paper",STATES="crbon_virgin_1_0p008mVV=0.008 crbon_virgin_1_0p010mVV=0.010 crbon_virgin_1_0p012mVV=0.012 crbon_virgin_1_0p019mVV=0.019 crbon_virgin_1_0p024mVV=0.024 crbon_virgin_1_0p033mVV=0.033 crbon_virgin_1_0p038mVV=0.038 crbon_virgin_1_0p048mVV=0.048 crbon_virgin_1_0p053mVV=0.053" \
-    slurm/train_carbon_conditional_96.slurm
-
-# Controlled paper ablations (Zero-SNR vs standard linear; multiscale Fourier vs legacy 1-token cross-attn):
-sbatch --export=ALL,EXPERIMENT="ablation_std_eps",SCHEDULE="scaled_linear_beta",PREDICTION_TYPE="epsilon" \
-    slurm/train_carbon_conditional_96.slurm
-sbatch --export=ALL,EXPERIMENT="ablation_legacy_xattn",CONDITIONING_MODE="legacy_crossattn" \
-    slurm/train_carbon_conditional_96.slurm
-```
-
-### 4. Sampling, Continuous Compression Sweep & Physics Evaluation
-
-Generates `N = 20` 3D realizations per load (both training and unseen held-out loads), runs a fixed-noise continuous compression sweep across `0.008..0.053 mV/V`, exports paired generated and real validation OpenImpala multi-page TIFF stacks (`--export-openimpala` and `--export-real-openimpala`), and produces `physics_validation_report.json`, `physics_compression_curves.png`, and `s2_correlation_comparison.png`:
-
-```bash
-# 3-state baseline evaluation:
 sbatch slurm/sample_carbon_conditional_96.slurm
 
-# Paper interpolation evaluation (highlighting unseen held-out loads):
-sbatch --export=ALL,EXPERIMENT="carbon_cond96_interp_paper",EVAL_STATES="crbon_virgin_1_0p008mVV=0.008 crbon_virgin_1_0p010mVV=0.010 crbon_virgin_1_0p012mVV=0.012 crbon_virgin_1_0p015mVV=0.015 crbon_virgin_1_0p019mVV=0.019 crbon_virgin_1_0p024mVV=0.024 crbon_virgin_1_0p028mVV=0.028 crbon_virgin_1_0p033mVV=0.033 crbon_virgin_1_0p038mVV=0.038 crbon_virgin_1_0p043mVV=0.043 crbon_virgin_1_0p048mVV=0.048 crbon_virgin_1_0p053mVV=0.053",HELDOUT_STATES="crbon_virgin_1_0p015mVV crbon_virgin_1_0p028mVV crbon_virgin_1_0p043mVV" \
-    slurm/sample_carbon_conditional_96.slurm
+# Core Paper Run: Unified Multi-Electrode Beamtime Multiplier (hold out intermediate TiO2 & CuHCF loads,
+# sample all states, and benchmark head-to-head against Affine Z-Squashing & Pillar Pore-Deletion)
+sbatch --export=ALL,EXPERIMENT="beamtime_fewshot_96",HELDOUT_STATES="tio2_0p018mVV tio2_0p033mVV cuhcf_0p018mVV cuhcf_0p033mVV" \
+    slurm/run_beamtime_multiplier.slurm
 ```
 
 ---
 
 ## Historical Benchmark Summary
 
-Earlier unconditional baselines (`TiO₂`, `Op001mVV` / `Op026mVV`) established the motivation for the calibrated segmentation and Zero-SNR `v`-prediction formulation introduced in `v0.2` (full log in [`experiments.md`](experiments.md)):
+Earlier unconditional baselines (`TiO₂`, `Op001mVV` / `Op026mVV`) established the motivation for the calibrated segmentation and Zero-SNR `v`-prediction formulation (full log in [`experiments.md`](experiments.md)):
 
 | Experiment | Formulation | Patch Size | Real $\phi_s$ | Generated $\phi_s$ | Key Diagnostic Takeaway |
 |---|---|---:|---:|---:|---|
@@ -154,7 +122,7 @@ Earlier unconditional baselines (`TiO₂`, `Op001mVV` / `Op026mVV`) established 
 | Exp 6–11 | Grayscale 3D DDPM (`epsilon`, std linear) | `64³` | — | — | Blurry boundaries & horizontal banding |
 | Exp 12 | Unconditional Binary DDPM (`epsilon`, std schedule) | `64³` | `0.1318` | `0.3948` | Non-zero terminal SNR shifts sparse binary mean ~3× toward `0.50` |
 | Exp 13 | Unconditional Binary DDPM (`epsilon`, std schedule) | `96³` | `0.0984` | `0.2806` | `96³` feasible on GH200, but schedule/conditioning fixes required |
-| **Exp 14 (`v0.2`)** | **Continuous Load-Conditioned DDPM (`v`-pred + Zero-SNR + EMA)** | **`96³`** | **Calibrated across `0.008–0.053 mV/V`** | **Physics-validated suite** | **Fixes Otsu inversion, ring/plunger seams, 1-token attention collapse & terminal-SNR bias** |
+| **Exp 14 (`v0.3`)** | **Multi-Electrode 3-Phase Load-Conditioned DDPM (`v`-pred + Zero-SNR + REV)** | **`96³` (`2×` REV)** | **Virgin + $\text{TiO}_2$ + CuHCF + DIAD** | **Benchmarked vs. Z-squashing** | **Unifies 3-phase EASA/TPB prediction & 3×–4× synchrotron beamtime reduction** |
 
 ---
 

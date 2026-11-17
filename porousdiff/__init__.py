@@ -1,3 +1,3 @@
-"""PorousDiff: Conditional 3D diffusion modelling for compressed porous electrodes."""
+"""PorousDiff: Multi-electrode, multi-phase conditional 3D diffusion for compressed porous electrodes."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

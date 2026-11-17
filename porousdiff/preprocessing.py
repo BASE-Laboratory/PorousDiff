@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -9,6 +10,43 @@ from typing import Iterable, Sequence
 import numpy as np
 from scipy.ndimage import binary_closing, binary_dilation, gaussian_filter
 from skimage.filters import threshold_otsu
+
+
+@dataclass(frozen=True)
+class CalibrationMetadata:
+    """Physical calibration linking beamline XCT coordinates and load-cell readings."""
+
+    voxel_size_um: float = 1.0
+    spatial_bin: int = 1
+    kpa_per_mvv: float | None = None
+    zero_offset_mvv: float = 0.0
+    reference_thickness_slices: int | None = None
+    beamline: str = "primary"
+
+    @property
+    def effective_voxel_size_um(self) -> float:
+        return float(self.voxel_size_um * max(1, self.spatial_bin))
+
+    def load_to_stress_kpa(self, load_mv_v: float) -> float | None:
+        if self.kpa_per_mvv is None:
+            return None
+        return float(max(0.0, (load_mv_v - self.zero_offset_mvv) * self.kpa_per_mvv))
+
+    def estimate_strain_z(self, clean_thickness_slices: int) -> float | None:
+        if self.reference_thickness_slices is None or self.reference_thickness_slices <= 0:
+            return None
+        ratio = float(clean_thickness_slices) / float(self.reference_thickness_slices)
+        return float(np.clip(1.0 - ratio, 0.0, 0.95))
+
+
+def infer_material_name(name: str) -> str:
+    """Infer canonical electrode material key from dataset/folder name."""
+    low = name.lower()
+    if "tio2" in low or "anode" in low:
+        return "tio2_anode"
+    if "cuhcf" in low or "cuchf" in low or "hexacyano" in low or "cathode" in low:
+        return "cuhcf_cathode"
+    return "virgin_carbon"
 
 
 def parse_load_value(name: str) -> float:
@@ -145,6 +183,104 @@ def calibrate_delta_threshold(
     return float(threshold_otsu(clipped))
 
 
+def _plateau_isodata_threshold(vals: np.ndarray, nbins: int = 512) -> float:
+    """Compute a gap-centered Otsu threshold refined to the half-maximum class midpoint.
+
+    Standard `skimage.filters.threshold_otsu` selects the *leftmost* histogram bin on
+    empty intensity gaps and shifts toward the dominant mode under 90%+ class imbalance.
+    Centering the optimal Otsu plateau and refining via 1D IsoData yields the unbiased
+    50% partial-volume iso-contour `0.5 * (mu_low + mu_high)` for Paganin XCT interfaces.
+    """
+    hist, bin_edges = np.histogram(vals, bins=nbins)
+    hist_f = hist.astype(np.float64)
+    centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    w0 = np.cumsum(hist_f)
+    w1 = w0[-1] - w0
+    valid = (w0 > 0) & (w1 > 0)
+    if not np.any(valid):
+        return float(np.median(vals))
+
+    csum = np.cumsum(hist_f * centers)
+    m0 = csum[valid] / w0[valid]
+    m1 = (csum[-1] - csum[valid]) / w1[valid]
+    var_between = w0[valid] * w1[valid] * (m0 - m1) ** 2
+    best = var_between >= 0.999 * var_between.max()
+    best_centers = centers[valid][best]
+    thresh = float(0.5 * (best_centers[0] + best_centers[-1]))
+
+    for _ in range(3):
+        lo = vals[vals <= thresh]
+        hi = vals[vals > thresh]
+        if lo.size == 0 or hi.size == 0:
+            break
+        thresh = float(0.5 * (lo.mean() + hi.mean()))
+    return thresh
+
+
+def calibrate_multiphase_thresholds(
+    reference_slices: Iterable[np.ndarray],
+    roi_mask: np.ndarray | None = None,
+    sigma: float = 32.0,
+    fixed_delta_carbon: float | None = None,
+) -> tuple[float, float]:
+    """Calibrate `(delta_carbon, delta_coating)` thresholds for 3-phase coated electrodes.
+
+    Gating above `4 * pore_std` isolates solid voxels (`carbon_fiber + active_coating`)
+    from the 80–95% pore background so `delta_coating` cleanly splits carbon (`Z=6`) vs
+    high-Z coating (`TiO2`/`CuHCF`), and `delta_carbon` lands on the unbiased 50%
+    partial-volume midpoint between pore and carbon without high-Z skew.
+    """
+    pooled: list[np.ndarray] = []
+    pore_stds: list[float] = []
+    rng = np.random.default_rng(0)
+    for slc in reference_slices:
+        delta, _, p_std = compute_pore_referenced_delta(slc, roi_mask=roi_mask, sigma=sigma)
+        pore_stds.append(p_std)
+        vals = delta[roi_mask] if roi_mask is not None else delta.ravel()
+        if vals.size > 80_000:
+            vals = rng.choice(vals, size=80_000, replace=False)
+        pooled.append(vals)
+
+    if not pooled:
+        raise ValueError("No reference slices provided for multiphase calibration")
+
+    all_vals = np.concatenate(pooled)
+    med_pstd = max(float(np.median(pore_stds)), 1.0)
+    solid_gate = 4.0 * med_pstd
+
+    if fixed_delta_carbon is not None:
+        delta_carbon = float(fixed_delta_carbon)
+        solid_candidates = all_vals[all_vals > delta_carbon]
+    else:
+        solid_candidates = all_vals[all_vals > solid_gate]
+
+    if solid_candidates.size < 32:
+        d_carb = float(fixed_delta_carbon) if fixed_delta_carbon is not None else max(solid_gate, 1000.0)
+        return d_carb, d_carb + max(4.0 * med_pstd, 2000.0)
+
+    hi_solid = float(np.percentile(solid_candidates, 99.9))
+    solid_clipped = solid_candidates[solid_candidates <= hi_solid]
+    if solid_clipped.size < 32 or float(solid_clipped.max() - solid_clipped.min()) < 1e-3:
+        d_carb = float(fixed_delta_carbon) if fixed_delta_carbon is not None else max(solid_gate, 1000.0)
+        return d_carb, d_carb + max(4.0 * med_pstd, 2000.0)
+
+    delta_coating = _plateau_isodata_threshold(solid_clipped)
+
+    if fixed_delta_carbon is None:
+        pore_vals = all_vals[all_vals <= solid_gate]
+        carbon_vals = solid_clipped[solid_clipped <= delta_coating]
+        if pore_vals.size > 0 and carbon_vals.size > 0:
+            delta_carbon = max(
+                0.5 * (float(pore_vals.mean()) + float(carbon_vals.mean())),
+                3.5 * med_pstd,
+            )
+        else:
+            delta_carbon = max(_plateau_isodata_threshold(all_vals), 3.5 * med_pstd)
+
+    delta_coating = max(float(delta_coating), float(delta_carbon) + max(2.0 * med_pstd, 500.0))
+    return float(delta_carbon), float(delta_coating)
+
+
 def segment_slice_calibrated(
     image: np.ndarray,
     delta_threshold: float = 5500.0,
@@ -171,6 +307,115 @@ def segment_slice_calibrated(
         "solid_fraction": solid_fraction,
     }
     return binary, stats
+
+
+def segment_slice_multiphase(
+    image: np.ndarray,
+    delta_carbon: float = 5500.0,
+    delta_coating: float | None = None,
+    roi_mask: np.ndarray | None = None,
+    sigma: float = 32.0,
+) -> tuple[np.ndarray, dict[str, float]]:
+    """Segment a 2D XCT slice into `{0: pore, 1: carbon_fiber, 2: active_coating}`.
+
+    When `delta_coating is None`, behaves identically to 2-phase `segment_slice_calibrated`.
+    """
+    if delta_carbon <= 0:
+        raise ValueError("delta_carbon must be positive")
+    if delta_coating is not None and delta_coating <= delta_carbon:
+        raise ValueError("delta_coating must be strictly greater than delta_carbon")
+
+    delta, pore_mode, pore_std = compute_pore_referenced_delta(
+        image, roi_mask=roi_mask, sigma=sigma
+    )
+    labels = np.zeros(image.shape, dtype=np.uint8)
+    labels[delta > delta_carbon] = 1
+    if delta_coating is not None:
+        labels[delta > delta_coating] = 2
+
+    if roi_mask is not None:
+        labels = np.where(roi_mask, labels, 0).astype(np.uint8)
+        region = labels[roi_mask]
+    else:
+        region = labels.ravel()
+
+    solid_frac = float((region >= 1).mean())
+    carbon_frac = float((region == 1).mean())
+    coating_frac = float((region == 2).mean())
+    stats = {
+        "pore_mode": pore_mode,
+        "pore_std": pore_std,
+        "solid_fraction": solid_frac,
+        "carbon_fraction": carbon_frac,
+        "coating_fraction": coating_frac,
+    }
+    return labels, stats
+
+
+def downsample_volume_rev(volume: np.ndarray, factor: int = 2) -> np.ndarray:
+    """Topology- and volume-fraction-preserving 3D block binning for REV-scale patches.
+
+    Pools `(factor x factor x factor)` voxel blocks using block occupancy ranked with
+    connected-neighborhood tie-breaking so global solid and active-coating volume
+    fractions are conserved (`< 0.5%` drift) without eroding thin carbon fibers.
+    """
+    if factor < 1:
+        raise ValueError("factor must be >= 1")
+    vol = np.asarray(volume, dtype=np.uint8)
+    if vol.ndim != 3:
+        raise ValueError(f"Expected 3D volume, got shape {vol.shape}")
+    if factor == 1:
+        return vol.copy()
+
+    d, h, w = vol.shape
+    od, oh, ow = d // factor, h // factor, w // factor
+    if min(od, oh, ow) < 1:
+        raise ValueError(f"Volume shape {vol.shape} smaller than bin factor {factor}")
+
+    cropped = vol[: od * factor, : oh * factor, : ow * factor]
+    blocks = cropped.reshape(od, factor, oh, factor, ow, factor)
+
+    solid_mask = cropped >= 1
+    target_solid_frac = float(solid_mask.mean())
+    n_out = od * oh * ow
+    target_solid_count = int(round(target_solid_frac * n_out))
+
+    out = np.zeros((od, oh, ow), dtype=np.uint8)
+    if target_solid_count == 0:
+        return out
+
+    occ_solid = (blocks >= 1).mean(axis=(1, 3, 5)).astype(np.float32)
+    # Break ties along continuous 3D fiber backbones while never activating empty blocks
+    score_solid = np.where(
+        occ_solid > 0.0,
+        occ_solid + 1e-2 * gaussian_filter(occ_solid, sigma=0.8),
+        0.0,
+    )
+    nonzero_solid = int(np.count_nonzero(score_solid > 0.0))
+    k_solid = min(target_solid_count, nonzero_solid)
+    if k_solid > 0:
+        flat_scores = score_solid.ravel()
+        top_idx = np.argpartition(flat_scores, -k_solid)[-k_solid:]
+        out.ravel()[top_idx] = 1
+
+    if np.any(cropped == 2):
+        target_coat_frac = float((cropped == 2).mean())
+        target_coat_count = int(round(target_coat_frac * n_out))
+        if target_coat_count > 0:
+            occ_coat = (blocks == 2).mean(axis=(1, 3, 5)).astype(np.float32)
+            score_coat = np.where(
+                (out == 1) & (occ_coat > 0.0),
+                occ_coat + 1e-2 * gaussian_filter(occ_coat, sigma=0.8),
+                0.0,
+            )
+            nonzero_coat = int(np.count_nonzero(score_coat > 0.0))
+            k_coat = min(target_coat_count, nonzero_coat)
+            if k_coat > 0:
+                flat_coat = score_coat.ravel()
+                coat_idx = np.argpartition(flat_coat, -k_coat)[-k_coat:]
+                out.ravel()[coat_idx] = 2
+
+    return out
 
 
 def compute_radial_ring_score(

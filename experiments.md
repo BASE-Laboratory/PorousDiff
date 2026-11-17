@@ -448,3 +448,24 @@ Direct inspection of raw synchrotron compression scans (`crbon_virgin_1_0p008mVV
 - **Multi-scale continuous conditioning (`ContinuousLoadConditionedUNet`):** Smooth Fourier scalar load embedder (`ContinuousScalarLoadEmbedder`) injected into `temb` at every ResBlock across all resolution levels plus 3-channel spatial input `[x_t, cond_norm * mask, mask]`, Zero-Terminal-SNR schedule (`zero_snr_scaled_linear`), `v_prediction`, EMA (`0.9995`), compression-safe `D_4(XY) × Z_2(Z)` augmentation, and `bf16` GH200 mixed precision.
 - **Physics & transport evaluation (`evaluate_carbon_physics.py`):** Automated comparison of solid fraction, specific surface area, directional chord lengths, `XY/Z` compression anisotropy, directional $S_2(r)$, 3D percolation, geodesic pore tortuosity, and OpenImpala multi-page TIFF export across both training and held-out interpolated loads.
 
+
+## Experiment 15: Unified Multi-Electrode, 3-Phase "Synchrotron Beamtime Multiplier" (`v0.3`)
+
+**Status:** Implemented and verified end-to-end (`feature/paper-ready-conditional`) — ready for Virgin Carbon, $\text{TiO}_2$ Anode, CuHCF Cathode, and DLS K11 DIAD datasets
+
+### Scientific Motivation & Literature Gap
+Existing 3D diffusion papers for porous electrodes generate static microstructures or condition on global porosity, while recent compression-transport studies (*ACS Appl. Energy Mater.* 2025) still rely on heuristic numerical Z-squashing or column-wise pore-voxel deletion. Across our multi-electrode synchrotron compression suite—**Virgin Carbon Felt** (`virgin_carbon`), **$\text{TiO}_2$-coated Carbon Felt Anode** (`tio2_anode`), and **Copper Hexacyanoferrate Coated Cathode** (`cuhcf_cathode`)—plus an independent cross-resolution repeat at **Diamond Light Source K11 DIAD**, we upgraded `PorousDiff` into a unified **Synchrotron Beamtime Multiplier** surrogate.
+
+### Key `v0.3` Upgrades (`porousdiff/`)
+1. **3-Phase Solid-Masked Calibration & Physical-REV Binning (`preprocessing.py`):**
+   - Two-stage Otsu calibration (`calibrate_multiphase_thresholds` + `segment_slice_multiphase`) separates `0 = pore`, `1 = carbon_fiber`, and `2 = active_coating` ($\text{TiO}_2$ / CuHCF) without splitting the dominant 80–90% pore background peak.
+   - Topology- and volume-fraction-conserving `downsample_volume_rev` (`spatial_bin = 2` or `3`) enlarges $96^3$ patches to $2\times$–$3\times$ physical field-of-view (`~20–30` fiber diameters per patch edge).
+   - `CalibrationMetadata` records physical `voxel_size_um`, `kpa_per_mvv` mechanical stress conversion, `beamline`, and `is_repeat` in `bundle_manifest.json`, plus a ~10-second `--preview-only` Spyder mode (`qa/multiphase_overlay_diagnostic.png`).
+2. **Literature Numerical Z-Compression Baselines (`baselines.py`):**
+   - `affine_z_compress_to_target` (affine Z-resampling + calibrated distance-transform threshold matching target compressed porosity) and `pillar_pore_deletion_compress` (stochastic XY-column pore-layer removal).
+3. **Hierarchical 2-Channel 3-Phase Representation & Multi-Modal Conditioning (`data.py`, `models.py`):**
+   - Hierarchical encoding `[c_solid, c_coating]` in `{-1, +1}` aligns Channel 0 (`total solid vs. pore`) across 2-phase Virgin Felt and 3-phase coated electrodes so dense Virgin compression series transfer scaffold mechanics to sparse (`2–3` load) $\text{TiO}_2$/CuHCF schedules, while `decode_channels_to_phases` prevents floating unattached coating artifacts.
+   - `MultiModalConditionEmbedder` jointly embeds normalized stress/load + discrete `material_id` + continuous `log(dx / dx_ref)` voxel size into `temb` and spatial conditioning channels.
+4. **3-Phase Electrochemical Interfacial Metrics & Head-to-Head Benchmark (`metrics.py`, `evaluate_beamtime_multiplier.py`):**
+   - Computes Electrochemically Active Surface Area (`ssa_pore_coating`), Triple-Phase Boundary line density (`tpb_density` in $\mu\text{m}^{-2}$), electronically wired coating fraction (`wired_coating_fraction`), directional tortuosity, and multi-phase OpenImpala TIFF export (`{0, 1, 2}`), comparing Real Held-Out XCT vs. Numerical Z-Compression Baselines vs. Dense and Few-Shot PorousDiff (`slurm/run_beamtime_multiplier.slurm`).
+

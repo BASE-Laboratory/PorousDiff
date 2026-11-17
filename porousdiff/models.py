@@ -1,4 +1,4 @@
-"""Continuous scalar load-conditioned 3D Diffusion UNet, Zero-SNR schedules, and EMA."""
+"""Multi-electrode, multi-phase, continuous stress & resolution conditioned 3D Diffusion UNet."""
 
 from __future__ import annotations
 
@@ -34,7 +34,6 @@ def _enforce_zero_terminal_snr(betas: torch.Tensor) -> tuple[torch.Tensor, torch
     alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
     alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
 
-    # Shift and rescale so sqrt(alpha_bar) hits 0 at T-1 and preserves value at t=0
     alphas_bar_sqrt = alphas_bar_sqrt - alphas_bar_sqrt_T
     alphas_bar_sqrt = alphas_bar_sqrt * (
         alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
@@ -77,7 +76,7 @@ def build_noise_scheduler(
     schedule: str = "zero_snr_scaled_linear",
     prediction_type: str = "v_prediction",
 ) -> DDPMScheduler | DDIMScheduler:
-    """Construct a MONAI diffusion scheduler configured for unbiased binary volumes."""
+    """Construct a MONAI diffusion scheduler configured for unbiased porous volumes."""
     kind = sampler.lower()
     if kind == "ddpm":
         return DDPMScheduler(
@@ -102,12 +101,7 @@ def build_noise_scheduler(
 
 
 class ContinuousScalarLoadEmbedder(nn.Module):
-    """Smooth Fourier/sinusoidal scalar conditioner with a learned null token for CFG.
-
-    Maps normalized continuous load `c in [-1, 1]` smoothly into `embed_dim` so
-    unseen intermediate compressions interpolate continuously rather than jumping
-    between discrete lookup bins.
-    """
+    """Smooth Fourier/sinusoidal scalar conditioner with a learned null token for CFG."""
 
     def __init__(self, freq_dim: int, embed_dim: int, max_period: float = 16.0) -> None:
         super().__init__()
@@ -117,7 +111,6 @@ class ContinuousScalarLoadEmbedder(nn.Module):
         self.embed_dim = embed_dim
 
         half = freq_dim // 2
-        # Frequencies spanning [pi/2, max_period * pi] cover [-1, 1] smoothly without aliasing
         freqs = torch.exp(
             torch.linspace(math.log(0.5 * math.pi), math.log(max_period * math.pi), half)
         )
@@ -143,17 +136,76 @@ class ContinuousScalarLoadEmbedder(nn.Module):
         return mask * cond_emb + (1.0 - mask) * null_emb
 
 
-class ContinuousLoadConditionedUNet(nn.Module):
-    """3D Diffusion UNet conditioned at every resolution on continuous mechanical load.
+class MultiModalConditionEmbedder(nn.Module):
+    """Joint embedder for continuous compressive stress/load, electrode chemistry ID,
+    and physical voxel size (`log(dx / dx_ref)`), with learned CFG null embedding."""
 
-    Fixes the 1-token bottleneck cross-attention degeneracy by:
-      1. Injecting a smooth Fourier embedding of the continuous load directly into
-         `temb` across every encoder, bottleneck, and decoder ResBlock (`96^3, 48^3, 24^3`),
-      2. Concatenating spatially broadcast `[cond_norm * mask, mask]` channels at the input
-         (`in_channels = 3`) so full-resolution convolutions directly see target load
-         and unambiguously distinguish midpoint load (`0.0, mask=1`) from unconditional CFG (`0.0, mask=0`),
-      3. Storing `[load_min, load_max]` inside model buffers so checkpoints carry their
-         own physical calibration.
+    def __init__(
+        self,
+        num_materials: int,
+        freq_dim: int,
+        embed_dim: int,
+        max_period: float = 16.0,
+    ) -> None:
+        super().__init__()
+        if freq_dim % 2 != 0:
+            raise ValueError("freq_dim must be even")
+        if num_materials < 1:
+            raise ValueError("num_materials must be >= 1")
+
+        self.num_materials = num_materials
+        self.freq_dim = freq_dim
+        self.embed_dim = embed_dim
+
+        half = freq_dim // 2
+        freqs = torch.exp(
+            torch.linspace(math.log(0.5 * math.pi), math.log(max_period * math.pi), half)
+        )
+        self.register_buffer("freqs", freqs, persistent=False)
+
+        self.material_embedding = nn.Embedding(num_materials, embed_dim)
+        nn.init.normal_(self.material_embedding.weight, std=0.02)
+
+        # Concatenate Fourier(load) [freq_dim + 1] + Fourier(log_voxel) [freq_dim + 1]
+        self.scalar_mlp = nn.Sequential(
+            nn.Linear(2 * (freq_dim + 1), embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.fusion_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        self.null_embedding = nn.Parameter(torch.zeros(1, embed_dim))
+
+    def _fourier_encode(self, val: torch.Tensor) -> torch.Tensor:
+        angles = val * self.freqs.unsqueeze(0)
+        return torch.cat([val, torch.sin(angles), torch.cos(angles)], dim=-1)
+
+    def forward(self, packed: torch.Tensor) -> torch.Tensor:
+        """Accepts `packed` of shape `(B, 4)`: `[load_norm, mat_id, log_vox, cond_mask]`."""
+        load_norm = packed[:, 0:1].float()
+        mat_ids = packed[:, 1].round().long().clamp(0, self.num_materials - 1)
+        log_vox = packed[:, 2:3].float()
+        cond_mask = packed[:, 3:4].float()
+
+        dtype = self.null_embedding.dtype
+        scalar_feat = torch.cat(
+            [self._fourier_encode(load_norm), self._fourier_encode(log_vox)], dim=-1
+        ).to(dtype)
+        fused = self.fusion_mlp(self.scalar_mlp(scalar_feat) + self.material_embedding(mat_ids))
+        null_emb = self.null_embedding.expand(fused.shape[0], -1)
+        mask = cond_mask.to(dtype)
+        return mask * fused + (1.0 - mask) * null_emb
+
+
+class ContinuousLoadConditionedUNet(nn.Module):
+    """3D Diffusion UNet conditioned on continuous compression load, electrode material,
+    and physical voxel resolution across 2-phase (`1 ch`) or 3-phase (`2 ch`) microstructures.
+
+    Defaults (`num_phases=2, num_materials=1`) preserve exact backward compatibility with
+    single-material binary checkpoints while `num_phases=3` or `num_materials>1` activates
+    hierarchical multi-phase + multi-electrode conditioning.
     """
 
     def __init__(
@@ -166,6 +218,9 @@ class ContinuousLoadConditionedUNet(nn.Module):
         load_max: float = 0.053,
         use_flash_attention: bool = False,
         conditioning_mode: str = "multiscale_fourier",
+        num_phases: int = 2,
+        num_materials: int = 1,
+        ref_voxel_size_um: float = 1.0,
     ) -> None:
         super().__init__()
         if load_max <= load_min:
@@ -175,25 +230,37 @@ class ContinuousLoadConditionedUNet(nn.Module):
                 f"Unknown conditioning_mode {conditioning_mode!r}; "
                 "choose 'multiscale_fourier' or 'legacy_crossattn'"
             )
+        if num_phases not in (2, 3):
+            raise ValueError(f"num_phases must be 2 or 3, got {num_phases}")
+        if num_materials < 1:
+            raise ValueError(f"num_materials must be >= 1, got {num_materials}")
+        if ref_voxel_size_um <= 0:
+            raise ValueError("ref_voxel_size_um must be positive")
+
         self.conditioning_mode = conditioning_mode
+        self.num_phases = num_phases
+        self.num_materials = num_materials
+        self.data_channels = 1 if num_phases == 2 else 2
+        self.is_multimodal = (num_phases == 3) or (num_materials > 1)
 
         unet_params = inspect.signature(DiffusionModelUNet.__init__).parameters
         if conditioning_mode == "multiscale_fourier":
+            aux_channels = 4 if self.is_multimodal else 2
             unet_kwargs: dict[str, object] = {
                 "spatial_dims": 3,
-                "in_channels": 3,
-                "out_channels": 1,
+                "in_channels": self.data_channels + aux_channels,
+                "out_channels": self.data_channels,
                 "attention_levels": tuple(attention_levels),
                 "num_res_blocks": num_res_blocks,
                 "norm_num_groups": norm_num_groups,
                 "with_conditioning": False,
-                "num_class_embeds": 1,  # Hook replaced below with ContinuousScalarLoadEmbedder
+                "num_class_embeds": 1,
             }
         else:
             unet_kwargs = {
                 "spatial_dims": 3,
-                "in_channels": 1,
-                "out_channels": 1,
+                "in_channels": self.data_channels,
+                "out_channels": self.data_channels,
                 "attention_levels": tuple(attention_levels),
                 "num_res_blocks": num_res_blocks,
                 "norm_num_groups": norm_num_groups,
@@ -210,28 +277,44 @@ class ContinuousLoadConditionedUNet(nn.Module):
             unet_kwargs["use_flash_attention"] = True
 
         self.unet = DiffusionModelUNet(**unet_kwargs)
+        base_ch = int(channels[0])
+        time_embed_dim = base_ch * 4
         if conditioning_mode == "multiscale_fourier":
-            base_ch = int(channels[0])
-            time_embed_dim = base_ch * 4
-            self.unet.class_embedding = ContinuousScalarLoadEmbedder(
-                freq_dim=max(32, base_ch),
-                embed_dim=time_embed_dim,
-            )
+            if self.is_multimodal:
+                self.unet.class_embedding = MultiModalConditionEmbedder(
+                    num_materials=num_materials,
+                    freq_dim=max(32, base_ch),
+                    embed_dim=time_embed_dim,
+                )
+            else:
+                self.unet.class_embedding = ContinuousScalarLoadEmbedder(
+                    freq_dim=max(32, base_ch),
+                    embed_dim=time_embed_dim,
+                )
             self.legacy_embedder: nn.Module | None = None
         else:
+            legacy_in_dim = 3 if self.is_multimodal else 1
             self.legacy_embedder = nn.Sequential(
-                nn.Linear(1, 32),
+                nn.Linear(legacy_in_dim, 32),
                 nn.SiLU(),
                 nn.Linear(32, 32),
             )
 
         self.register_buffer("load_min", torch.tensor(float(load_min), dtype=torch.float32))
         self.register_buffer("load_max", torch.tensor(float(load_max), dtype=torch.float32))
+        self.register_buffer(
+            "ref_voxel_size_um", torch.tensor(float(ref_voxel_size_um), dtype=torch.float32)
+        )
 
     def normalize_load(self, load_values: torch.Tensor) -> torch.Tensor:
-        """Linearly map physical load values into `[-1, 1]` (allowing smooth interpolation/extrapolation)."""
+        """Linearly map physical load/stress values into `[-1, 1]`."""
         span = (self.load_max - self.load_min).clamp(min=1e-8)
         return 2.0 * (load_values.float() - self.load_min) / span - 1.0
+
+    def normalize_voxel_size(self, voxel_sizes: torch.Tensor) -> torch.Tensor:
+        """Map physical voxel size into log-ratio `log(dx / dx_ref)`."""
+        safe = voxel_sizes.float().clamp(min=1e-4)
+        return torch.log(safe / self.ref_voxel_size_um.clamp(min=1e-4))
 
     def forward(
         self,
@@ -239,8 +322,10 @@ class ContinuousLoadConditionedUNet(nn.Module):
         timesteps: torch.Tensor,
         load_values: torch.Tensor,
         cond_mask: torch.Tensor | None = None,
+        material_ids: torch.Tensor | None = None,
+        voxel_sizes: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Predict velocity `v` (or `epsilon`) for noisy 3D volume `x` `[B, 1, D, H, W]`."""
+        """Predict velocity `v` (or `epsilon`) for noisy 3D volume `x` `[B, C, D, H, W]`."""
         b, _, d, h, w = x.shape
         loads = load_values.view(b).to(device=x.device, dtype=torch.float32)
         cond_norm = self.normalize_load(loads)
@@ -250,21 +335,50 @@ class ContinuousLoadConditionedUNet(nn.Module):
         else:
             mask = cond_mask.view(b).to(device=x.device, dtype=torch.float32)
 
+        if not self.is_multimodal:
+            if self.conditioning_mode == "legacy_crossattn":
+                assert self.legacy_embedder is not None
+                masked_scalar = (cond_norm * mask).unsqueeze(-1)
+                ctx = self.legacy_embedder(masked_scalar).unsqueeze(1).to(dtype=x.dtype)
+                return self.unet(x=x, timesteps=timesteps, context=ctx)
+
+            masked_cond = (cond_norm * mask).to(dtype=x.dtype)
+            mask_ch = mask.to(dtype=x.dtype)
+            cond_vol = masked_cond.view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
+            mask_vol = mask_ch.view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
+            unet_in = torch.cat([x, cond_vol, mask_vol], dim=1)
+            packed_labels = torch.stack([cond_norm, mask], dim=-1)
+            return self.unet(x=unet_in, timesteps=timesteps, class_labels=packed_labels)
+
+        # Multi-modal / 3-phase forward path
+        if material_ids is None:
+            mats = torch.zeros(b, device=x.device, dtype=torch.long)
+        else:
+            mats = material_ids.view(b).to(device=x.device, dtype=torch.long)
+
+        if voxel_sizes is None:
+            vox = self.ref_voxel_size_um.expand(b).to(device=x.device, dtype=torch.float32)
+        else:
+            vox = voxel_sizes.view(b).to(device=x.device, dtype=torch.float32)
+        log_vox = self.normalize_voxel_size(vox)
+
+        mat_span = max(1, self.num_materials - 1)
+        mat_norm = 2.0 * (mats.float() / float(mat_span)) - 1.0 if self.num_materials > 1 else torch.zeros_like(cond_norm)
+
         if self.conditioning_mode == "legacy_crossattn":
             assert self.legacy_embedder is not None
-            masked_scalar = (cond_norm * mask).unsqueeze(-1)
-            ctx = self.legacy_embedder(masked_scalar).unsqueeze(1).to(dtype=x.dtype)
+            vec = torch.stack([cond_norm * mask, mat_norm * mask, log_vox * mask], dim=-1)
+            ctx = self.legacy_embedder(vec).unsqueeze(1).to(dtype=x.dtype)
             return self.unet(x=x, timesteps=timesteps, context=ctx)
 
-        masked_cond = (cond_norm * mask).to(dtype=x.dtype)
-        mask_ch = mask.to(dtype=x.dtype)
+        c_load = (cond_norm * mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
+        c_mat = (mat_norm * mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
+        c_vox = (log_vox * mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
+        c_msk = mask.to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
+        unet_in = torch.cat([x, c_load, c_mat, c_vox, c_msk], dim=1)
 
-        cond_vol = masked_cond.view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
-        mask_vol = mask_ch.view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
-        unet_in = torch.cat([x, cond_vol, mask_vol], dim=1)
-
-        packed_labels = torch.stack([cond_norm, mask], dim=-1)
-        return self.unet(x=unet_in, timesteps=timesteps, class_labels=packed_labels)
+        packed_mm = torch.stack([cond_norm, mats.float(), log_vox, mask], dim=-1)
+        return self.unet(x=unet_in, timesteps=timesteps, class_labels=packed_mm)
 
     def forward_cfg(
         self,
@@ -272,16 +386,35 @@ class ContinuousLoadConditionedUNet(nn.Module):
         timesteps: torch.Tensor,
         load_values: torch.Tensor,
         guidance_scale: float = 1.0,
+        material_ids: torch.Tensor | None = None,
+        voxel_sizes: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Classifier-free guided prediction combining conditional and unconditional passes."""
         b = x.shape[0]
         if abs(guidance_scale - 1.0) < 1e-6:
             ones = torch.ones(b, device=x.device, dtype=torch.float32)
-            return self.forward(x, timesteps, load_values, cond_mask=ones)
+            return self.forward(
+                x,
+                timesteps,
+                load_values,
+                cond_mask=ones,
+                material_ids=material_ids,
+                voxel_sizes=voxel_sizes,
+            )
 
         x_cat = torch.cat([x, x], dim=0)
         t_cat = torch.cat([timesteps, timesteps], dim=0)
         loads_cat = torch.cat([load_values.view(b), load_values.view(b)], dim=0)
+        mats_cat = (
+            torch.cat([material_ids.view(b), material_ids.view(b)], dim=0)
+            if material_ids is not None
+            else None
+        )
+        vox_cat = (
+            torch.cat([voxel_sizes.view(b), voxel_sizes.view(b)], dim=0)
+            if voxel_sizes is not None
+            else None
+        )
         mask_cat = torch.cat(
             [
                 torch.ones(b, device=x.device, dtype=torch.float32),
@@ -289,7 +422,14 @@ class ContinuousLoadConditionedUNet(nn.Module):
             ],
             dim=0,
         )
-        pred_both = self.forward(x_cat, t_cat, loads_cat, cond_mask=mask_cat)
+        pred_both = self.forward(
+            x_cat,
+            t_cat,
+            loads_cat,
+            cond_mask=mask_cat,
+            material_ids=mats_cat,
+            voxel_sizes=vox_cat,
+        )
         pred_cond, pred_uncond = pred_both.chunk(2, dim=0)
         return pred_uncond + guidance_scale * (pred_cond - pred_uncond)
 

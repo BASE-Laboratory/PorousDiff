@@ -1,8 +1,10 @@
-"""Sample a trained load-conditioned 3D DDPM across discrete states and continuous load sweeps.
+"""Sample trained PorousDiff 3D models across single-material or multi-electrode 3-phase states.
 
-Supports multi-sample statistical generation (`N >= 20` per load state), unseen intermediate
-load interpolation, fixed-noise compression sweeps, DDIM/DDPM sampling, classifier-free
-guidance, EMA weights, and OpenImpala 3D TIFF export.
+Supports:
+  - 2-phase (`{0, 1}`) and hierarchical 3-phase (`{0: pore, 1: carbon, 2: coating}`) decoding,
+  - Multi-electrode (`--manifest-json` or `--material`) + voxel-size (`--voxel-size-um`) conditioning,
+  - Unseen held-out load interpolation, fixed-noise compression sweeps, DDIM/DDPM, CFG, EMA,
+    and OpenImpala multi-page TIFF export.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import csv
 import json
 import sys
 import time
+from matplotlib.colors import ListedColormap
 from pathlib import Path
 
 import matplotlib
@@ -24,10 +27,16 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from porousdiff.data import default_project_root
-from porousdiff.metrics import evaluate_volume_physics, export_openimpala_tiff
+from porousdiff.data import decode_channels_to_phases, default_project_root, resolve_material_id
+from porousdiff.metrics import (
+    evaluate_multiphase_physics,
+    evaluate_volume_physics,
+    export_openimpala_tiff,
+)
 from porousdiff.models import ContinuousLoadConditionedUNet, EMAModel, build_noise_scheduler
-from porousdiff.preprocessing import parse_load_value
+from porousdiff.preprocessing import infer_material_name, parse_load_value
+
+PHASE_CMAP = ListedColormap(["#0b0e14", "#38bdf8", "#facc15"])
 
 
 @torch.inference_mode()
@@ -39,13 +48,25 @@ def generate_batch(
     guidance_scale: float,
     use_amp: bool,
     amp_dtype: torch.dtype,
+    material_id: int = 0,
+    voxel_size_um: float = 1.0,
     generator: torch.Generator | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Run reverse diffusion from `initial_noise` `[B, 1, D, H, W]` at scalar `load_value`."""
+    """Run reverse diffusion from `initial_noise` `[B, C, D, H, W]`."""
     device = initial_noise.device
     bsz = initial_noise.shape[0]
     image = initial_noise.clone()
     loads = torch.full((bsz,), float(load_value), device=device, dtype=torch.float32)
+    mats = (
+        torch.full((bsz,), int(material_id), device=device, dtype=torch.long)
+        if model.is_multimodal
+        else None
+    )
+    voxs = (
+        torch.full((bsz,), float(voxel_size_um), device=device, dtype=torch.float32)
+        if model.is_multimodal
+        else None
+    )
 
     for timestep in scheduler.timesteps:  # type: ignore[attr-defined]
         t_int = int(timestep)
@@ -56,28 +77,40 @@ def generate_batch(
                 t_batch,
                 loads,
                 guidance_scale=guidance_scale,
+                material_ids=mats,
+                voxel_sizes=voxs,
             )
         image = scheduler.step(pred.float(), t_int, image, generator=generator)[0]  # type: ignore[attr-defined]
 
-    continuous = image[:, 0].float().cpu().numpy()
-    normalized = np.clip((continuous + 1.0) * 0.5, 0.0, 1.0).astype(np.float32)
-    binary = (normalized >= 0.5).astype(np.uint8)
-    return binary, normalized
+    raw_np = image.float().cpu().numpy()
+    phases = decode_channels_to_phases(raw_np, enforce_solid_support=True, threshold=0.0)
+    probs = np.clip((raw_np[:, 0] + 1.0) * 0.5, 0.0, 1.0).astype(np.float32)
+    return phases, probs
 
 
-def save_orthoview_figure(binary: np.ndarray, title: str, png_path: Path, pdf_path: Path | None = None) -> None:
-    mid_z, mid_y, mid_x = (s // 2 for s in binary.shape)
+def save_orthoview_figure(
+    volume: np.ndarray,
+    title: str,
+    png_path: Path,
+    pdf_path: Path | None = None,
+    num_phases: int = 2,
+) -> None:
+    mid_z, mid_y, mid_x = (s // 2 for s in volume.shape)
     views = [
-        (binary[mid_z, :, :], "XY (In-Plane Sheet)"),
-        (binary[:, mid_y, :], "XZ (Through-Plane Compression)"),
-        (binary[:, :, mid_x], "YZ (Through-Plane Compression)"),
+        (volume[mid_z, :, :], "XY (In-Plane Sheet)"),
+        (volume[:, mid_y, :], "XZ (Through-Plane Compression)"),
+        (volume[:, :, mid_x], "YZ (Through-Plane Compression)"),
     ]
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    cmap = PHASE_CMAP if num_phases == 3 else "gray"
+    vmax = 2 if num_phases == 3 else 1
     for ax, (view, vtitle) in zip(axes, views):
-        ax.imshow(view, cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+        ax.imshow(view, cmap=cmap, vmin=0, vmax=vmax, interpolation="nearest")
         ax.set_title(vtitle)
         ax.axis("off")
-    fig.suptitle(f"{title} (solid frac = {binary.mean():.3f})")
+    sf = float((volume >= 1).mean())
+    extra = f", coat = {float((volume == 2).mean()):.3f}" if num_phases == 3 else ""
+    fig.suptitle(f"{title} (solid = {sf:.3f}{extra})")
     fig.tight_layout()
     fig.savefig(png_path, dpi=240, bbox_inches="tight")
     if pdf_path is not None:
@@ -86,22 +119,27 @@ def save_orthoview_figure(binary: np.ndarray, title: str, png_path: Path, pdf_pa
 
 
 def save_sweep_panel(
-    sweep_binaries: list[tuple[float, np.ndarray]],
+    sweep_volumes: list[tuple[float, np.ndarray]],
     png_path: Path,
     pdf_path: Path,
+    num_phases: int = 2,
+    unit_label: str = "mV/V",
 ) -> None:
-    n_cols = len(sweep_binaries)
+    n_cols = len(sweep_volumes)
     fig, axes = plt.subplots(2, n_cols, figsize=(3.2 * n_cols, 6.2))
     if n_cols == 1:
         axes = np.expand_dims(axes, axis=1)
 
-    for col, (load_mv, vol) in enumerate(sweep_binaries):
+    cmap = PHASE_CMAP if num_phases == 3 else "gray"
+    vmax = 2 if num_phases == 3 else 1
+    for col, (load_val, vol) in enumerate(sweep_volumes):
         mz, my, _ = (s // 2 for s in vol.shape)
-        axes[0, col].imshow(vol[mz], cmap="gray", vmin=0, vmax=1, interpolation="nearest")
-        axes[0, col].set_title(f"{load_mv:g} mV/V\nφ_s = {vol.mean():.3f} (XY)")
+        axes[0, col].imshow(vol[mz], cmap=cmap, vmin=0, vmax=vmax, interpolation="nearest")
+        sf = float((vol >= 1).mean())
+        axes[0, col].set_title(f"{load_val:g} {unit_label}\nφ_s = {sf:.3f} (XY)")
         axes[0, col].axis("off")
 
-        axes[1, col].imshow(vol[:, my, :], cmap="gray", vmin=0, vmax=1, interpolation="nearest")
+        axes[1, col].imshow(vol[:, my, :], cmap=cmap, vmin=0, vmax=vmax, interpolation="nearest")
         axes[1, col].set_title("XZ (Compression ↓)")
         axes[1, col].axis("off")
 
@@ -112,6 +150,76 @@ def save_sweep_panel(
     plt.close(fig)
 
 
+def _build_eval_specs(
+    args: argparse.Namespace,
+    cfg: dict[str, object],
+) -> list[dict[str, object]]:
+    ref_vox = float(cfg.get("ref_voxel_size_um", 1.0))  # type: ignore[arg-type]
+    use_kpa = bool(cfg.get("use_stress_kpa", False))
+    default_mat = args.material
+
+    if args.manifest_json is not None:
+        manifest = json.loads(args.manifest_json.read_text())
+        filter_set = set(args.eval_states) if args.eval_states else None
+        specs: list[dict[str, object]] = []
+        for scan in manifest.get("scans", []):
+            st = str(scan["state"])
+            if filter_set is not None and st not in filter_set:
+                continue
+            if filter_set is None and bool(scan.get("is_repeat_or_secondary", False)):
+                continue
+            lv = (
+                float(scan["stress_kpa"])
+                if (use_kpa and scan.get("stress_kpa") is not None)
+                else float(scan["load_mv_per_v"])
+            )
+            specs.append(
+                {
+                    "state": st,
+                    "load_value": lv,
+                    "material": str(scan.get("material", "virgin_carbon")),
+                    "voxel_size_um": float(scan.get("effective_voxel_size_um", ref_vox)),
+                }
+            )
+        return specs
+
+    if args.eval_states:
+        specs = []
+        for entry in args.eval_states:
+            if "=" in entry:
+                k, v = entry.split("=", 1)
+                st = k.strip()
+                lv = float(v.strip())
+            else:
+                st = entry.strip()
+                lv = parse_load_value(st)
+            mat = infer_material_name(st) if default_mat == "auto" else default_mat
+            specs.append(
+                {
+                    "state": st,
+                    "load_value": lv,
+                    "material": mat,
+                    "voxel_size_um": args.voxel_size_um if args.voxel_size_um > 0 else ref_vox,
+                }
+            )
+        return specs
+
+    saved_specs = cfg.get("scan_specs")
+    if isinstance(saved_specs, list) and saved_specs:
+        return [dict(s) for s in saved_specs]  # type: ignore[arg-type]
+
+    states_map = cfg["states"]  # type: ignore[index]
+    return [
+        {
+            "state": str(k),
+            "load_value": float(v),
+            "material": infer_material_name(str(k)) if default_mat == "auto" else default_mat,
+            "voxel_size_um": args.voxel_size_um if args.voxel_size_um > 0 else ref_vox,
+        }
+        for k, v in states_map.items()  # type: ignore[union-attr]
+    ]
+
+
 def main() -> None:
     proj_root = default_project_root()
     parser = argparse.ArgumentParser(
@@ -119,28 +227,25 @@ def main() -> None:
     )
     parser.add_argument("--experiment", default="carbon_conditional_96_v2")
     parser.add_argument("--output-root", type=Path, default=proj_root)
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=None,
-        help="Explicit checkpoint path (defaults to best_val.pth if present, else latest.pth)",
-    )
-    parser.add_argument("--no-ema", action="store_true", help="Sample raw online weights instead of EMA")
+    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--manifest-json", type=Path, default=None)
+    parser.add_argument("--no-ema", action="store_true")
     parser.add_argument("--sampler", choices=["ddim", "ddpm"], default="ddim")
-    parser.add_argument("--steps", type=int, default=100, help="Inference denoising steps (e.g. 100 for DDIM, 1000 for DDPM)")
+    parser.add_argument("--steps", type=int, default=100)
     parser.add_argument("--guidance-scale", type=float, default=1.5)
-    parser.add_argument("--num-samples", type=int, default=20, help="Samples to generate per evaluated state")
+    parser.add_argument("--num-samples", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--eval-states", nargs="+", default=None)
     parser.add_argument(
-        "--eval-states",
-        nargs="+",
-        default=None,
-        help="States to sample (e.g. Op008mVV=0.008 Op023mVV=0.023); defaults to checkpoint states",
+        "--material",
+        default="auto",
+        choices=["auto", "virgin_carbon", "tio2_anode", "cuhcf_cathode"],
     )
+    parser.add_argument("--voxel-size-um", type=float, default=0.0, help="0 = use checkpoint/manifest voxel size")
     parser.add_argument(
         "--sweep-loads",
         default="0.008,0.015,0.023,0.033,0.043,0.053",
-        help="Comma-separated load values for a fixed-noise continuous compression sweep (empty to skip)",
+        help="Comma-separated load/stress values for a fixed-noise sweep (empty to skip)",
     )
     parser.add_argument("--export-openimpala", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
@@ -175,6 +280,10 @@ def main() -> None:
     saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = saved["config"]
     patch_size = int(cfg["patch_size"])
+    num_phases = int(cfg.get("num_phases", 2))
+    num_materials = int(cfg.get("num_materials", 1))
+    ref_vox = float(cfg.get("ref_voxel_size_um", 1.0))
+    unit_label = "kPa" if bool(cfg.get("use_stress_kpa", False)) else "mV/V"
 
     model = ContinuousLoadConditionedUNet(
         channels=cfg["channels"],
@@ -185,6 +294,9 @@ def main() -> None:
         load_max=float(cfg["load_max"]),
         use_flash_attention=(device.type == "cuda"),
         conditioning_mode=str(cfg.get("conditioning_mode", "multiscale_fourier")),
+        num_phases=num_phases,
+        num_materials=num_materials,
+        ref_voxel_size_um=ref_vox,
     ).to(device)
 
     if not args.no_ema and "ema" in saved:
@@ -207,22 +319,11 @@ def main() -> None:
 
     print(
         f"Loaded {weight_source} weights from {ckpt_path} (epoch {int(saved['epoch']) + 1}) | "
-        f"sampler={args.sampler} ({args.steps} steps, CFG={args.guidance_scale})",
+        f"phases={num_phases} | materials={num_materials} | sampler={args.sampler} ({args.steps} steps)",
         flush=True,
     )
 
-    # Determine states to sample
-    if args.eval_states:
-        eval_states: dict[str, float] = {}
-        for entry in args.eval_states:
-            if "=" in entry:
-                k, v = entry.split("=", 1)
-                eval_states[k.strip()] = float(v.strip())
-            else:
-                eval_states[entry.strip()] = parse_load_value(entry.strip())
-    else:
-        eval_states = {str(k): float(v) for k, v in cfg["states"].items()}
-
+    eval_specs = _build_eval_specs(args, cfg)
     out_dir = args.output_root / "results" / args.experiment / "samples"
     figures_dir = args.output_root / "results" / args.experiment / "figures"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -230,13 +331,20 @@ def main() -> None:
 
     per_sample_records: list[dict[str, object]] = []
     summary_records: list[dict[str, object]] = []
+    data_ch = active_model.data_channels
 
-    for state_name, load_val in eval_states.items():
+    for spec in eval_specs:
+        state_name = str(spec["state"])
+        load_val = float(spec["load_value"])  # type: ignore[arg-type]
+        mat_name = str(spec.get("material", "virgin_carbon"))
+        mat_id = resolve_material_id(mat_name) if num_materials > 1 else 0
+        vox_um = float(spec.get("voxel_size_um", ref_vox))  # type: ignore[arg-type]
+
         state_dir = out_dir / state_name
         state_dir.mkdir(parents=True, exist_ok=True)
 
         gen = torch.Generator(device=device).manual_seed(args.seed)
-        collected_bin: list[np.ndarray] = []
+        collected_vols: list[np.ndarray] = []
         started = time.perf_counter()
 
         remaining = args.num_samples
@@ -244,11 +352,11 @@ def main() -> None:
         while remaining > 0:
             cur_b = min(args.batch_size, remaining)
             noise = torch.randn(
-                (cur_b, 1, patch_size, patch_size, patch_size),
+                (cur_b, data_ch, patch_size, patch_size, patch_size),
                 generator=gen,
                 device=device,
             )
-            binaries, probs = generate_batch(
+            vols, probs = generate_batch(
                 model=active_model,
                 scheduler=scheduler,
                 initial_noise=noise,
@@ -256,56 +364,69 @@ def main() -> None:
                 guidance_scale=args.guidance_scale,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
+                material_id=mat_id,
+                voxel_size_um=vox_um,
                 generator=gen,
             )
-            for b_vol, p_vol in zip(binaries, probs):
+            for b_vol, p_vol in zip(vols, probs):
                 sample_idx += 1
-                collected_bin.append(b_vol)
+                collected_vols.append(b_vol)
                 np.save(state_dir / f"sample_{sample_idx:03d}_binary.npy", b_vol)
                 np.save(state_dir / f"sample_{sample_idx:03d}_prob.npy", p_vol)
 
                 if args.export_openimpala:
                     export_openimpala_tiff(
-                        b_vol, state_dir / "openimpala" / f"sample_{sample_idx:03d}.tif"
+                        b_vol,
+                        state_dir / "openimpala" / f"sample_{sample_idx:03d}.tif",
+                        preserve_multiphase=(num_phases == 3),
                     )
 
-                phys = evaluate_volume_physics(b_vol)
+                phys = (
+                    evaluate_multiphase_physics(b_vol, voxel_size=vox_um)
+                    if num_phases == 3
+                    else evaluate_volume_physics(b_vol, voxel_size=vox_um)
+                )
                 rec: dict[str, object] = {
                     "state": state_name,
-                    "load_mv_per_v": load_val,
+                    "material": mat_name,
+                    "load_value": load_val,
+                    "voxel_size_um": vox_um,
                     "sample_id": sample_idx,
                 }
-                rec.update({k: round(float(v), 6) if np.isfinite(v) else float("nan") for k, v in phys.items()})
+                rec.update(
+                    {k: round(float(v), 6) if np.isfinite(v) else float("nan") for k, v in phys.items()}
+                )
                 per_sample_records.append(rec)
 
                 if sample_idx == 1:
                     save_orthoview_figure(
                         b_vol,
-                        title=f"{state_name} ({load_val:g} mV/V)",
+                        title=f"{state_name} ({mat_name}, {load_val:g} {unit_label})",
                         png_path=figures_dir / f"figure_generated_{state_name}.png",
                         pdf_path=figures_dir / f"figure_generated_{state_name}.pdf",
+                        num_phases=num_phases,
                     )
             remaining -= cur_b
 
         elapsed = time.perf_counter() - started
-        stacked_state = np.stack(collected_bin, axis=0)
+        stacked_state = np.stack(collected_vols, axis=0)
         np.save(state_dir / "generated_samples.npy", stacked_state)
 
-        sfs = [float(v.mean()) for v in collected_bin]
+        sfs = [float((v >= 1).mean()) for v in collected_vols]
+        cfs = [float((v == 2).mean()) for v in collected_vols]
         summary_row = {
             "state": state_name,
-            "load_mv_per_v": load_val,
+            "material": mat_name,
+            "load_value": load_val,
             "num_samples": args.num_samples,
             "solid_fraction_mean": round(float(np.mean(sfs)), 6),
             "solid_fraction_std": round(float(np.std(sfs)), 6),
-            "solid_fraction_min": round(float(np.min(sfs)), 6),
-            "solid_fraction_max": round(float(np.max(sfs)), 6),
+            "coating_fraction_mean": round(float(np.mean(cfs)), 6),
             "sampling_seconds": round(elapsed, 2),
         }
         summary_records.append(summary_row)
         print(json.dumps(summary_row), flush=True)
 
-    # Save CSVs
     if per_sample_records:
         with (out_dir / "per_sample_physics.csv").open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=list(per_sample_records[0].keys()))
@@ -318,12 +439,15 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(summary_records)
 
-    # Optional continuous fixed-noise compression sweep
     if args.sweep_loads.strip():
         sweep_vals = [float(x.strip()) for x in args.sweep_loads.split(",") if x.strip()]
+        sweep_mat_name = "virgin_carbon" if args.material == "auto" else args.material
+        sweep_mat_id = resolve_material_id(sweep_mat_name) if num_materials > 1 else 0
+        sweep_vox = args.voxel_size_um if args.voxel_size_um > 0 else ref_vox
+
         sweep_gen = torch.Generator(device=device).manual_seed(args.seed + 777)
         shared_noise = torch.randn(
-            (1, 1, patch_size, patch_size, patch_size),
+            (1, data_ch, patch_size, patch_size, patch_size),
             generator=sweep_gen,
             device=device,
         )
@@ -341,6 +465,8 @@ def main() -> None:
                 guidance_scale=args.guidance_scale,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
+                material_id=sweep_mat_id,
+                voxel_size_um=sweep_vox,
                 generator=step_gen,
             )
             vol = b_vol[0]
@@ -352,6 +478,8 @@ def main() -> None:
             sweep_pairs,
             png_path=figures_dir / "compression_sweep_orthoviews.png",
             pdf_path=figures_dir / "compression_sweep_orthoviews.pdf",
+            num_phases=num_phases,
+            unit_label=unit_label,
         )
         print(f"Saved continuous compression sweep ({len(sweep_pairs)} loads) -> {figures_dir}", flush=True)
 

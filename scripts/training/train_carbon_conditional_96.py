@@ -1,12 +1,12 @@
-"""Train a continuous load-conditioned 3D DDPM on compressed porous electrode patches.
+"""Train PorousDiff continuous load/stress-conditioned 3D diffusion models (single or multi-electrode).
 
-Key improvements over v1:
-  - Multi-scale continuous Fourier load conditioning across all UNet levels + spatial load channel
-  - Classifier-free guidance (CFG) dropout for smooth interpolation across unseen loads
-  - Zero-terminal-SNR `v_prediction` + EMA weights to eliminate the 0.50 solid-fraction bias
-  - GH200 `bfloat16` mixed precision, configurable batching/grad-accumulation, and RAM caching
-  - Anisotropy-preserving `D_4(XY) x Z_2(Z)` 16x symmetry augmentation
-  - Full CPU + CUDA RNG checkpointing, `best_val.pth`, periodic checkpoints, and deterministic val loss
+Supports:
+  - Single-material binary training (`--states ...`) for backward-compatible Virgin Felt runs,
+  - Unified multi-electrode 3-phase training (`--manifest-json bundle_manifest.json`) across
+    `virgin_carbon`, `tio2_anode`, and `cuhcf_cathode` with balanced material/state sampling,
+  - Few-Shot "Beamtime Multiplier" filtering (`--include-states` / `--exclude-states`) holding
+    out intermediate coated-electrode loads while leveraging dense Virgin Felt scaffold physics,
+  - Zero-Terminal-SNR `v_prediction`, EMA, GH200 `bf16` AMP, and full RNG `--resume`.
 """
 
 from __future__ import annotations
@@ -24,32 +24,39 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from porousdiff.data import (
+    MATERIAL_TO_ID,
     LoadConditionedPatchDataset,
+    MultiElectrodePatchDataset,
     capture_rng_states,
     default_project_root,
     restore_rng_states,
 )
-from porousdiff.models import (
-    ContinuousLoadConditionedUNet,
-    EMAModel,
-    build_noise_scheduler,
-)
+from porousdiff.models import ContinuousLoadConditionedUNet, EMAModel, build_noise_scheduler
 from porousdiff.preprocessing import parse_load_value
 
+DEFAULT_CARBON_STATES = {
+    "Op008mVV": 0.008,
+    "Op018mVV": 0.018,
+    "Op033mVV": 0.033,
+}
 
-def parse_states_arg(entries: list[str] | None, states_json: Path | None) -> dict[str, float]:
+
+def parse_states_arg(
+    entries: list[str] | None, states_json: Path | None
+) -> dict[str, float]:
     if states_json is not None:
-        raw = json.loads(states_json.read_text())
+        with states_json.open("r") as f:
+            raw = json.load(f)
         return {str(k): float(v) for k, v in raw.items()}
     if not entries:
-        return {"Op008mVV": 0.008, "Op018mVV": 0.018, "Op033mVV": 0.033}
+        return dict(DEFAULT_CARBON_STATES)
 
     mapping: dict[str, float] = {}
     for item in entries:
@@ -62,6 +69,61 @@ def parse_states_arg(entries: list[str] | None, states_json: Path | None) -> dic
     return mapping
 
 
+def load_manifest_specs(
+    manifest_path: Path,
+    data_root: Path,
+    include_states: set[str] | None = None,
+    exclude_states: set[str] | None = None,
+    include_repeats: bool = False,
+    use_stress_kpa: bool = False,
+) -> tuple[list[dict[str, object]], int, float]:
+    with manifest_path.open("r") as f:
+        manifest = json.load(f)
+
+    specs: list[dict[str, object]] = []
+    max_phases = 2
+    vox_list: list[float] = []
+
+    for scan in manifest.get("scans", []):
+        st = str(scan["state"])
+        if not include_repeats and bool(scan.get("is_repeat_or_secondary", False)):
+            if include_states is None or st not in include_states:
+                continue
+        if include_states is not None and st not in include_states:
+            continue
+        if exclude_states is not None and st in exclude_states:
+            continue
+
+        if use_stress_kpa and scan.get("stress_kpa") is not None:
+            load_val = float(scan["stress_kpa"])
+        else:
+            load_val = float(scan["load_mv_per_v"])
+
+        eff_vox = float(scan.get("effective_voxel_size_um", manifest.get("effective_voxel_size_um", 1.0)))
+        n_ph = int(scan.get("num_phases", 2))
+        max_phases = max(max_phases, n_ph)
+        vox_list.append(eff_vox)
+
+        patch_dir_name = scan.get("patch_dir_name")
+        patch_dir = (data_root / str(patch_dir_name)) if patch_dir_name else None
+
+        specs.append(
+            {
+                "state": st,
+                "material": str(scan.get("material", "virgin_carbon")),
+                "load_value": load_val,
+                "voxel_size_um": eff_vox,
+                "num_phases": n_ph,
+                "patch_dir": str(patch_dir) if (patch_dir and patch_dir.is_dir()) else None,
+            }
+        )
+
+    if len(specs) < 2:
+        raise ValueError(f"Manifest filtering yielded < 2 training states ({len(specs)} found)")
+    ref_vox = float(np.median(vox_list)) if vox_list else 1.0
+    return specs, max_phases, ref_vox
+
+
 def atomic_torch_save(payload: dict[str, object], target: Path) -> None:
     tmp = target.with_suffix(target.suffix + ".tmp")
     torch.save(payload, tmp)
@@ -71,7 +133,7 @@ def atomic_torch_save(payload: dict[str, object], target: Path) -> None:
 def main() -> None:
     proj_root = default_project_root()
     parser = argparse.ArgumentParser(
-        description="Train continuous load-conditioned 3D diffusion model (PorousDiff)"
+        description="Train continuous load/stress-conditioned 3D diffusion model (PorousDiff)"
     )
     parser.add_argument("--experiment", default="carbon_conditional_96_v2")
     parser.add_argument("--data-root", type=Path, default=proj_root / "data" / "carbon_virgin")
@@ -84,6 +146,18 @@ def main() -> None:
         help="Dataset=load pairs (e.g. Op008mVV=0.008 Op018mVV=0.018 Op033mVV=0.033) or folder names",
     )
     parser.add_argument("--states-json", type=Path, default=None)
+    parser.add_argument(
+        "--manifest-json",
+        type=Path,
+        default=None,
+        help="Multi-electrode bundle_manifest.json activating material + 3-phase + voxel-size conditioning",
+    )
+    parser.add_argument("--include-states", nargs="*", default=None, help="Explicit subset of manifest states to train on")
+    parser.add_argument("--exclude-states", nargs="*", default=None, help="Held-out manifest states to exclude from training")
+    parser.add_argument("--include-repeats", action="store_true", help="Include replicate/secondary scans from manifest")
+    parser.add_argument("--use-stress-kpa", action="store_true", help="Condition on calibrated stress_kpa from manifest")
+    parser.add_argument("--num-phases", type=int, default=0, choices=[0, 2, 3], help="0=infer from manifest (or 2 for legacy --states)")
+    parser.add_argument("--balanced-sampling", action="store_true", help="Equalize gradient weight across materials and states")
 
     parser.add_argument("--patch-size", type=int, default=96)
     parser.add_argument("--channels", default="32,64,128")
@@ -97,7 +171,6 @@ def main() -> None:
         "--conditioning-mode",
         default="multiscale_fourier",
         choices=["multiscale_fourier", "legacy_crossattn"],
-        help="Conditioning mechanism ('multiscale_fourier' default, or 'legacy_crossattn' for v1 ablation)",
     )
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--cfg-drop-prob", type=float, default=0.10)
@@ -136,7 +209,6 @@ def main() -> None:
     else:
         raise RuntimeError("CUDA GPU required (pass --allow-cpu only for local smoke tests).")
 
-    # Configure AMP dtype
     use_amp = False
     amp_dtype = torch.float32
     if device.type == "cuda" and args.amp != "off":
@@ -154,12 +226,6 @@ def main() -> None:
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    states = parse_states_arg(args.states, args.states_json)
-    if len(states) < 2:
-        raise ValueError("Conditional training requires at least 2 distinct load states")
-    load_min = min(states.values())
-    load_max = max(states.values())
-
     channels = tuple(int(c.strip()) for c in args.channels.split(","))
     attention_levels = tuple(bool(int(a.strip())) for a in args.attention_levels.split(","))
     if len(channels) != len(attention_levels):
@@ -176,42 +242,125 @@ def main() -> None:
         flush=True,
     )
 
-    train_data = LoadConditionedPatchDataset(
-        data_root=args.data_root,
-        states=states,
-        split="train",
-        patch_size=args.patch_size,
-        version=args.version,
-        augment=not args.no_augment,
-    )
-    val_data = LoadConditionedPatchDataset(
-        data_root=args.data_root,
-        states=states,
-        split="val",
-        patch_size=args.patch_size,
-        version=args.version,
-        augment=False,
-    )
-    print(f"Train patches: {len(train_data)} ({train_data.state_counts})", flush=True)
-    print(f"Val patches:   {len(val_data)} ({val_data.state_counts})", flush=True)
-
     pin = device.type == "cuda"
     workers = args.num_workers if device.type == "cuda" else 0
-    train_loader = DataLoader(
-        train_data,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=workers,
-        pin_memory=pin,
-        drop_last=False,
-    )
-    val_loader = DataLoader(
-        val_data,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=workers,
-        pin_memory=pin,
-    )
+    is_multielectrode = args.manifest_json is not None
+
+    if is_multielectrode:
+        inc_set = set(args.include_states) if args.include_states else None
+        exc_set = set(args.exclude_states) if args.exclude_states else None
+        scan_specs, inferred_phases, ref_vox = load_manifest_specs(
+            manifest_path=args.manifest_json,
+            data_root=args.data_root,
+            include_states=inc_set,
+            exclude_states=exc_set,
+            include_repeats=args.include_repeats,
+            use_stress_kpa=args.use_stress_kpa,
+        )
+        num_phases = args.num_phases if args.num_phases in (2, 3) else inferred_phases
+        num_materials = len(MATERIAL_TO_ID)
+        states = {str(s["state"]): float(s["load_value"]) for s in scan_specs}  # type: ignore[arg-type]
+        load_min = min(states.values())
+        load_max = max(states.values())
+        if load_max <= load_min:
+            load_max = load_min + 1.0
+
+        train_data_mm = MultiElectrodePatchDataset(
+            data_root=args.data_root,
+            scan_specs=scan_specs,
+            split="train",
+            patch_size=args.patch_size,
+            version=args.version,
+            num_phases=num_phases,
+            augment=not args.no_augment,
+        )
+        val_data_mm = MultiElectrodePatchDataset(
+            data_root=args.data_root,
+            scan_specs=scan_specs,
+            split="val",
+            patch_size=args.patch_size,
+            version=args.version,
+            num_phases=num_phases,
+            augment=False,
+        )
+        print(
+            f"Multi-electrode train: {len(train_data_mm)} patches | materials={train_data_mm.material_counts}",
+            flush=True,
+        )
+        print(f"Multi-electrode val:   {len(val_data_mm)} patches", flush=True)
+
+        if args.balanced_sampling:
+            weights = train_data_mm.build_balanced_weights()
+            sampler = WeightedRandomSampler(weights, num_samples=len(train_data_mm), replacement=True)
+            train_loader: DataLoader = DataLoader(
+                train_data_mm,
+                batch_size=args.batch_size,
+                sampler=sampler,
+                num_workers=workers,
+                pin_memory=pin,
+            )
+        else:
+            train_loader = DataLoader(
+                train_data_mm,
+                batch_size=args.batch_size,
+                shuffle=True,
+                num_workers=workers,
+                pin_memory=pin,
+            )
+        val_loader: DataLoader = DataLoader(
+            val_data_mm,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=workers,
+            pin_memory=pin,
+        )
+    else:
+        states = parse_states_arg(args.states, args.states_json)
+        if len(states) < 2:
+            raise ValueError("Conditional training requires at least 2 distinct load states")
+        load_min = min(states.values())
+        load_max = max(states.values())
+        num_phases = args.num_phases if args.num_phases in (2, 3) else 2
+        num_materials = 1
+        ref_vox = 1.0
+        scan_specs = []
+
+        train_data = LoadConditionedPatchDataset(
+            data_root=args.data_root,
+            states=states,
+            split="train",
+            patch_size=args.patch_size,
+            version=args.version,
+            augment=not args.no_augment,
+            num_phases=num_phases,
+        )
+        val_data = LoadConditionedPatchDataset(
+            data_root=args.data_root,
+            states=states,
+            split="val",
+            patch_size=args.patch_size,
+            version=args.version,
+            augment=False,
+            num_phases=num_phases,
+        )
+        print(f"Train patches: {len(train_data)} ({train_data.state_counts})", flush=True)
+        print(f"Val patches:   {len(val_data)} ({val_data.state_counts})", flush=True)
+
+        train_loader = DataLoader(
+            train_data,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=workers,
+            pin_memory=pin,
+            drop_last=False,
+        )
+        val_loader = DataLoader(
+            val_data,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=workers,
+            pin_memory=pin,
+        )
 
     model = ContinuousLoadConditionedUNet(
         channels=channels,
@@ -222,6 +371,9 @@ def main() -> None:
         load_max=load_max,
         use_flash_attention=(device.type == "cuda" and use_amp),
         conditioning_mode=args.conditioning_mode,
+        num_phases=num_phases,
+        num_materials=num_materials,
+        ref_voxel_size_um=ref_vox,
     ).to(device)
 
     ema = EMAModel(model, decay=args.ema_decay)
@@ -248,8 +400,13 @@ def main() -> None:
         "schedule": args.schedule,
         "prediction_type": args.prediction_type,
         "conditioning_mode": args.conditioning_mode,
+        "num_phases": num_phases,
+        "num_materials": num_materials,
+        "ref_voxel_size_um": ref_vox,
+        "use_stress_kpa": args.use_stress_kpa,
         "timesteps": args.timesteps,
         "states": states,
+        "scan_specs": scan_specs,
         "version": args.version,
     }
 
@@ -289,39 +446,50 @@ def main() -> None:
     if hasattr(signal, "SIGUSR1"):
         signal.signal(signal.SIGUSR1, _handle_preempt)
 
-    def compute_batch_loss(
-        images: torch.Tensor,
-        loads: torch.Tensor,
-        is_train: bool,
-        rng_gen: torch.Generator | None = None,
-    ) -> torch.Tensor:
-        images = images.to(device, non_blocking=True)
-        loads = loads.to(device, non_blocking=True)
-        bsz = images.shape[0]
+    def _unpack_batch(
+        batch: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        if len(batch) == 4:
+            imgs, lds, mats, voxs = batch
+            return (
+                imgs.to(device, non_blocking=True),
+                lds.to(device, non_blocking=True),
+                mats.to(device, non_blocking=True),
+                voxs.to(device, non_blocking=True),
+            )
+        imgs, lds = batch
+        return imgs.to(device, non_blocking=True), lds.to(device, non_blocking=True), None, None
 
-        if rng_gen is not None:
-            noise = torch.randn(images.shape, generator=rng_gen, device=device, dtype=images.dtype)
-            timesteps = torch.randint(
-                0, args.timesteps, (bsz,), generator=rng_gen, device=device
-            ).long()
-            cond_mask = torch.ones(bsz, device=device, dtype=torch.float32)
+    def compute_batch_loss(
+        batch: tuple[torch.Tensor, ...],
+        is_train: bool,
+    ) -> torch.Tensor:
+        images, loads, mats, voxs = _unpack_batch(batch)
+        bsz = images.shape[0]
+        noise = torch.randn_like(images)
+        timesteps = torch.randint(0, args.timesteps, (bsz,), device=device).long()
+        if is_train and args.cfg_drop_prob > 0.0:
+            keep = torch.rand(bsz, device=device) >= args.cfg_drop_prob
+            cond_mask = keep.to(torch.float32)
         else:
-            noise = torch.randn_like(images)
-            timesteps = torch.randint(0, args.timesteps, (bsz,), device=device).long()
-            if is_train and args.cfg_drop_prob > 0.0:
-                keep = torch.rand(bsz, device=device) >= args.cfg_drop_prob
-                cond_mask = keep.to(torch.float32)
-            else:
-                cond_mask = torch.ones(bsz, device=device, dtype=torch.float32)
+            cond_mask = torch.ones(bsz, device=device, dtype=torch.float32)
 
         noisy = scheduler.add_noise(original_samples=images, noise=noise, timesteps=timesteps)
-        if args.prediction_type == "v_prediction":
-            target = scheduler.get_velocity(images, noise, timesteps)
-        else:
-            target = noise
+        target = (
+            scheduler.get_velocity(images, noise, timesteps)
+            if args.prediction_type == "v_prediction"
+            else noise
+        )
 
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            pred = model(noisy, timesteps, loads, cond_mask=cond_mask)
+            pred = model(
+                noisy,
+                timesteps,
+                loads,
+                cond_mask=cond_mask,
+                material_ids=mats,
+                voxel_sizes=voxs,
+            )
             loss = F.mse_loss(pred.float(), target.float())
         return loss
 
@@ -335,8 +503,8 @@ def main() -> None:
         train_total = 0.0
         train_steps = 0
 
-        for step_idx, (images, loads) in enumerate(train_loader, start=1):
-            raw_loss = compute_batch_loss(images, loads, is_train=True)
+        for step_idx, batch in enumerate(train_loader, start=1):
+            raw_loss = compute_batch_loss(batch, is_train=True)
             scaled_loss = raw_loss / args.grad_accum
 
             if scaler.is_enabled():
@@ -372,7 +540,6 @@ def main() -> None:
             if args.max_steps and train_steps >= args.max_steps:
                 break
 
-        # Deterministic validation using EMA weights without perturbing training RNG
         ema_model = ema.shadow_model
         ema_model.eval()
         val_gen = torch.Generator(device=device).manual_seed(args.seed + 10_007)
@@ -380,9 +547,8 @@ def main() -> None:
         val_steps = 0
 
         with torch.no_grad():
-            for images, loads in val_loader:
-                images = images.to(device, non_blocking=True)
-                loads = loads.to(device, non_blocking=True)
+            for batch in val_loader:
+                images, loads, mats, voxs = _unpack_batch(batch)
                 bsz = images.shape[0]
                 noise = torch.randn(images.shape, generator=val_gen, device=device, dtype=images.dtype)
                 timesteps = torch.randint(
@@ -396,7 +562,14 @@ def main() -> None:
                 )
                 ones = torch.ones(bsz, device=device, dtype=torch.float32)
                 with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                    pred = ema_model(noisy, timesteps, loads, cond_mask=ones)
+                    pred = ema_model(
+                        noisy,
+                        timesteps,
+                        loads,
+                        cond_mask=ones,
+                        material_ids=mats,
+                        voxel_sizes=voxs,
+                    )
                     v_loss = F.mse_loss(pred.float(), target.float())
                 val_total += float(v_loss.item())
                 val_steps += 1
