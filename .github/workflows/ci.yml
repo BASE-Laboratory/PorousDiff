@@ -29,11 +29,12 @@ jobs:
         uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
           python-version: ${{ matrix.python-version }}
 
       - name: Install CPU PyTorch and PorousDiff test dependencies
         run: |
-          uv venv .venv
+          uv venv --clear .venv
           uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install --python .venv/bin/python -e ".[dev]"
 
