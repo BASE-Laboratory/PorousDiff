@@ -140,3 +140,69 @@ def test_compression_safe_symmetry_never_mixes_z_with_xy() -> None:
         )
         seen_variants.add(aug.tobytes())
     assert len(seen_variants) >= 2
+
+
+def test_conditional_model_learns_monotonic_load_interpolation() -> None:
+    """Verify end-to-end learning: training on sparse (0.008) & dense (0.053) loads produces
+    monotonic generated solid fractions across low, unseen interpolated midpoint, and high loads.
+    """
+    torch.manual_seed(7)
+    model = ContinuousLoadConditionedUNet(
+        channels=(8, 16),
+        attention_levels=(False, True),
+        num_res_blocks=1,
+        norm_num_groups=4,
+        load_min=0.008,
+        load_max=0.053,
+    )
+    train_sched = build_noise_scheduler(
+        sampler="ddpm",
+        num_train_timesteps=200,
+        schedule="zero_snr_scaled_linear",
+        prediction_type="v_prediction",
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-3)
+
+    gen = torch.Generator().manual_seed(11)
+    x_low = (torch.rand((4, 1, 8, 8, 8), generator=gen) < 0.06).float() * 2.0 - 1.0
+    x_high = (torch.rand((4, 1, 8, 8, 8), generator=gen) < 0.62).float() * 2.0 - 1.0
+    x_all = torch.cat([x_low, x_high], dim=0)
+    loads_all = torch.tensor([0.008] * 4 + [0.053] * 4, dtype=torch.float32)
+
+    for _ in range(60):
+        optimizer.zero_grad()
+        noise = torch.randn_like(x_all)
+        t = torch.randint(0, 200, (8,))
+        noisy = train_sched.add_noise(original_samples=x_all, noise=noise, timesteps=t)
+        target = train_sched.get_velocity(x_all, noise, t)
+        cond_mask = (torch.rand(8) > 0.15).float()
+        pred = model(noisy, t, loads_all, cond_mask=cond_mask)
+        loss = torch.nn.functional.mse_loss(pred, target)
+        loss.backward()
+        optimizer.step()
+
+    model.eval()
+    ddim = build_noise_scheduler(
+        sampler="ddim",
+        num_train_timesteps=200,
+        schedule="zero_snr_scaled_linear",
+        prediction_type="v_prediction",
+    )
+    ddim.set_timesteps(15)
+    init_noise = torch.randn((4, 1, 8, 8, 8), generator=torch.Generator().manual_seed(99))
+
+    generated_sf: dict[float, float] = {}
+    with torch.no_grad():
+        for load_val in (0.008, 0.0305, 0.053):
+            cur = init_noise.clone()
+            lv_tensor = torch.full((4,), load_val, dtype=torch.float32)
+            for ts in ddim.timesteps:
+                t_batch = torch.full((4,), int(ts), dtype=torch.long)
+                v_pred = model.forward_cfg(cur, t_batch, lv_tensor, guidance_scale=1.5)
+                cur, _ = ddim.step(model_output=v_pred, timestep=int(ts), sample=cur)
+            generated_sf[load_val] = float((cur > 0.0).float().mean().item())
+
+    # Strictly monotonic across low -> unseen interpolated midpoint -> high compression load
+    assert generated_sf[0.008] < generated_sf[0.0305] < generated_sf[0.053]
+    assert generated_sf[0.053] - generated_sf[0.008] > 0.25
+
