@@ -28,20 +28,30 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import torch
+
 from porousdiff.baselines import affine_z_compress_to_target, pillar_pore_deletion_compress
-from porousdiff.data import default_project_root, load_split_patches, resolve_patch_split_dir
+from porousdiff.data import (
+    default_project_root,
+    load_split_patches,
+    resolve_material_id,
+    resolve_patch_split_dir,
+)
+from porousdiff.losses import compute_coating_retention_diagnostics
 from porousdiff.metrics import (
     directional_two_point_correlation,
     evaluate_multiphase_physics,
     export_openimpala_tiff,
     summarize_metric_records,
 )
+from porousdiff.models import ContinuousLoadConditionedUNet, EMAModel, build_noise_scheduler
 from porousdiff.preprocessing import infer_material_name, parse_load_value
 from porousdiff.transport_and_xrd import (
     correlate_xrd_with_microstructure,
     generate_openimpala_job_suite,
     parse_openimpala_results,
 )
+from porousdiff.virtual_compression import virtual_compress_volumes
 
 
 def _load_generated_volumes(samples_dir: Path, state_name: str) -> np.ndarray:
@@ -118,6 +128,16 @@ def main() -> None:
         default=None,
         help="Optional DLS K11 DIAD co-registered XRD CSV to correlate against 3D microstructural observables",
     )
+    parser.add_argument(
+        "--include-virtual-compression",
+        action="store_true",
+        help="Virtually compress real lowest-load XCT patches via deterministic DDIM ODE inversion + target-stress denoising",
+    )
+    parser.add_argument("--checkpoint", type=Path, default=None, help="Optional checkpoint override for --include-virtual-compression")
+    parser.add_argument("--virtual-steps", type=int, default=40)
+    parser.add_argument("--invert-strength", type=float, default=0.85)
+    parser.add_argument("--guidance-scale", type=float, default=1.5)
+    parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -183,11 +203,13 @@ def main() -> None:
     expected_shape = (args.patch_size, args.patch_size, args.patch_size)
     real_cache: dict[str, np.ndarray] = {}
     lowest_state_by_group: dict[tuple[str, str], str] = {}
+    lowest_load_by_group: dict[tuple[str, str], float] = {}
 
     for spec in state_specs:
         st = str(spec["state"])
         mat = str(spec["material"])
         beam = str(spec["beamline"])
+        lv = float(spec["load_value"])  # type: ignore[arg-type]
         pdir_hint = str(spec["patch_dir_name"]) if spec.get("patch_dir_name") else None
         split_dir = resolve_patch_split_dir(
             args.data_root, st, args.patch_size, args.version, "val", patch_dir_name=pdir_hint
@@ -199,6 +221,99 @@ def main() -> None:
         real_cache[st] = vols
         if (mat, beam) not in lowest_state_by_group:
             lowest_state_by_group[(mat, beam)] = st
+            lowest_load_by_group[(mat, beam)] = lv
+
+    # Optional: Virtual in-situ compression of real uncompressed scans via DDIM ODE inversion
+    virtual_cache_by_state: dict[str, np.ndarray] = {}
+    if args.include_virtual_compression:
+        if torch.cuda.is_available():
+            vc_device = torch.device("cuda")
+        elif args.allow_cpu:
+            vc_device = torch.device("cpu")
+        else:
+            raise RuntimeError("CUDA GPU required for --include-virtual-compression (or pass --allow-cpu)")
+
+        ckpt_dir = args.output_root / "checkpoints" / first_exp
+        ckpt_path = (
+            args.checkpoint
+            if args.checkpoint is not None
+            else (
+                ckpt_dir / "best_val.pth"
+                if (ckpt_dir / "best_val.pth").is_file()
+                else ckpt_dir / "latest.pth"
+            )
+        )
+        if not ckpt_path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found for virtual compression: {ckpt_path}")
+
+        saved_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        vc_cfg = saved_ckpt["config"]
+        vc_num_materials = int(vc_cfg.get("num_materials", 1))
+        vc_model = ContinuousLoadConditionedUNet(
+            channels=vc_cfg["channels"],
+            attention_levels=vc_cfg["attention_levels"],
+            num_res_blocks=int(vc_cfg["num_res_blocks"]),
+            norm_num_groups=int(vc_cfg["norm_groups"]),
+            load_min=float(vc_cfg["load_min"]),
+            load_max=float(vc_cfg["load_max"]),
+            use_flash_attention=(vc_device.type == "cuda"),
+            conditioning_mode=str(vc_cfg.get("conditioning_mode", "multiscale_fourier")),
+            num_phases=int(vc_cfg.get("num_phases", 2)),
+            num_materials=vc_num_materials,
+            ref_voxel_size_um=float(vc_cfg.get("ref_voxel_size_um", 1.0)),
+        ).to(vc_device)
+        if "ema" in saved_ckpt:
+            vc_ema = EMAModel(vc_model)
+            vc_ema.load_state_dict(saved_ckpt["ema"])
+            vc_active = vc_ema.shadow_model.to(vc_device).eval()
+        else:
+            vc_model.load_state_dict(saved_ckpt["model"])
+            vc_active = vc_model.eval()
+
+        vc_sched = build_noise_scheduler(
+            sampler="ddim",
+            num_train_timesteps=int(vc_cfg["timesteps"]),
+            schedule=str(vc_cfg["schedule"]),
+            prediction_type=str(vc_cfg["prediction_type"]),
+        )
+        vc_use_amp = vc_device.type == "cuda"
+        vc_amp_dtype = (
+            torch.bfloat16
+            if (vc_device.type == "cuda" and torch.cuda.is_bf16_supported())
+            else torch.float16
+        )
+
+        specs_by_group: dict[tuple[str, str], list[dict[str, object]]] = {}
+        for sp in state_specs:
+            specs_by_group.setdefault((str(sp["material"]), str(sp["beamline"])), []).append(sp)
+
+        for (mat, beam), grp_specs in specs_by_group.items():
+            ref_st = lowest_state_by_group[(mat, beam)]
+            ref_lv = lowest_load_by_group[(mat, beam)]
+            ref_vols = real_cache[ref_st]
+            target_lvs = [float(sp["load_value"]) for sp in grp_specs]  # type: ignore[arg-type]
+            mat_id = resolve_material_id(mat) if vc_num_materials > 1 else 0
+            vox_um = float(grp_specs[0]["voxel_size_um"])  # type: ignore[arg-type]
+            vc_map = virtual_compress_volumes(
+                model=vc_active,
+                alphas_cumprod=vc_sched.alphas_cumprod,
+                source_volumes=ref_vols,
+                source_load=ref_lv,
+                target_loads=target_lvs,
+                prediction_type=str(vc_cfg["prediction_type"]),
+                num_steps=args.virtual_steps,
+                invert_strength=args.invert_strength,
+                guidance_scale=args.guidance_scale,
+                material_id=mat_id,
+                voxel_size_um=vox_um,
+                batch_size=min(4, int(ref_vols.shape[0])),
+                use_amp=vc_use_amp,
+                amp_dtype=vc_amp_dtype,
+            )
+            for sp in grp_specs:
+                st_k = str(sp["state"])
+                lv_k = float(sp["load_value"])  # type: ignore[arg-type]
+                virtual_cache_by_state[st_k] = vc_map[lv_k]
 
     max_lag = min(32, args.patch_size // 2)
     report: dict[str, object] = {}
@@ -212,6 +327,7 @@ def main() -> None:
         "ssa_pore_coating",
         "tpb_density",
         "wired_coating_fraction",
+        "coating_pinch_fraction",
         "pore_anisotropy_xy_over_z",
         "geodesic_tortuosity_z",
     ]
@@ -276,6 +392,8 @@ def main() -> None:
             "affine_z_squash": affine_vols,
             "pillar_pore_deletion": pillar_vols,
         }
+        if st in virtual_cache_by_state:
+            methods_vols["virtual_compression"] = virtual_cache_by_state[st]
         for lbl, exp_name in exp_map.items():
             samples_dir = args.output_root / "results" / exp_name / "samples"
             if (samples_dir / st).is_dir():
@@ -350,6 +468,10 @@ def main() -> None:
             ),
             flush=True,
         )
+
+    retention_diag = compute_coating_retention_diagnostics(report)
+    with (out_dir / "coating_retention_diagnostics.json").open("w") as f:
+        json.dump(retention_diag, f, indent=2)
 
     with (out_dir / "beamtime_multiplier_report.json").open("w") as f:
         json.dump(report, f, indent=2)

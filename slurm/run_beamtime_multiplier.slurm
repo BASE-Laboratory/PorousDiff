@@ -49,6 +49,11 @@ if [ -f "${POROUSDIFF_ROOT}/checkpoints/${EXPERIMENT}/latest.pth" ]; then
     RESUME_ARGS+=(--resume)
 fi
 
+PHYSICS_ARGS=()
+if [ "${PHYSICS_LOSS:-1}" = "1" ]; then
+    PHYSICS_ARGS+=(--physics-loss)
+fi
+
 echo "Started Beamtime Multiplier pipeline: $(date -u)"
 echo "Manifest: $MANIFEST | Experiment: $EXPERIMENT"
 nvidia-smi
@@ -66,6 +71,7 @@ python -u scripts/training/train_carbon_conditional_96.py \
     --lr "${LR:-2e-4}" \
     --amp bf16 \
     --num-workers 4 \
+    "${PHYSICS_ARGS[@]}" \
     "${INCLUDE_ARGS[@]}" \
     "${EXCLUDE_ARGS[@]}" \
     "${RESUME_ARGS[@]}"
@@ -87,7 +93,17 @@ python -u scripts/evaluation/evaluate_beamtime_multiplier.py \
     --manifest-json "$MANIFEST" \
     --version "$VERSION" \
     --patch-size "$PATCH_SIZE" \
+    --include-virtual-compression \
+    --generate-openimpala-suite \
     --export-real-openimpala \
     "${HELDOUT_ARGS[@]}"
+
+python -u scripts/evaluation/optimize_clamping_pressure.py \
+    --experiments "porousdiff=${EXPERIMENT}" \
+    --data-root "$DATA_ROOT" \
+    --manifest-json "$MANIFEST" \
+    --version "$VERSION" \
+    --patch-size "$PATCH_SIZE" \
+    --dense-sweep-points "${DENSE_SWEEP_POINTS:-15}"
 
 echo "Finished: $(date -u)"

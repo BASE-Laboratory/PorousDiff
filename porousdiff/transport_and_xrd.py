@@ -258,6 +258,10 @@ def correlate_xrd_with_microstructure(
         "tpb_density",
         "wired_coating_fraction",
         "geodesic_tortuosity_z",
+        "geodesic_solid_tortuosity_z",
+        "z_pinch_contact_density",
+        "coating_pinch_fraction",
+        "mean_coating_coordination",
     ]
 
     merged_rows: list[dict[str, object]] = []
@@ -314,34 +318,42 @@ def correlate_xrd_with_microstructure(
 
         real_m = entry["real"]["metrics"]  # type: ignore[index]
         for mk in micro_keys:
-            merged[f"real_{mk}"] = float(real_m[mk]["mean"])
+            if mk in real_m:
+                merged[f"real_{mk}"] = float(real_m[mk]["mean"])
 
         if chosen_method and chosen_method in methods_dict:
             pred_m = methods_dict[chosen_method]["metrics"]
             for mk in micro_keys:
-                merged[f"pred_{mk}"] = float(pred_m[mk]["mean"])
+                if mk in pred_m:
+                    merged[f"pred_{mk}"] = float(pred_m[mk]["mean"])
 
         merged_rows.append(merged)
 
     if not merged_rows:
         raise ValueError("No rows in XRD CSV matched states or loads in benchmark_report")
 
+    all_fieldnames: list[str] = []
+    for row_d in merged_rows:
+        for k in row_d:
+            if k not in all_fieldnames:
+                all_fieldnames.append(k)
+
     merged_csv = out_dir / "xrd_microstructure_merged.csv"
     with merged_csv.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(merged_rows[0].keys()))
+        writer = csv.DictWriter(f, fieldnames=all_fieldnames)
         writer.writeheader()
         writer.writerows(merged_rows)
 
     correlations: dict[str, dict[str, dict[str, float]]] = {}
     for xc in xrd_cols:
-        x_vals = np.asarray([float(r[f"xrd_{xc}"]) for r in merged_rows], dtype=np.float64)
+        x_vals = np.asarray([float(r.get(f"xrd_{xc}", float("nan"))) for r in merged_rows], dtype=np.float64)
         correlations[xc] = {}
         for prefix in ("real", "pred"):
             for mk in micro_keys:
                 col_key = f"{prefix}_{mk}"
-                if col_key not in merged_rows[0]:
+                if col_key not in all_fieldnames:
                     continue
-                y_vals = np.asarray([float(r[col_key]) for r in merged_rows], dtype=np.float64)
+                y_vals = np.asarray([float(r.get(col_key, float("nan"))) for r in merged_rows], dtype=np.float64)
                 mask = np.isfinite(x_vals) & np.isfinite(y_vals)
                 if int(mask.sum()) >= 3 and np.std(x_vals[mask]) > 1e-12 and np.std(y_vals[mask]) > 1e-12:
                     pr, pp = pearsonr(x_vals[mask], y_vals[mask])
@@ -366,29 +378,34 @@ def correlate_xrd_with_microstructure(
     }
     summary_json.write_text(json.dumps(summary_payload, indent=2))
 
-    # Plot primary XRD observable against EASA, TPB density, and through-plane tortuosity
+    # Plot primary XRD observable against EASA, TPB density, tortuosity, and compressive pinch-points
     if xrd_cols:
         primary_xrd = xrd_cols[0]
-        fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.0))
-        plot_targets = [
+        candidate_targets = [
             ("ssa_pore_coating", "Active Coating EASA (1/µm)"),
             ("tpb_density", "Triple-Phase Boundary (1/µm²)"),
             ("geodesic_tortuosity_z", "Through-Plane Tortuosity τ_Z"),
+            ("coating_pinch_fraction", "Pinched Coating Fraction"),
         ]
-        xv = np.asarray([float(r[f"xrd_{primary_xrd}"]) for r in merged_rows], dtype=np.float64)
-        for ax, (mk, label) in zip(axes, plot_targets):
-            ry = np.asarray([float(r[f"real_{mk}"]) for r in merged_rows], dtype=np.float64)
-            ax.scatter(xv, ry, color="black", s=42, label="Real XCT")
-            if f"pred_{mk}" in merged_rows[0]:
-                py = np.asarray([float(r[f"pred_{mk}"]) for r in merged_rows], dtype=np.float64)
-                ax.scatter(xv, py, color="tab:blue", marker="^", s=46, label="PorousDiff")
-            ax.set_xlabel(f"DIAD XRD: {primary_xrd}")
-            ax.set_ylabel(label)
-            ax.grid(True, alpha=0.3)
-            ax.legend(fontsize=8)
-        fig.suptitle("DLS K11 DIAD Co-Registered XRD vs. 3D Microstructural Electrochemistry", fontsize=12)
-        fig.tight_layout()
-        fig.savefig(out_dir / "diad_xrd_microstructure_correlation.png", dpi=220, bbox_inches="tight")
-        plt.close(fig)
+        plot_targets = [
+            (mk, lbl) for mk, lbl in candidate_targets if f"real_{mk}" in all_fieldnames
+        ]
+        if plot_targets:
+            fig, axes = plt.subplots(1, len(plot_targets), figsize=(4.2 * len(plot_targets), 4.0), squeeze=False)
+            xv = np.asarray([float(r.get(f"xrd_{primary_xrd}", float("nan"))) for r in merged_rows], dtype=np.float64)
+            for ax, (mk, label) in zip(axes[0], plot_targets):
+                ry = np.asarray([float(r.get(f"real_{mk}", float("nan"))) for r in merged_rows], dtype=np.float64)
+                ax.scatter(xv, ry, color="black", s=42, label="Real XCT")
+                if f"pred_{mk}" in all_fieldnames:
+                    py = np.asarray([float(r.get(f"pred_{mk}", float("nan"))) for r in merged_rows], dtype=np.float64)
+                    ax.scatter(xv, py, color="tab:blue", marker="^", s=46, label="PorousDiff")
+                ax.set_xlabel(f"DIAD XRD: {primary_xrd}")
+                ax.set_ylabel(label)
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=8)
+            fig.suptitle("DLS K11 DIAD Co-Registered XRD vs. 3D Microstructure & Pinch-Points", fontsize=12)
+            fig.tight_layout()
+            fig.savefig(out_dir / "diad_xrd_microstructure_correlation.png", dpi=220, bbox_inches="tight")
+            plt.close(fig)
 
     return summary_payload

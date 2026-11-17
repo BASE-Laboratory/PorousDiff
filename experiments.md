@@ -469,3 +469,19 @@ Existing 3D diffusion papers for porous electrodes generate static microstructur
 4. **3-Phase Electrochemical Interfacial Metrics & Head-to-Head Benchmark (`metrics.py`, `evaluate_beamtime_multiplier.py`):**
    - Computes Electrochemically Active Surface Area (`ssa_pore_coating`), Triple-Phase Boundary line density (`tpb_density` in $\mu\text{m}^{-2}$), electronically wired coating fraction (`wired_coating_fraction`), directional tortuosity, and multi-phase OpenImpala TIFF export (`{0, 1, 2}`), comparing Real Held-Out XCT vs. Numerical Z-Compression Baselines vs. Dense and Few-Shot PorousDiff (`slurm/run_beamtime_multiplier.slurm`).
 
+
+## Experiment 16: Virtual *In-Situ* Compression, Seamless REV MultiDiffusion, Physics-Informed $\hat{x}_0$ Loss & OpenImpala Optimal Clamping-Pressure ($\sigma^*$) Discovery (`v0.4`)
+
+**Status:** Implemented and verified end-to-end (`feature/paper-ready-conditional`)
+
+### Key `v0.4` Scientific Upgrades (`porousdiff/`)
+1. **Zero-Beamtime Virtual *In-Situ* Compression (`porousdiff/virtual_compression.py`, `scripts/evaluation/virtual_compress_scan.py`):**
+   - Deterministically inverts a real segmented $0\text{ kPa}$ / lowest-load 3D scan along the conditional DDIM probability-flow ODE (safely bounded away from Zero-SNR $\bar{\alpha}_{T-1} = 0$) and denoises to arbitrary target stresses $\sigma$. Enables 1-to-1 starting-volume comparison against `affine_z_squash` and `pillar_pore_deletion` (`--include-virtual-compression`).
+2. **Seamless $>96^3$ 3D Volume Stitching (`generate_tiled_3d`, `--tiled-shape`):**
+   - Overlapped 3D raised-cosine (Hann) MultiDiffusion synthesizes arbitrarily large stitch-free electrode domains (e.g. $96 \times 96 \times 192$ or $160^3$) for OpenImpala REV convergence without increasing training GPU memory.
+3. **Physics-Informed $\hat{x}_0$ Training Objective & Delamination Audit (`porousdiff/losses.py`, `--physics-loss`):**
+   - Closed-form single-step $\hat{x}_0$ reconstruction paired with Min-SNR-$\gamma$ weighting, 3D finite-difference interfacial sharpness, hierarchical no-floating-coating support penalty $\text{ReLU}(\hat{c}_{\text{coating}} - \hat{c}_{\text{solid}})$, and solid-phase catalyst-to-scaffold ratio conservation, plus experimental coating-spallation diagnostics (`coating_retention_diagnostics.json`).
+4. **Optimal Clamping-Pressure $\sigma^*$ Sweet-Spot Finder + OpenImpala Integration (`porousdiff/optimization.py`, `scripts/evaluation/optimize_clamping_pressure.py`):**
+   - Couples OpenImpala continuum $D_{\text{eff},Z}/D_0$ & $\sigma_{\text{eff},Z}/\sigma_0$ (and 3D geodesic / Carman-Kozeny surrogates) with wired active catalyst area into a harmonic series-conductance Figure of Merit $\text{FoM}(\sigma)$ with bootstrap 95% confidence intervals on $\sigma^*$.
+5. **3D Compressive Pinch-Point & Coordination Metrics for K11 DIAD XRD (`porousdiff/metrics.py`, `porousdiff/transport_and_xrd.py`):**
+   - Quantifies through-plane solid contact density (`z_pinch_contact_density`), bilateral sandwiched coating fraction (`coating_pinch_fraction`), and 6-connected solid coordination (`mean_coating_coordination`), automatically correlated against co-registered DLS K11 DIAD XRD microstrain and peak broadening.

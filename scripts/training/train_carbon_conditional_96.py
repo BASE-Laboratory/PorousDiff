@@ -38,6 +38,7 @@ from porousdiff.data import (
     default_project_root,
     restore_rng_states,
 )
+from porousdiff.losses import PhysicsInformedDiffusionLoss
 from porousdiff.models import ContinuousLoadConditionedUNet, EMAModel, build_noise_scheduler
 from porousdiff.preprocessing import parse_load_value
 
@@ -175,6 +176,15 @@ def main() -> None:
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--cfg-drop-prob", type=float, default=0.10)
     parser.add_argument("--ema-decay", type=float, default=0.9995)
+    parser.add_argument(
+        "--physics-loss",
+        action="store_true",
+        help="Enable physics-informed x0_hat training loss (Min-SNR-gamma + 3D interfacial gradient + solid support + catalyst loading conservation)",
+    )
+    parser.add_argument("--snr-gamma", type=float, default=5.0)
+    parser.add_argument("--interface-weight", type=float, default=0.05)
+    parser.add_argument("--support-weight", type=float, default=0.05)
+    parser.add_argument("--loading-weight", type=float, default=0.05)
 
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -389,6 +399,22 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
 
+    physics_criterion: PhysicsInformedDiffusionLoss | None = None
+    if args.physics_loss:
+        physics_criterion = PhysicsInformedDiffusionLoss(
+            alphas_cumprod=scheduler.alphas_cumprod,
+            prediction_type=args.prediction_type,
+            snr_gamma=args.snr_gamma,
+            interface_weight=args.interface_weight,
+            support_weight=args.support_weight,
+            loading_weight=args.loading_weight,
+        ).to(device)
+        print(
+            f"Physics-informed loss enabled: snr_gamma={args.snr_gamma}, "
+            f"iface={args.interface_weight}, support={args.support_weight}, loading={args.loading_weight}",
+            flush=True,
+        )
+
     model_config = {
         "patch_size": args.patch_size,
         "channels": list(channels),
@@ -404,6 +430,8 @@ def main() -> None:
         "num_materials": num_materials,
         "ref_voxel_size_um": ref_vox,
         "use_stress_kpa": args.use_stress_kpa,
+        "physics_loss": args.physics_loss,
+        "snr_gamma": args.snr_gamma if args.physics_loss else 0.0,
         "timesteps": args.timesteps,
         "states": states,
         "scan_specs": scan_specs,
@@ -490,7 +518,16 @@ def main() -> None:
                 material_ids=mats,
                 voxel_sizes=voxs,
             )
-            loss = F.mse_loss(pred.float(), target.float())
+            if physics_criterion is not None:
+                loss, _ = physics_criterion(
+                    model_pred=pred,
+                    target=target,
+                    x_t=noisy,
+                    x_0=images,
+                    timesteps=timesteps,
+                )
+            else:
+                loss = F.mse_loss(pred.float(), target.float())
         return loss
 
     for epoch in range(start_epoch, args.epochs):

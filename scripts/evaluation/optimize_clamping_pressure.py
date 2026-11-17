@@ -1,0 +1,590 @@
+"""Find optimal electrode clamping pressure `sigma*` coupling PorousDiff & OpenImpala transport.
+
+Computes the continuous reaction-transport Figure of Merit `FoM(sigma)` and bootstrap 95%
+confidence interval on the optimal cell clamping stress `sigma*` across electrode chemistries
+(`virgin_carbon`, `tio2_anode`, `cuhcf_cathode`), comparing:
+  - Real synchrotron XCT ground truth (`real`),
+  - PorousDiff generative predictions (`porousdiff`, plus optional dense continuous stress sweep),
+  - Standard literature numerical compression heuristics (`affine_z_squash`, `pillar_pore_deletion`).
+
+Automatically ingests OpenImpala continuum solver outputs (`openimpala_transport_parity.csv`)
+when present, and seamlessly falls back to exact 3D geodesic pore/solid tortuosity and
+Carman-Kozeny permeability surrogates prior to running OpenImpala.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import sys
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from porousdiff.baselines import affine_z_compress_to_target, pillar_pore_deletion_compress
+from porousdiff.data import (
+    decode_channels_to_phases,
+    default_project_root,
+    load_split_patches,
+    resolve_material_id,
+    resolve_patch_split_dir,
+)
+from porousdiff.metrics import evaluate_multiphase_physics
+from porousdiff.models import ContinuousLoadConditionedUNet, EMAModel, build_noise_scheduler
+from porousdiff.optimization import (
+    compute_transport_and_fom_record,
+    find_optimal_clamping_pressure,
+    load_openimpala_lookup,
+)
+from porousdiff.preprocessing import infer_material_name, parse_load_value
+
+
+def _parse_experiments(entries: list[str]) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for item in entries:
+        if "=" in item:
+            lbl, exp = item.split("=", 1)
+            out[lbl.strip()] = exp.strip()
+        else:
+            out[item.strip()] = item.strip()
+    return out
+
+
+def _load_generated_volumes(samples_dir: Path, state_name: str) -> np.ndarray:
+    state_dir = samples_dir / state_name
+    stacked = state_dir / "generated_samples.npy"
+    if stacked.is_file():
+        return np.load(stacked)
+    files = sorted(state_dir.glob("sample_*_binary.npy"))
+    if not files:
+        raise FileNotFoundError(f"No generated samples found in {state_dir}")
+    return np.stack([np.load(p) for p in files], axis=0)
+
+
+@torch.inference_mode()
+def _sample_dense_sweep_for_material(
+    active_model: ContinuousLoadConditionedUNet,
+    scheduler: object,
+    dense_loads: np.ndarray,
+    num_samples_per_load: int,
+    patch_size: int,
+    guidance_scale: float,
+    material_id: int,
+    voxel_size_um: float,
+    seed: int,
+    use_amp: bool,
+    amp_dtype: torch.dtype,
+) -> dict[float, list[dict[str, float]]]:
+    """Generate a continuous stress sweep with shared latent seeds to resolve `sigma*` finely."""
+    device = next(active_model.parameters()).device
+    data_ch = active_model.data_channels
+    gen = torch.Generator(device=device).manual_seed(seed)
+    shared_noise = torch.randn(
+        (num_samples_per_load, data_ch, patch_size, patch_size, patch_size),
+        generator=gen,
+        device=device,
+    )
+    records_by_load: dict[float, list[dict[str, float]]] = {}
+    for lv in dense_loads:
+        lv_f = float(lv)
+        img = shared_noise.clone()
+        loads_t = torch.full((num_samples_per_load,), lv_f, device=device, dtype=torch.float32)
+        mats_t = (
+            torch.full((num_samples_per_load,), int(material_id), device=device, dtype=torch.long)
+            if active_model.is_multimodal
+            else None
+        )
+        voxs_t = (
+            torch.full(
+                (num_samples_per_load,), float(voxel_size_um), device=device, dtype=torch.float32
+            )
+            if active_model.is_multimodal
+            else None
+        )
+        step_gen = torch.Generator(device=device).manual_seed(seed + 101)
+        for timestep in scheduler.timesteps:  # type: ignore[attr-defined]
+            t_int = int(timestep)
+            t_batch = torch.full((num_samples_per_load,), t_int, device=device, dtype=torch.long)
+            with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                pred = active_model.forward_cfg(
+                    img,
+                    t_batch,
+                    loads_t,
+                    guidance_scale=guidance_scale,
+                    material_ids=mats_t,
+                    voxel_sizes=voxs_t,
+                )
+            img = scheduler.step(pred.float(), t_int, img, generator=step_gen)[0]  # type: ignore[attr-defined]
+
+        vols = decode_channels_to_phases(img.float().cpu().numpy(), enforce_solid_support=True)
+        recs = [
+            compute_transport_and_fom_record(
+                evaluate_multiphase_physics(v, voxel_size=voxel_size_um),
+                openimpala_metrics=None,
+                voxel_size_um=voxel_size_um,
+            )
+            for v in vols
+        ]
+        records_by_load[lv_f] = recs
+    return records_by_load
+
+
+def main() -> None:
+    proj_root = default_project_root()
+    parser = argparse.ArgumentParser(
+        description="Discover optimal electrode clamping pressure sigma* across Real XCT, OpenImpala, and PorousDiff"
+    )
+    parser.add_argument(
+        "--experiments",
+        nargs="+",
+        required=True,
+        help="Experiment(s), e.g. porousdiff=beamtime_multiplier_96",
+    )
+    parser.add_argument("--data-root", type=Path, default=None, help="Optional real XCT patch root for ground-truth & baselines")
+    parser.add_argument("--output-root", type=Path, default=proj_root)
+    parser.add_argument("--out-dir", type=Path, default=None)
+    parser.add_argument("--manifest-json", type=Path, default=None)
+    parser.add_argument("--states", nargs="*", default=None)
+    parser.add_argument("--version", default="carbon_calibrated_v1")
+    parser.add_argument("--patch-size", type=int, default=96)
+    parser.add_argument("--voxel-size-um", type=float, default=1.0)
+    parser.add_argument("--include-repeats", action="store_true")
+    parser.add_argument("--beamline", default=None)
+    parser.add_argument("--max-real-samples", type=int, default=20)
+    parser.add_argument(
+        "--openimpala-csv",
+        type=Path,
+        default=None,
+        help="Optional openimpala_transport_parity.csv from parse_openimpala_suite.py",
+    )
+    parser.add_argument(
+        "--weights",
+        default="0.35,0.35,0.30",
+        help="Comma-separated weights 'ionic,electronic,kinetic' for harmonic cell conductance FoM",
+    )
+    parser.add_argument("--dense-sweep-points", type=int, default=0, help=">0 runs continuous intermediate PorousDiff stress sweep")
+    parser.add_argument("--dense-samples-per-load", type=int, default=4)
+    parser.add_argument("--checkpoint", type=Path, default=None)
+    parser.add_argument("--steps", type=int, default=50)
+    parser.add_argument("--guidance-scale", type=float, default=1.5)
+    parser.add_argument("--bootstrap", type=int, default=200)
+    parser.add_argument("--allow-cpu", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    w_parts = [float(x.strip()) for x in args.weights.split(",") if x.strip()]
+    if len(w_parts) != 3:
+        raise ValueError("--weights must have 3 comma-separated floats: ionic,electronic,kinetic")
+    weights = (w_parts[0], w_parts[1], w_parts[2])
+
+    exp_map = _parse_experiments(args.experiments)
+    first_exp = next(iter(exp_map.values()))
+    out_dir = (
+        args.out_dir
+        if args.out_dir is not None
+        else (args.output_root / "results" / first_exp / "clamping_optimization")
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    auto_oi_csv = (
+        args.openimpala_csv
+        if args.openimpala_csv is not None
+        else (args.output_root / "results" / first_exp / "beamtime_benchmark" / "openimpala_transport_parity.csv")
+    )
+    oi_lookup = load_openimpala_lookup(auto_oi_csv) if auto_oi_csv.is_file() else {}
+
+    # Build state specs from manifest, --states, or sampled directories
+    state_specs: list[dict[str, object]] = []
+    if args.manifest_json is not None:
+        manifest = json.loads(args.manifest_json.read_text())
+        for sc in manifest.get("scans", []):
+            if not args.include_repeats and bool(sc.get("is_repeat_or_secondary", False)):
+                continue
+            sc_beam = str(sc.get("beamline", "primary"))
+            if args.beamline and sc_beam != args.beamline:
+                continue
+            state_specs.append(
+                {
+                    "state": str(sc["state"]),
+                    "material": str(sc.get("material", "virgin_carbon")),
+                    "beamline": sc_beam,
+                    "load_value": float(sc.get("stress_kpa") or sc["load_mv_per_v"]),
+                    "voxel_size_um": float(sc.get("effective_voxel_size_um", args.voxel_size_um)),
+                    "patch_dir_name": sc.get("patch_dir_name"),
+                }
+            )
+    elif args.states:
+        for item in args.states:
+            if "=" in item:
+                st, lv_s = item.split("=", 1)
+                st, lv = st.strip(), float(lv_s.strip())
+            else:
+                st = item.strip()
+                lv = parse_load_value(st)
+            state_specs.append(
+                {
+                    "state": st,
+                    "material": infer_material_name(st),
+                    "beamline": args.beamline or "primary",
+                    "load_value": lv,
+                    "voxel_size_um": args.voxel_size_um,
+                    "patch_dir_name": None,
+                }
+            )
+    else:
+        # Discover from first experiment's per_sample_physics.csv
+        sample_csv = args.output_root / "results" / first_exp / "samples" / "per_sample_physics.csv"
+        if not sample_csv.is_file():
+            raise ValueError("Provide --manifest-json, --states, or run sample_carbon_conditional_96.py first")
+        seen_st: set[str] = set()
+        with sample_csv.open("r", newline="") as f:
+            for row in csv.DictReader(f):
+                st = str(row["state"])
+                if st in seen_st:
+                    continue
+                seen_st.add(st)
+                state_specs.append(
+                    {
+                        "state": st,
+                        "material": str(row.get("material", infer_material_name(st))),
+                        "beamline": "primary",
+                        "load_value": float(row["load_value"]),
+                        "voxel_size_um": float(row.get("voxel_size_um", args.voxel_size_um)),
+                        "patch_dir_name": None,
+                    }
+                )
+
+    state_specs.sort(key=lambda s: (str(s["material"]), float(s["load_value"])))  # type: ignore[arg-type]
+
+    # Collect per-(material, method, load) transport records
+    rng = np.random.default_rng(args.seed)
+    expected_shape = (args.patch_size, args.patch_size, args.patch_size)
+    records_tree: dict[str, dict[str, dict[float, list[dict[str, float]]]]] = {}
+
+    have_real_data = args.data_root is not None and args.data_root.is_dir()
+    real_cache: dict[str, np.ndarray] = {}
+    lowest_state_by_mat: dict[str, str] = {}
+
+    if have_real_data:
+        for sp in state_specs:
+            st = str(sp["state"])
+            mat = str(sp["material"])
+            pdir_hint = str(sp["patch_dir_name"]) if sp.get("patch_dir_name") else None
+            try:
+                split_dir = resolve_patch_split_dir(
+                    args.data_root, st, args.patch_size, args.version, "val", patch_dir_name=pdir_hint  # type: ignore[arg-type]
+                )
+                vols = load_split_patches(split_dir, expected_shape=expected_shape)
+            except FileNotFoundError:
+                continue
+            if vols.shape[0] > args.max_real_samples:
+                idx = np.sort(rng.choice(vols.shape[0], size=args.max_real_samples, replace=False))
+                vols = vols[idx]
+            real_cache[st] = vols
+            if mat not in lowest_state_by_mat:
+                lowest_state_by_mat[mat] = st
+
+    for sp in state_specs:
+        st = str(sp["state"])
+        mat = str(sp["material"])
+        lv = float(sp["load_value"])  # type: ignore[arg-type]
+        vox = float(sp["voxel_size_um"])  # type: ignore[arg-type]
+        mat_bucket = records_tree.setdefault(mat, {})
+
+        if st in real_cache:
+            r_vols = real_cache[st]
+            r_oi = oi_lookup.get(("real", st))
+            r_recs = [
+                compute_transport_and_fom_record(
+                    evaluate_multiphase_physics(v, voxel_size=vox),
+                    openimpala_metrics=r_oi,
+                    voxel_size_um=vox,
+                )
+                for v in r_vols
+            ]
+            mat_bucket.setdefault("real", {}).setdefault(lv, []).extend(r_recs)
+
+            target_sf = float(np.mean([r["solid_fraction"] for r in r_recs]))
+            ref_vols = real_cache[lowest_state_by_mat[mat]]
+            aff_vols = [
+                affine_z_compress_to_target(rv, target_solid_fraction=max(target_sf, 1e-3), output_depth=args.patch_size)
+                for rv in ref_vols
+            ]
+            pil_vols = [
+                pillar_pore_deletion_compress(
+                    rv,
+                    target_solid_fraction=max(target_sf, 1e-3),
+                    output_depth=args.patch_size,
+                    rng=np.random.default_rng(args.seed + i),
+                )
+                for i, rv in enumerate(ref_vols)
+            ]
+            aff_oi = oi_lookup.get(("affine_z_squash", st))
+            pil_oi = oi_lookup.get(("pillar_pore_deletion", st))
+            mat_bucket.setdefault("affine_z_squash", {}).setdefault(lv, []).extend(
+                [
+                    compute_transport_and_fom_record(
+                        evaluate_multiphase_physics(v, voxel_size=vox),
+                        openimpala_metrics=aff_oi,
+                        voxel_size_um=vox,
+                    )
+                    for v in aff_vols
+                ]
+            )
+            mat_bucket.setdefault("pillar_pore_deletion", {}).setdefault(lv, []).extend(
+                [
+                    compute_transport_and_fom_record(
+                        evaluate_multiphase_physics(v, voxel_size=vox),
+                        openimpala_metrics=pil_oi,
+                        voxel_size_um=vox,
+                    )
+                    for v in pil_vols
+                ]
+            )
+
+        for lbl, exp_name in exp_map.items():
+            samples_dir = args.output_root / "results" / exp_name / "samples"
+            if (samples_dir / st).is_dir():
+                g_vols = _load_generated_volumes(samples_dir, st)
+                g_oi = oi_lookup.get((lbl, st))
+                g_recs = [
+                    compute_transport_and_fom_record(
+                        evaluate_multiphase_physics(v, voxel_size=vox),
+                        openimpala_metrics=g_oi,
+                        voxel_size_um=vox,
+                    )
+                    for v in g_vols
+                ]
+                mat_bucket.setdefault(lbl, {}).setdefault(lv, []).extend(g_recs)
+
+    # Optional continuous dense PorousDiff sweep for high-resolution sigma* discovery
+    if args.dense_sweep_points >= 3:
+        device = (
+            torch.device("cuda")
+            if torch.cuda.is_available()
+            else (torch.device("cpu") if args.allow_cpu else None)
+        )
+        if device is None:
+            raise RuntimeError("CUDA required for --dense-sweep-points (or pass --allow-cpu)")
+        ckpt_dir = args.output_root / "checkpoints" / first_exp
+        ckpt_path = (
+            args.checkpoint
+            if args.checkpoint is not None
+            else (
+                ckpt_dir / "best_val.pth"
+                if (ckpt_dir / "best_val.pth").is_file()
+                else ckpt_dir / "latest.pth"
+            )
+        )
+        saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        cfg = saved["config"]
+        num_materials = int(cfg.get("num_materials", 1))
+        model = ContinuousLoadConditionedUNet(
+            channels=cfg["channels"],
+            attention_levels=cfg["attention_levels"],
+            num_res_blocks=int(cfg["num_res_blocks"]),
+            norm_num_groups=int(cfg["norm_groups"]),
+            load_min=float(cfg["load_min"]),
+            load_max=float(cfg["load_max"]),
+            use_flash_attention=(device.type == "cuda"),
+            conditioning_mode=str(cfg.get("conditioning_mode", "multiscale_fourier")),
+            num_phases=int(cfg.get("num_phases", 2)),
+            num_materials=num_materials,
+            ref_voxel_size_um=float(cfg.get("ref_voxel_size_um", 1.0)),
+        ).to(device)
+        if "ema" in saved:
+            ema = EMAModel(model)
+            ema.load_state_dict(saved["ema"])
+            active_model = ema.shadow_model.to(device).eval()
+        else:
+            model.load_state_dict(saved["model"])
+            active_model = model.eval()
+        sched = build_noise_scheduler(
+            sampler="ddim",
+            num_train_timesteps=int(cfg["timesteps"]),
+            schedule=str(cfg["schedule"]),
+            prediction_type=str(cfg["prediction_type"]),
+        )
+        sched.set_timesteps(args.steps, device=device)
+        use_amp = device.type == "cuda"
+        amp_dtype = (
+            torch.bfloat16
+            if (device.type == "cuda" and torch.cuda.is_bf16_supported())
+            else torch.float16
+        )
+
+        for mat, mat_bucket in records_tree.items():
+            mat_loads = sorted({float(sp["load_value"]) for sp in state_specs if str(sp["material"]) == mat})  # type: ignore[arg-type]
+            if len(mat_loads) < 2:
+                continue
+            dense_grid = np.linspace(mat_loads[0], mat_loads[-1], args.dense_sweep_points)
+            vox_um = float(
+                next(sp["voxel_size_um"] for sp in state_specs if str(sp["material"]) == mat)  # type: ignore[arg-type]
+            )
+            mat_id = resolve_material_id(mat) if num_materials > 1 else 0
+            mat_bucket["porousdiff_dense"] = _sample_dense_sweep_for_material(
+                active_model=active_model,
+                scheduler=sched,
+                dense_loads=dense_grid,
+                num_samples_per_load=args.dense_samples_per_load,
+                patch_size=int(cfg["patch_size"]),
+                guidance_scale=args.guidance_scale,
+                material_id=mat_id,
+                voxel_size_um=vox_um,
+                seed=args.seed,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+            )
+
+    summary_out: dict[str, dict[str, object]] = {}
+    csv_rows: list[dict[str, object]] = []
+
+    for mat, methods_map in sorted(records_tree.items()):
+        if not methods_map:
+            continue
+        mat_summary: dict[str, object] = {}
+        ref_scales: tuple[float, float, float] | None = None
+        if "real" in methods_map:
+            real_opt = find_optimal_clamping_pressure(
+                methods_map["real"],
+                weights=weights,
+                n_bootstrap=args.bootstrap,
+                seed=args.seed,
+            )
+            ns = real_opt["norm_scales"]  # type: ignore[index]
+            ref_scales = (
+                float(ns["d_eff_pore_z"]),  # type: ignore[index]
+                float(ns["sigma_eff_solid_z"]),  # type: ignore[index]
+                float(ns["active_wired_interface"]),  # type: ignore[index]
+            )
+            mat_summary["real"] = real_opt
+
+        real_sigma_star = (
+            float(mat_summary["real"]["optimal_load"])  # type: ignore[index]
+            if "real" in mat_summary
+            else float("nan")
+        )
+
+        for m_name, load_map in methods_map.items():
+            if m_name == "real":
+                opt_res = mat_summary["real"]  # type: ignore[assignment]
+            else:
+                opt_res = find_optimal_clamping_pressure(
+                    load_map,
+                    weights=weights,
+                    n_bootstrap=args.bootstrap,
+                    seed=args.seed,
+                    norm_scales=ref_scales,
+                )
+                if np.isfinite(real_sigma_star):
+                    opt_res["abs_err_optimal_load_vs_real"] = round(
+                        abs(float(opt_res["optimal_load"]) - real_sigma_star), 6
+                    )
+                mat_summary[m_name] = opt_res
+
+            for pt in opt_res["discrete_points"]:  # type: ignore[index]
+                row: dict[str, object] = {
+                    "material": mat,
+                    "method": m_name,
+                    "optimal_load_method": opt_res["optimal_load"],  # type: ignore[index]
+                }
+                row.update(pt)
+                csv_rows.append(row)
+
+            print(
+                f"[{mat} | {m_name}] sigma* = {opt_res['optimal_load']} "  # type: ignore[index]
+                f"(95% CI {opt_res['optimal_load_ci95']}) | FoM* = {opt_res['optimal_fom']}",  # type: ignore[index]
+                flush=True,
+            )
+        summary_out[mat] = mat_summary
+
+    (out_dir / "optimal_clamping_summary.json").write_text(json.dumps(summary_out, indent=2))
+    if csv_rows:
+        with (out_dir / "clamping_optimization_curves.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(csv_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(csv_rows)
+
+    # Render 4-panel publication figure per material
+    materials = list(summary_out.keys())
+    if materials:
+        fig, axes = plt.subplots(
+            len(materials), 4, figsize=(16.5, 4.0 * len(materials)), squeeze=False
+        )
+        style_map = {
+            "real": ("black", "-o", 2.2),
+            "affine_z_squash": ("tab:gray", "--s", 1.4),
+            "pillar_pore_deletion": ("tab:orange", "--d", 1.4),
+        }
+        extra_colors = ["tab:blue", "tab:green", "tab:purple", "tab:red"]
+
+        for r_idx, mat in enumerate(materials):
+            mat_res = summary_out[mat]
+            extra_i = 0
+            for m_name, m_obj in mat_res.items():
+                pts = m_obj["discrete_points"]  # type: ignore[index]
+                curve = m_obj["continuous_curve"]  # type: ignore[index]
+                xs = [float(p["load_value"]) for p in pts]
+                if m_name in style_map:
+                    color, marker_style, lw = style_map[m_name]
+                else:
+                    color = extra_colors[extra_i % len(extra_colors)]
+                    marker_style, lw = "-^", 2.0
+                    extra_i += 1
+
+                axes[r_idx, 0].plot(
+                    xs, [float(p["d_eff_pore_z"]) for p in pts], marker_style, color=color, lw=lw, label=m_name
+                )
+                axes[r_idx, 1].plot(
+                    xs, [float(p["sigma_eff_solid_z"]) for p in pts], marker_style, color=color, lw=lw, label=m_name
+                )
+                axes[r_idx, 2].plot(
+                    xs, [float(p["active_wired_interface"]) for p in pts], marker_style, color=color, lw=lw, label=m_name
+                )
+
+                gx = np.asarray(curve["grid_loads"], dtype=np.float64)
+                gfom = np.asarray(curve["fom_mean"], dtype=np.float64)
+                glo = np.asarray(curve["fom_ci95_low"], dtype=np.float64)
+                ghi = np.asarray(curve["fom_ci95_high"], dtype=np.float64)
+                ls = "--" if m_name in ("affine_z_squash", "pillar_pore_deletion") else "-"
+                axes[r_idx, 3].plot(gx, gfom, ls, color=color, lw=lw, label=f"{m_name} (σ*={m_obj['optimal_load']:g})")  # type: ignore[index]
+                axes[r_idx, 3].fill_between(gx, glo, ghi, color=color, alpha=0.14)
+                axes[r_idx, 3].axvline(float(m_obj["optimal_load"]), color=color, ls=":", lw=1.2)  # type: ignore[index]
+
+            titles = [
+                f"{mat} — Ionic D_eff,Z / D_0",
+                f"{mat} — Electronic σ_eff,Z / σ_0",
+                f"{mat} — Wired Active Interface (1/µm)",
+                f"{mat} — Cell Conductance FoM & Optimal σ*",
+            ]
+            for c_idx, ttl in enumerate(titles):
+                axes[r_idx, c_idx].set_title(ttl, fontsize=10)
+                axes[r_idx, c_idx].set_xlabel("Compressive Load / Stress")
+                axes[r_idx, c_idx].grid(True, alpha=0.3)
+            axes[r_idx, 3].legend(fontsize=7.5, loc="best")
+            if r_idx == 0:
+                axes[r_idx, 0].legend(fontsize=7.5, loc="best")
+
+        fig.suptitle(
+            "Reaction-Transport Trade-Off & Optimal Cell Clamping Pressure σ* (OpenImpala + PorousDiff)",
+            fontsize=13,
+        )
+        fig.tight_layout()
+        fig.savefig(out_dir / "optimal_clamping_pressure.png", dpi=240, bbox_inches="tight")
+        fig.savefig(out_dir / "optimal_clamping_pressure.pdf", bbox_inches="tight")
+        plt.close(fig)
+
+    print(f"Saved optimal clamping-pressure study -> {out_dir}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

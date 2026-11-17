@@ -279,6 +279,31 @@ def multiphase_interfacial_metrics(volume: np.ndarray, voxel_size: float = 1.0) 
             wired_mask = np.isin(solid_lbl, list(boundary_ids)) & (vol == 2)
             wired_frac = float(np.count_nonzero(wired_mask) / total_coat)
 
+    # 3D compressive pinch-point & solid contact coordination (links to K11 DIAD XRD microstrain)
+    solid_mask = vol >= 1
+    z_solid_faces = int(np.count_nonzero(solid_mask[1:, :, :] & solid_mask[:-1, :, :]))
+    z_pinch_density = float(z_solid_faces) / area_norm
+
+    if total_coat == 0 or vol.shape[0] < 3:
+        coat_pinch_frac = 0.0
+    else:
+        sandwiched_coat = solid_mask[:-2, :, :] & (vol[1:-1, :, :] == 2) & solid_mask[2:, :, :]
+        coat_pinch_frac = float(np.count_nonzero(sandwiched_coat) / total_coat)
+
+    if total_coat == 0:
+        mean_coat_coord = 0.0
+    else:
+        padded_solid = np.pad(solid_mask.astype(np.uint8), 1, mode="constant", constant_values=0)
+        coord6 = (
+            padded_solid[2:, 1:-1, 1:-1]
+            + padded_solid[:-2, 1:-1, 1:-1]
+            + padded_solid[1:-1, 2:, 1:-1]
+            + padded_solid[1:-1, :-2, 1:-1]
+            + padded_solid[1:-1, 1:-1, 2:]
+            + padded_solid[1:-1, 1:-1, :-2]
+        )
+        mean_coat_coord = float(coord6[vol == 2].mean())
+
     return {
         "carbon_fraction": carbon_frac,
         "coating_fraction": coat_frac,
@@ -288,6 +313,9 @@ def multiphase_interfacial_metrics(volume: np.ndarray, voxel_size: float = 1.0) 
         "ssa_carbon_coating": _pair_faces(1, 2),
         "tpb_density": tpb_density,
         "wired_coating_fraction": wired_frac,
+        "z_pinch_contact_density": z_pinch_density,
+        "coating_pinch_fraction": coat_pinch_frac,
+        "mean_coating_coordination": mean_coat_coord,
     }
 
 
@@ -306,6 +334,7 @@ def evaluate_volume_physics(volume: np.ndarray, voxel_size: float = 1.0) -> dict
     metrics["geodesic_tortuosity_z"] = geodesic_pore_tortuosity(vol, axis=0)
     metrics["geodesic_tortuosity_y"] = geodesic_pore_tortuosity(vol, axis=1)
     metrics["geodesic_tortuosity_x"] = geodesic_pore_tortuosity(vol, axis=2)
+    metrics["geodesic_solid_tortuosity_z"] = geodesic_pore_tortuosity(1 - vol, axis=0)
     return metrics
 
 

@@ -35,6 +35,7 @@ from porousdiff.metrics import (
 )
 from porousdiff.models import ContinuousLoadConditionedUNet, EMAModel, build_noise_scheduler
 from porousdiff.preprocessing import infer_material_name, parse_load_value
+from porousdiff.virtual_compression import generate_tiled_3d
 
 PHASE_CMAP = ListedColormap(["#0b0e14", "#38bdf8", "#facc15"])
 
@@ -256,6 +257,13 @@ def main() -> None:
         help="Comma-separated load/stress values for a fixed-noise sweep (empty to skip)",
     )
     parser.add_argument("--export-openimpala", action="store_true")
+    parser.add_argument(
+        "--tiled-shape",
+        default="",
+        help="Optional seamless >patch_size^3 3D MultiDiffusion shape 'D,H,W' (e.g. '96,96,192' or '160,160,160') for OpenImpala REV convergence",
+    )
+    parser.add_argument("--tiled-overlap", type=float, default=0.5)
+    parser.add_argument("--tile-batch-size", type=int, default=4)
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -293,6 +301,15 @@ def main() -> None:
     ref_vox = float(cfg.get("ref_voxel_size_um", 1.0))
     unit_label = "kPa" if bool(cfg.get("use_stress_kpa", False)) else "mV/V"
 
+    tiled_shape: tuple[int, int, int] | None = None
+    if args.tiled_shape.strip():
+        parts = [int(p.strip()) for p in args.tiled_shape.split(",") if p.strip()]
+        if len(parts) != 3 or any(p < patch_size for p in parts):
+            raise ValueError(
+                f"--tiled-shape must be 'D,H,W' with each dimension >= patch_size ({patch_size})"
+            )
+        tiled_shape = (parts[0], parts[1], parts[2])
+
     model = ContinuousLoadConditionedUNet(
         channels=cfg["channels"],
         attention_levels=cfg["attention_levels"],
@@ -327,7 +344,8 @@ def main() -> None:
 
     print(
         f"Loaded {weight_source} weights from {ckpt_path} (epoch {int(saved['epoch']) + 1}) | "
-        f"phases={num_phases} | materials={num_materials} | sampler={args.sampler} ({args.steps} steps)",
+        f"phases={num_phases} | materials={num_materials} | sampler={args.sampler} ({args.steps} steps)"
+        + (f" | tiled={tiled_shape}" if tiled_shape else ""),
         flush=True,
     )
 
@@ -358,24 +376,42 @@ def main() -> None:
         remaining = args.num_samples
         sample_idx = 0
         while remaining > 0:
-            cur_b = min(args.batch_size, remaining)
-            noise = torch.randn(
-                (cur_b, data_ch, patch_size, patch_size, patch_size),
-                generator=gen,
-                device=device,
-            )
-            vols, probs = generate_batch(
-                model=active_model,
-                scheduler=scheduler,
-                initial_noise=noise,
-                load_value=load_val,
-                guidance_scale=args.guidance_scale,
-                use_amp=use_amp,
-                amp_dtype=amp_dtype,
-                material_id=mat_id,
-                voxel_size_um=vox_um,
-                generator=gen,
-            )
+            cur_b = 1 if tiled_shape is not None else min(args.batch_size, remaining)
+            if tiled_shape is not None:
+                vols, probs = generate_tiled_3d(
+                    model=active_model,
+                    scheduler=scheduler,
+                    target_shape=tiled_shape,
+                    patch_size=patch_size,
+                    load_value=load_val,
+                    guidance_scale=args.guidance_scale,
+                    overlap=args.tiled_overlap,
+                    batch_size=cur_b,
+                    tile_batch_size=args.tile_batch_size,
+                    material_id=mat_id,
+                    voxel_size_um=vox_um,
+                    use_amp=use_amp,
+                    amp_dtype=amp_dtype,
+                    generator=gen,
+                )
+            else:
+                noise = torch.randn(
+                    (cur_b, data_ch, patch_size, patch_size, patch_size),
+                    generator=gen,
+                    device=device,
+                )
+                vols, probs = generate_batch(
+                    model=active_model,
+                    scheduler=scheduler,
+                    initial_noise=noise,
+                    load_value=load_val,
+                    guidance_scale=args.guidance_scale,
+                    use_amp=use_amp,
+                    amp_dtype=amp_dtype,
+                    material_id=mat_id,
+                    voxel_size_um=vox_um,
+                    generator=gen,
+                )
             for b_vol, p_vol in zip(vols, probs):
                 sample_idx += 1
                 collected_vols.append(b_vol)
