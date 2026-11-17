@@ -29,6 +29,7 @@ from porousdiff.data import default_project_root, load_split_patches
 from porousdiff.metrics import (
     directional_two_point_correlation,
     evaluate_volume_physics,
+    export_openimpala_tiff,
     summarize_metric_records,
 )
 from porousdiff.preprocessing import parse_load_value
@@ -58,6 +59,17 @@ def main() -> None:
     parser.add_argument("--real-split", default="val", choices=["val", "train"])
     parser.add_argument("--max-real-samples", type=int, default=30)
     parser.add_argument("--voxel-size-um", type=float, default=1.0)
+    parser.add_argument(
+        "--export-real-openimpala",
+        action="store_true",
+        help="Export real validation subvolumes as OpenImpala uint8 multi-page TIFF stacks",
+    )
+    parser.add_argument(
+        "--num-openimpala",
+        type=int,
+        default=10,
+        help="Max real validation subvolumes per state to export when --export-real-openimpala is set",
+    )
     parser.add_argument(
         "--states",
         nargs="+",
@@ -101,6 +113,11 @@ def main() -> None:
         if real_vols.shape[0] > args.max_real_samples:
             idx = rng.choice(real_vols.shape[0], size=args.max_real_samples, replace=False)
             real_vols = real_vols[np.sort(idx)]
+
+        if args.export_real_openimpala:
+            real_oi_dir = eval_dir / "openimpala_real" / state_name
+            for r_idx, r_vol in enumerate(real_vols[: max(1, args.num_openimpala)], start=1):
+                export_openimpala_tiff(r_vol, real_oi_dir / f"real_val_{r_idx:03d}.tif")
 
         gen_vols = _load_generated_state_volumes(samples_dir, state_name)
 

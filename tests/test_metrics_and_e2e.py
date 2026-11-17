@@ -277,6 +277,9 @@ def test_end_to_end_cli_pipeline_with_heldout_load_interpolation(tmp_path: Path)
             "0p053mVV=0.053",
             "--heldout-states",
             "0p028mVV",
+            "--export-real-openimpala",
+            "--num-openimpala",
+            "2",
         ],
         check=True,
     )
@@ -288,3 +291,83 @@ def test_end_to_end_cli_pipeline_with_heldout_load_interpolation(tmp_path: Path)
     assert phys_report["0p008mVV"]["is_heldout_interpolation"] is False
     assert (eval_dir / "physics_compression_curves.png").is_file()
     assert (eval_dir / "s2_correlation_comparison.png").is_file()
+    assert (eval_dir / "openimpala_real" / "0p028mVV" / "real_val_001.tif").is_file()
+
+
+def test_prepare_local_drive_bundle_cli_and_zip(tmp_path: Path) -> None:
+    import zipfile
+
+    drive_root = tmp_path / "dry_samples"
+    bundle_dir = tmp_path / "porousdiff_upload_bundle"
+    rng = np.random.default_rng(123)
+    yy, xx = np.indices((64, 64))
+    in_circle = ((yy - 32.0) ** 2 + (xx - 32.0) ** 2) <= (27.0**2)
+
+    folders = [
+        ("crbon_virgin_1_0p008mVV_", 0.08),
+        ("crbon_virgin_1_0p015mVV_rep2_", 0.14),
+        ("crbon_virgin_1_0p053mVV_", 0.30),
+    ]
+    for folder_name, fiber_p in folders:
+        rec_dir = drive_root / folder_name / "rec_16bit_Paganin"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        vol = (30_000.0 + rng.normal(0.0, 350.0, size=(80, 64, 64))).astype(np.float32)
+        vol[rng.random((80, 64, 64)) < fiber_p] += 9500.0
+        vol_u16 = vol.clip(0, 65535).astype(np.uint16)
+        for z in range(vol_u16.shape[0]):
+            slc = vol_u16[z].copy()
+            slc[~in_circle] = 30_100
+            tifffile.imwrite(rec_dir / f"slice_{z:04d}.tif", slc)
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts/preprocessing/prepare_local_drive_bundle.py"),
+            "--drive-root",
+            str(drive_root),
+            "--output-dir",
+            str(bundle_dir),
+            "--version",
+            "bundle_v1",
+            "--sigma",
+            "12",
+            "--roi-radius-fraction",
+            "0.80",
+            "--patch-size",
+            "24",
+            "--stride-xy",
+            "12",
+            "--stride-z",
+            "8",
+            "--max-patches",
+            "10",
+            "--min-interval-length",
+            "24",
+            "--seam-margin",
+            "2",
+            "--zip",
+        ],
+        check=True,
+    )
+
+    primary = json.loads((bundle_dir / "primary_states.json").read_text())
+    manifest = json.loads((bundle_dir / "bundle_manifest.json").read_text())
+    assert primary == {
+        "crbon_virgin_1_0p008mVV": 0.008,
+        "crbon_virgin_1_0p053mVV": 0.053,
+    }
+    assert manifest["repeat_and_secondary_states"] == {
+        "crbon_virgin_1_0p015mVV_rep2": 0.015,
+    }
+    p_low = np.load(bundle_dir / "crbon_virgin_1_0p008mVV_binary_patches24_bundle_v1" / "train" / "patches.npy")
+    p_high = np.load(bundle_dir / "crbon_virgin_1_0p053mVV_binary_patches24_bundle_v1" / "train" / "patches.npy")
+    assert p_low.shape[1:] == (24, 24, 24)
+    assert float(p_low.mean()) < float(p_high.mean())
+
+    zip_path = tmp_path / "porousdiff_upload_bundle.zip"
+    assert zip_path.is_file()
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        names = set(zf.namelist())
+        assert "primary_states.json" in names
+        assert "bundle_manifest.json" in names
+

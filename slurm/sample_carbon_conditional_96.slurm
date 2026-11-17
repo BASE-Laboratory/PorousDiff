@@ -53,6 +53,8 @@ fi
 python -u scripts/evaluation/evaluate_carbon_physics.py \
     --experiment "$EXPERIMENT" \
     --version "$VERSION" \
+    --patch-size "${PATCH_SIZE:-96}" \
+    --export-real-openimpala \
     --states "${EVAL_STATES_ARR[@]}" \
     "${HELDOUT_ARGS[@]}"
 

@@ -49,6 +49,7 @@ PorousDiff/
 │   └── metrics.py            # Solid fraction, SSA, chords, anisotropy, FFT S2(r), percolation, geodesic tortuosity, OpenImpala export
 ├── scripts/
 │   ├── preprocessing/
+│   │   ├── prepare_local_drive_bundle.py  # Local Windows/Spyder stream-bundler (318 GB raw -> ~800 MB patch zip)
 │   │   ├── segment_carbon_xct.py
 │   │   └── extract_carbon_3d_patches.py
 │   ├── training/
@@ -84,29 +85,31 @@ pytest -v
 
 > All scripts resolve data and results relative to `POROUSDIFF_ROOT` (defaults automatically to `/projects/u6uc/asif` when present, or current directory otherwise).
 
-### 2. Calibrated Segmentation & Z-Artifact Gating
+### 2. Data Preparation (Two Options)
 
-For the 3 currently staged datasets (`Op008mVV`, `Op018mVV`, `Op033mVV`), or any expanded list of Diamond synchrotron folders (`0p008mVV` through `0p053mVV` — both `data/raw/<name>/*.tif` and `data/raw/<name>/rec_16bit_Paganin/*.tif` are supported automatically):
+#### Option A: Local Windows / Spyder Stream-Bundler (avoids uploading 300+ GB of raw TIFFs)
+On the lab machine holding `D:\dry_samples`, open `scripts/preprocessing/prepare_local_drive_bundle.py` in Spyder and press **F5** (or run from Anaconda Prompt):
+
+```bash
+python scripts/preprocessing/prepare_local_drive_bundle.py \
+    --drive-root "D:/dry_samples" \
+    --output-dir "D:/porousdiff_upload_bundle" \
+    --zip
+```
+
+This stream-segments every `crbon_virgin_*` scan, gates out bullseye/plunger slices, separates `primary_states.json` (`crbon_virgin_1_*`) from repeat scans (`rep2`, `crbon_virgin_2_*`), and packs `D:\porousdiff_upload_bundle.zip` (~`800 MB`), which unzips directly into `/projects/u6uc/asif/data/carbon_virgin/`.
+
+#### Option B: Direct Segmentation & Patch Extraction on Isambard-AI
+For raw scans staged directly on Isambard-AI (`Op008mVV`, `Op018mVV`, `Op033mVV`, or `0p008mVV`..`0p053mVV` — both `data/raw/<name>/*.tif` and `data/raw/<name>/rec_16bit_Paganin/*.tif` are supported automatically):
 
 ```bash
 sbatch slurm/segment_carbon_xct.slurm
-# Or with custom staged folders:
-sbatch --export=ALL,DATASETS="0p008mVV 0p013mVV 0p018mVV 0p023mVV 0p028mVV 0p033mVV 0p038mVV 0p043mVV 0p048mVV 0p053mVV" \
-    slurm/segment_carbon_xct.slurm
+sbatch slurm/extract_carbon_96.slurm
 ```
 
 Inspect `<POROUSDIFF_ROOT>/data/carbon_virgin/<dataset>_binary_corrected_carbon_calibrated_v1/z_quality_diagnostic.png`, `segmentation_report.json`, and `valid_slices.json` to confirm monotonic clean solid fractions and excluded ring/plunger intervals.
 
-### 3. Z-Stratified `96³` Patch Extraction
-
-```bash
-sbatch slurm/extract_carbon_96.slurm
-# Or with custom datasets:
-sbatch --export=ALL,DATASETS="0p008mVV 0p013mVV 0p018mVV 0p023mVV 0p028mVV 0p033mVV 0p038mVV 0p043mVV 0p048mVV 0p053mVV" \
-    slurm/extract_carbon_96.slurm
-```
-
-### 4. Training (Observed + Held-Out Interpolation Protocol)
+### 3. Training (Observed + Held-Out Interpolation + Ablations)
 
 Run a quick 4-step GPU smoke test first, then launch the 100-epoch `bf16` training job (if pre-empted or extended, resubmitting the **exact same** `train_carbon_conditional_96.slurm` automatically detects `latest.pth` and resumes):
 
@@ -115,21 +118,27 @@ Run a quick 4-step GPU smoke test first, then launch the 100-epoch `bf16` traini
 sbatch slurm/test_carbon_conditional_96.slurm
 sbatch slurm/train_carbon_conditional_96.slurm
 
-# Paper interpolation experiment (train on 7 loads, hold out 0.018, 0.033, 0.048 mV/V):
-sbatch --export=ALL,EXPERIMENT="carbon_cond96_interp_paper",STATES="0p008mVV=0.008 0p013mVV=0.013 0p023mVV=0.023 0p028mVV=0.028 0p038mVV=0.038 0p043mVV=0.043 0p053mVV=0.053" \
+# Paper interpolation experiment (train on primary loads while holding out 0.015, 0.028, 0.043 mV/V):
+sbatch --export=ALL,EXPERIMENT="carbon_cond96_interp_paper",STATES="crbon_virgin_1_0p008mVV=0.008 crbon_virgin_1_0p010mVV=0.010 crbon_virgin_1_0p012mVV=0.012 crbon_virgin_1_0p019mVV=0.019 crbon_virgin_1_0p024mVV=0.024 crbon_virgin_1_0p033mVV=0.033 crbon_virgin_1_0p038mVV=0.038 crbon_virgin_1_0p048mVV=0.048 crbon_virgin_1_0p053mVV=0.053" \
+    slurm/train_carbon_conditional_96.slurm
+
+# Controlled paper ablations (Zero-SNR vs standard linear; multiscale Fourier vs legacy 1-token cross-attn):
+sbatch --export=ALL,EXPERIMENT="ablation_std_eps",SCHEDULE="scaled_linear_beta",PREDICTION_TYPE="epsilon" \
+    slurm/train_carbon_conditional_96.slurm
+sbatch --export=ALL,EXPERIMENT="ablation_legacy_xattn",CONDITIONING_MODE="legacy_crossattn" \
     slurm/train_carbon_conditional_96.slurm
 ```
 
-### 5. Sampling, Continuous Compression Sweep & Physics Evaluation
+### 4. Sampling, Continuous Compression Sweep & Physics Evaluation
 
-Generates `N = 20` 3D realizations per load (both training and unseen held-out loads), runs a fixed-noise continuous compression sweep across `0.008..0.053 mV/V`, exports OpenImpala multi-page TIFF stacks, and produces `physics_validation_report.json`, `physics_compression_curves.png`, and `s2_correlation_comparison.png`:
+Generates `N = 20` 3D realizations per load (both training and unseen held-out loads), runs a fixed-noise continuous compression sweep across `0.008..0.053 mV/V`, exports paired generated and real validation OpenImpala multi-page TIFF stacks (`--export-openimpala` and `--export-real-openimpala`), and produces `physics_validation_report.json`, `physics_compression_curves.png`, and `s2_correlation_comparison.png`:
 
 ```bash
 # 3-state baseline evaluation:
 sbatch slurm/sample_carbon_conditional_96.slurm
 
 # Paper interpolation evaluation (highlighting unseen held-out loads):
-sbatch --export=ALL,EXPERIMENT="carbon_cond96_interp_paper",EVAL_STATES="0p008mVV=0.008 0p013mVV=0.013 0p018mVV=0.018 0p023mVV=0.023 0p028mVV=0.028 0p033mVV=0.033 0p038mVV=0.038 0p043mVV=0.043 0p048mVV=0.048 0p053mVV=0.053",HELDOUT_STATES="0p018mVV 0p033mVV 0p048mVV" \
+sbatch --export=ALL,EXPERIMENT="carbon_cond96_interp_paper",EVAL_STATES="crbon_virgin_1_0p008mVV=0.008 crbon_virgin_1_0p010mVV=0.010 crbon_virgin_1_0p012mVV=0.012 crbon_virgin_1_0p015mVV=0.015 crbon_virgin_1_0p019mVV=0.019 crbon_virgin_1_0p024mVV=0.024 crbon_virgin_1_0p028mVV=0.028 crbon_virgin_1_0p033mVV=0.033 crbon_virgin_1_0p038mVV=0.038 crbon_virgin_1_0p043mVV=0.043 crbon_virgin_1_0p048mVV=0.048 crbon_virgin_1_0p053mVV=0.053",HELDOUT_STATES="crbon_virgin_1_0p015mVV crbon_virgin_1_0p028mVV crbon_virgin_1_0p043mVV" \
     slurm/sample_carbon_conditional_96.slurm
 ```
 

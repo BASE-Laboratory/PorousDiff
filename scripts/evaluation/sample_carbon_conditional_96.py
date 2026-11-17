@@ -184,6 +184,7 @@ def main() -> None:
         load_min=float(cfg["load_min"]),
         load_max=float(cfg["load_max"]),
         use_flash_attention=(device.type == "cuda"),
+        conditioning_mode=str(cfg.get("conditioning_mode", "multiscale_fourier")),
     ).to(device)
 
     if not args.no_ema and "ema" in saved:

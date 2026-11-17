@@ -93,6 +93,12 @@ def main() -> None:
 
     parser.add_argument("--schedule", default="zero_snr_scaled_linear")
     parser.add_argument("--prediction-type", default="v_prediction", choices=["v_prediction", "epsilon"])
+    parser.add_argument(
+        "--conditioning-mode",
+        default="multiscale_fourier",
+        choices=["multiscale_fourier", "legacy_crossattn"],
+        help="Conditioning mechanism ('multiscale_fourier' default, or 'legacy_crossattn' for v1 ablation)",
+    )
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--cfg-drop-prob", type=float, default=0.10)
     parser.add_argument("--ema-decay", type=float, default=0.9995)
@@ -215,6 +221,7 @@ def main() -> None:
         load_min=load_min,
         load_max=load_max,
         use_flash_attention=(device.type == "cuda" and use_amp),
+        conditioning_mode=args.conditioning_mode,
     ).to(device)
 
     ema = EMAModel(model, decay=args.ema_decay)
@@ -240,6 +247,7 @@ def main() -> None:
         "load_max": load_max,
         "schedule": args.schedule,
         "prediction_type": args.prediction_type,
+        "conditioning_mode": args.conditioning_mode,
         "timesteps": args.timesteps,
         "states": states,
         "version": args.version,

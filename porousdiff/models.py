@@ -165,22 +165,42 @@ class ContinuousLoadConditionedUNet(nn.Module):
         load_min: float = 0.008,
         load_max: float = 0.053,
         use_flash_attention: bool = False,
+        conditioning_mode: str = "multiscale_fourier",
     ) -> None:
         super().__init__()
         if load_max <= load_min:
             raise ValueError("load_max must be strictly greater than load_min")
+        if conditioning_mode not in ("multiscale_fourier", "legacy_crossattn"):
+            raise ValueError(
+                f"Unknown conditioning_mode {conditioning_mode!r}; "
+                "choose 'multiscale_fourier' or 'legacy_crossattn'"
+            )
+        self.conditioning_mode = conditioning_mode
 
         unet_params = inspect.signature(DiffusionModelUNet.__init__).parameters
-        unet_kwargs: dict[str, object] = {
-            "spatial_dims": 3,
-            "in_channels": 3,
-            "out_channels": 1,
-            "attention_levels": tuple(attention_levels),
-            "num_res_blocks": num_res_blocks,
-            "norm_num_groups": norm_num_groups,
-            "with_conditioning": False,
-            "num_class_embeds": 1,  # Hook replaced below with ContinuousScalarLoadEmbedder
-        }
+        if conditioning_mode == "multiscale_fourier":
+            unet_kwargs: dict[str, object] = {
+                "spatial_dims": 3,
+                "in_channels": 3,
+                "out_channels": 1,
+                "attention_levels": tuple(attention_levels),
+                "num_res_blocks": num_res_blocks,
+                "norm_num_groups": norm_num_groups,
+                "with_conditioning": False,
+                "num_class_embeds": 1,  # Hook replaced below with ContinuousScalarLoadEmbedder
+            }
+        else:
+            unet_kwargs = {
+                "spatial_dims": 3,
+                "in_channels": 1,
+                "out_channels": 1,
+                "attention_levels": tuple(attention_levels),
+                "num_res_blocks": num_res_blocks,
+                "norm_num_groups": norm_num_groups,
+                "with_conditioning": True,
+                "cross_attention_dim": 32,
+            }
+
         if "channels" in unet_params:
             unet_kwargs["channels"] = tuple(channels)
         else:
@@ -190,12 +210,20 @@ class ContinuousLoadConditionedUNet(nn.Module):
             unet_kwargs["use_flash_attention"] = True
 
         self.unet = DiffusionModelUNet(**unet_kwargs)
-        base_ch = int(channels[0])
-        time_embed_dim = base_ch * 4
-        self.unet.class_embedding = ContinuousScalarLoadEmbedder(
-            freq_dim=max(32, base_ch),
-            embed_dim=time_embed_dim,
-        )
+        if conditioning_mode == "multiscale_fourier":
+            base_ch = int(channels[0])
+            time_embed_dim = base_ch * 4
+            self.unet.class_embedding = ContinuousScalarLoadEmbedder(
+                freq_dim=max(32, base_ch),
+                embed_dim=time_embed_dim,
+            )
+            self.legacy_embedder: nn.Module | None = None
+        else:
+            self.legacy_embedder = nn.Sequential(
+                nn.Linear(1, 32),
+                nn.SiLU(),
+                nn.Linear(32, 32),
+            )
 
         self.register_buffer("load_min", torch.tensor(float(load_min), dtype=torch.float32))
         self.register_buffer("load_max", torch.tensor(float(load_max), dtype=torch.float32))
@@ -221,6 +249,12 @@ class ContinuousLoadConditionedUNet(nn.Module):
             mask = torch.ones(b, device=x.device, dtype=torch.float32)
         else:
             mask = cond_mask.view(b).to(device=x.device, dtype=torch.float32)
+
+        if self.conditioning_mode == "legacy_crossattn":
+            assert self.legacy_embedder is not None
+            masked_scalar = (cond_norm * mask).unsqueeze(-1)
+            ctx = self.legacy_embedder(masked_scalar).unsqueeze(1).to(dtype=x.dtype)
+            return self.unet(x=x, timesteps=timesteps, context=ctx)
 
         masked_cond = (cond_norm * mask).to(dtype=x.dtype)
         mask_ch = mask.to(dtype=x.dtype)

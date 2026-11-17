@@ -99,6 +99,32 @@ def test_continuous_load_conditioned_unet_all_params_get_gradients_and_cfg_disti
         assert not torch.allclose(out_cfg, out_mid)
 
 
+def test_legacy_crossattn_ablation_mode_runs_and_trains() -> None:
+    torch.manual_seed(3)
+    legacy = ContinuousLoadConditionedUNet(
+        channels=(16, 32),
+        attention_levels=(False, True),
+        num_res_blocks=1,
+        norm_num_groups=8,
+        load_min=0.008,
+        load_max=0.053,
+        conditioning_mode="legacy_crossattn",
+    )
+    x = torch.randn(2, 1, 16, 16, 16)
+    t = torch.tensor([50, 500], dtype=torch.long)
+    loads = torch.tensor([0.008, 0.053], dtype=torch.float32)
+    cond_mask = torch.tensor([1.0, 0.0], dtype=torch.float32)
+
+    out = legacy(x, t, loads, cond_mask=cond_mask)
+    assert out.shape == x.shape
+    loss = out.pow(2).mean()
+    loss.backward()
+
+    with torch.no_grad():
+        cfg_out = legacy.forward_cfg(x[:1], t[:1], loads[:1], guidance_scale=1.5)
+        assert cfg_out.shape == (1, 1, 16, 16, 16)
+
+
 def test_ema_and_rng_roundtrip() -> None:
     lin = torch.nn.Linear(8, 4)
     ema = EMAModel(lin, decay=0.99)

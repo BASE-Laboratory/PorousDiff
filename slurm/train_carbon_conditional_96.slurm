@@ -45,6 +45,11 @@ python -u scripts/training/train_carbon_conditional_96.py \
     --experiment "$EXPERIMENT" \
     --version "$VERSION" \
     --states "${STATES_ARR[@]}" \
+    --patch-size "${PATCH_SIZE:-96}" \
+    --channels "${CHANNELS:-32,64,128}" \
+    --schedule "${SCHEDULE:-zero_snr_scaled_linear}" \
+    --prediction-type "${PREDICTION_TYPE:-v_prediction}" \
+    --conditioning-mode "${CONDITIONING_MODE:-multiscale_fourier}" \
     --epochs "$EPOCHS" \
     --batch-size "${BATCH_SIZE:-4}" \
     --grad-accum "${GRAD_ACCUM:-2}" \
