@@ -428,3 +428,23 @@ Investigate whether increasing patch size from 64³ to 96³ improves the fidelit
 Increasing patch size to 96³ was computationally feasible on the GH200 but did not consistently reproduce the physical characteristics of the training microstructures.
 
 Future work will investigate compression-conditioned generation using CuCHF datasets with three experimentally measured load-cell conditions.
+
+
+## Experiment 14: Synchrotron XCT Diagnostic Audit & Continuous Load-Conditioned 3D DDPM (`v0.2`)
+
+**Status:** Implemented and verified end-to-end (`feature/paper-ready-conditional`) — ready for full Isambard-AI GH200 paper runs
+
+### Diagnostic Findings on Raw Carbon-Felt XCT Volumes (`2160 × 2560 × 2560` `uint16` Paganin)
+Direct inspection of raw synchrotron compression scans (`crbon_virgin_1_0p008mVV` through `0p053mVV`) identified five root causes behind earlier binary/conditional instabilities:
+1. **Compression axis orientation:** `Z` (slice index `0..2159`) is the vertical mechanical compression plunger axis; `XY` is the carbon-felt sheet plane.
+2. **Circular punch geometry:** The cylindrical carbon-felt punch (`R ≈ 950 px` centered at `(1280, 1280)`) sits inside square `2560 × 2560` reconstructions surrounded by gray exterior air (`~30,000` counts). Unmasked square grids extracted exterior air corners.
+3. **Plunger intrusion & mid-stack bullseye ring seams:** Under higher loads, the bottom compression plunger rises into the stack (`Z ≈ 1850+` at `0.028 mV/V`; `Z ≈ 1280+` at `0.053 mV/V`), and non-physical concentric ring / stitch interference bands appear mid-stack (including `Z ≈ 520–620` inside the first `800` slices at `0.053 mV/V`).
+4. **Per-slice Otsu inversion on sparse low-load slices:** Per-slice `[1, 99]` percentile clipping + `sigma = 50` Gaussian subtraction + per-slice Otsu inverted empty pore noise into ~80% false solid on sparse `0.008 mV/V` slices and erased true monotonic compression trends.
+5. **1-token cross-attention degeneracy & non-zero terminal SNR:** Passing a 1-token context `[B, 1, 32]` into cross-attention forced `softmax([s]) = 1.0` identically (zero gradient to `W_Q, W_K`), while standard linear/scaled-linear schedules left residual signal at `t = T - 1` that biased sparse `{−1, +1}` microstructures upward toward `50%` solid fraction.
+
+### Architectural & Pipeline Fixes (`porousdiff/`)
+- **Calibrated segmentation (`segment_carbon_xct.py`):** Circular ROI mask (`radius_fraction = 0.70`), pore-mode-clamped background subtraction (`sigma = 32`), shared `delta_threshold = 5500` across all loads (recovering clean monotonic solid fractions `~5.4%` at `0.008 mV/V` → `~23.5%` at `0.028 mV/V` → `~33.8%` at `0.053 mV/V`), and automatic Z-interval gating (`compute_radial_ring_score` + slice-jump + pore-mode drift).
+- **Z-stratified patch extraction (`extract_carbon_3d_patches.py`):** Round-robin sampling across all valid Z-windows, `>= patch_size` buffer between `train` and `val` Z-slabs, and stacked `patches.npy` archives.
+- **Multi-scale continuous conditioning (`ContinuousLoadConditionedUNet`):** Smooth Fourier scalar load embedder (`ContinuousScalarLoadEmbedder`) injected into `temb` at every ResBlock across all resolution levels plus 3-channel spatial input `[x_t, cond_norm * mask, mask]`, Zero-Terminal-SNR schedule (`zero_snr_scaled_linear`), `v_prediction`, EMA (`0.9995`), compression-safe `D_4(XY) × Z_2(Z)` augmentation, and `bf16` GH200 mixed precision.
+- **Physics & transport evaluation (`evaluate_carbon_physics.py`):** Automated comparison of solid fraction, specific surface area, directional chord lengths, `XY/Z` compression anisotropy, directional $S_2(r)$, 3D percolation, geodesic pore tortuosity, and OpenImpala multi-page TIFF export across both training and held-out interpolated loads.
+
