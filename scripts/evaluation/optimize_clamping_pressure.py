@@ -36,6 +36,7 @@ from porousdiff.data import (
     default_project_root,
     load_split_patches,
     load_tall_or_split_patches,
+    resolve_checkpoint_path,
     resolve_material_id,
     resolve_patch_split_dir,
     resolve_scan_load_value,
@@ -232,7 +233,10 @@ def main() -> None:
     state_specs: list[dict[str, object]] = []
     if args.manifest_json is not None:
         manifest = json.loads(args.manifest_json.read_text())
-        for sc in manifest.get("scans", []):
+        all_m_scans = list(manifest.get("scans", []))
+        if all_m_scans and args.patch_size == 96 and "patch_size" in all_m_scans[0]:
+            args.patch_size = int(all_m_scans[0]["patch_size"])
+        for sc in all_m_scans:
             if not args.include_repeats and bool(sc.get("is_repeat_or_secondary", False)):
                 continue
             sc_beam = str(sc.get("beamline", "primary"))
@@ -301,19 +305,30 @@ def main() -> None:
     expected_shape = (args.patch_size, args.patch_size, args.patch_size)
     records_tree: dict[str, dict[str, dict[float, list[dict[str, float]]]]] = {}
 
-    have_real_data = args.data_root is not None and args.data_root.is_dir()
+    manifest_fallback_root = args.manifest_json.parent if args.manifest_json is not None else None
+    have_real_data = (args.data_root is not None and args.data_root.is_dir()) or (
+        manifest_fallback_root is not None and manifest_fallback_root.is_dir()
+    )
     real_cache: dict[str, np.ndarray] = {}
     tall_real_cache: dict[str, np.ndarray] = {}
     lowest_state_by_mat: dict[str, str] = {}
 
     if have_real_data:
+        eff_root = args.data_root if args.data_root is not None else manifest_fallback_root
+        assert eff_root is not None
         for sp in state_specs:
             st = str(sp["state"])
             mat = str(sp["material"])
             pdir_hint = str(sp["patch_dir_name"]) if sp.get("patch_dir_name") else None
             try:
                 split_dir = resolve_patch_split_dir(
-                    args.data_root, st, args.patch_size, args.version, "val", patch_dir_name=pdir_hint  # type: ignore[arg-type]
+                    eff_root,
+                    st,
+                    args.patch_size,
+                    args.version,
+                    "val",
+                    patch_dir_name=pdir_hint,
+                    fallback_root=manifest_fallback_root,
                 )
                 vols = load_split_patches(split_dir, expected_shape=expected_shape)
             except (FileNotFoundError, RuntimeError):
@@ -460,16 +475,13 @@ def main() -> None:
         )
         if device is None:
             raise RuntimeError("CUDA required for --dense-sweep-points (or pass --allow-cpu)")
-        ckpt_dir = args.output_root / "checkpoints" / first_exp
-        ckpt_path = (
-            args.checkpoint
-            if args.checkpoint is not None
-            else (
-                ckpt_dir / "best_val.pth"
-                if (ckpt_dir / "best_val.pth").is_file()
-                else ckpt_dir / "latest.pth"
-            )
+        ckpt_path = resolve_checkpoint_path(
+            output_root=args.output_root,
+            experiment=first_exp,
+            explicit_checkpoint=args.checkpoint,
         )
+        if ckpt_path is None:
+            raise FileNotFoundError(f"Checkpoint not found for experiment {first_exp!r} under {args.output_root}")
         saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         cfg = saved["config"]
         num_materials = int(cfg.get("num_materials", 1))

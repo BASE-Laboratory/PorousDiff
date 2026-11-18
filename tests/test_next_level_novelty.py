@@ -1088,3 +1088,62 @@ def test_peer_review_bugfixes_units_resume_tortuosity_tall_baselines_and_stats(t
     assert topo_audit["pore_percolation_agreement"] == 1.0
     assert abs(topo_audit["solid_fraction_abs_err"]) < 1e-6
 
+
+def test_cli_manifest_state_subset_and_checkpoint_safeguards(tmp_path: Path) -> None:
+    """Verify beamline-stripped state matching, typo/ambiguity rejection, relative ckpt lookup, and fallback_root."""
+    import pytest
+
+    from porousdiff.data import (
+        resolve_checkpoint_path,
+        resolve_manifest_state_subset,
+        resolve_patch_split_dir,
+    )
+
+    scans = [
+        {"state": "DLS_I12__tio2_0p008mVV", "source_folder": "tio2_0p008mVV"},
+        {"state": "DLS_I12__tio2_0p030mVV", "source_folder": "tio2_0p030mVV"},
+        {"state": "DLS_K11__cuhcf_0p030mVV", "source_folder": "cuhcf_0p030mVV"},
+    ]
+    # Exact and beamline-stripped suffix both resolve to canonical manifest state
+    assert resolve_manifest_state_subset(scans, ["tio2_0p030mVV"], "--exclude-states") == {
+        "DLS_I12__tio2_0p030mVV"
+    }
+    assert resolve_manifest_state_subset(scans, ["DLS_I12__tio2_0p008mVV"]) == {
+        "DLS_I12__tio2_0p008mVV"
+    }
+    # Typos raise ValueError rather than silently failing to exclude a held-out state
+    with pytest.raises(ValueError, match="Unknown state"):
+        resolve_manifest_state_subset(scans, ["tio2_0p030_typo"], "--exclude-states")
+
+    # Ambiguous suffix across multiple beamlines raises ValueError
+    dup_scans = [
+        {"state": "DLS_I12__tio2_0p030mVV"},
+        {"state": "DLS_K11__tio2_0p030mVV"},
+    ]
+    with pytest.raises(ValueError, match="Ambiguous state"):
+        resolve_manifest_state_subset(dup_scans, ["tio2_0p030mVV"], "--heldout-states")
+
+    # Relative --checkpoint filename resolves inside output_root/checkpoints/<experiment>/
+    ckpt_dir = tmp_path / "checkpoints" / "exp_demo"
+    ckpt_dir.mkdir(parents=True)
+    latest = ckpt_dir / "latest.pth"
+    latest.write_bytes(b"stub")
+    assert resolve_checkpoint_path(tmp_path, "exp_demo", Path("latest.pth")) == latest
+    assert resolve_checkpoint_path(tmp_path, "exp_demo", Path("nonexistent.pth")) is None
+
+    # resolve_patch_split_dir falls back to manifest parent directory when data_root lacks the bundle
+    bundle_root = tmp_path / "bundle_dir"
+    val_dir = bundle_root / "DLS_I12__tio2_0p030mVV_binary_patches24_v1" / "val"
+    val_dir.mkdir(parents=True)
+    resolved_split = resolve_patch_split_dir(
+        tmp_path / "missing_default_data_root",
+        "DLS_I12__tio2_0p030mVV",
+        24,
+        "v1",
+        "val",
+        patch_dir_name="DLS_I12__tio2_0p030mVV_binary_patches24_v1",
+        fallback_root=bundle_root,
+    )
+    assert resolved_split == val_dir
+
+

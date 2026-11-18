@@ -30,6 +30,8 @@ if str(REPO_ROOT) not in sys.path:
 from porousdiff.data import (
     decode_channels_to_phases,
     default_project_root,
+    resolve_checkpoint_path,
+    resolve_manifest_state_subset,
     resolve_material_id,
     resolve_scan_load_value,
 )
@@ -154,7 +156,7 @@ def save_sweep_panel(
         axes[1, col].set_title("XZ (Compression ↓)")
         axes[1, col].axis("off")
 
-    fig.suptitle("Virtual Compression Sweep (Fixed Initial Gaussian Noise Seed)", fontsize=13)
+    fig.suptitle("Load-Conditioned Trajectory Sweep (Fixed Initial Gaussian Noise Seed)", fontsize=13)
     fig.tight_layout()
     fig.savefig(png_path, dpi=260, bbox_inches="tight")
     fig.savefig(pdf_path, bbox_inches="tight")
@@ -171,9 +173,10 @@ def _build_eval_specs(
 
     if args.manifest_json is not None:
         manifest = json.loads(args.manifest_json.read_text())
-        filter_set = set(args.eval_states) if args.eval_states else None
+        all_scans = list(manifest.get("scans", []))
+        filter_set = resolve_manifest_state_subset(all_scans, args.eval_states, "--eval-states")
         specs: list[dict[str, object]] = []
-        for scan in manifest.get("scans", []):
+        for scan in all_scans:
             st = str(scan["state"])
             if filter_set is not None and st not in filter_set:
                 continue
@@ -288,16 +291,11 @@ def main() -> None:
         else torch.float16
     )
 
-    ckpt_dir = args.output_root / "checkpoints" / args.experiment
-    if args.checkpoint is not None:
-        ckpt_path = args.checkpoint
-    elif (ckpt_dir / "best_val.pth").is_file():
-        ckpt_path = ckpt_dir / "best_val.pth"
-    else:
-        ckpt_path = ckpt_dir / "latest.pth"
-
-    if not ckpt_path.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    ckpt_path = resolve_checkpoint_path(args.output_root, args.experiment, args.checkpoint)
+    if ckpt_path is None:
+        raise FileNotFoundError(
+            f"Checkpoint not found for experiment={args.experiment!r} (requested={args.checkpoint})"
+        )
 
     saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = saved["config"]
@@ -339,7 +337,7 @@ def main() -> None:
     else:
         model.load_state_dict(saved["model"])
         active_model = model.eval()
-        weight_source = "online"
+        weight_source = "raw"
 
     scheduler = build_noise_scheduler(
         sampler=args.sampler,
@@ -357,7 +355,12 @@ def main() -> None:
     )
 
     eval_specs = _build_eval_specs(args, cfg)
-    out_dir = args.output_root / "results" / args.experiment / "samples"
+    samples_subdir = (
+        f"samples_tiled_{tiled_shape[0]}x{tiled_shape[1]}x{tiled_shape[2]}"
+        if tiled_shape is not None
+        else "samples"
+    )
+    out_dir = args.output_root / "results" / args.experiment / samples_subdir
     figures_dir = args.output_root / "results" / args.experiment / "figures"
     out_dir.mkdir(parents=True, exist_ok=True)
     figures_dir.mkdir(parents=True, exist_ok=True)
@@ -492,7 +495,11 @@ def main() -> None:
 
     if args.sweep_loads.strip():
         sweep_vals = [float(x.strip()) for x in args.sweep_loads.split(",") if x.strip()]
-        sweep_mat_name = "virgin_carbon" if args.material == "auto" else args.material
+        if args.material == "auto":
+            unique_mats = list(dict.fromkeys(str(s["material"]) for s in eval_specs))
+            sweep_mat_name = unique_mats[0] if len(unique_mats) == 1 else "virgin_carbon"
+        else:
+            sweep_mat_name = args.material
         sweep_mat_id = resolve_material_id(sweep_mat_name) if num_materials > 1 else 0
         sweep_vox = args.voxel_size_um if args.voxel_size_um > 0 else ref_vox
 
@@ -504,6 +511,7 @@ def main() -> None:
         )
         sweep_dir = out_dir / "continuous_sweep"
         sweep_dir.mkdir(parents=True, exist_ok=True)
+        unit_file_tag = "kPa" if unit_label == "kPa" else "mVV"
 
         sweep_pairs: list[tuple[float, np.ndarray]] = []
         for mv in sweep_vals:
@@ -522,7 +530,7 @@ def main() -> None:
             )
             vol = b_vol[0]
             tag = f"{mv:.4f}".replace(".", "p")
-            np.save(sweep_dir / f"sweep_{tag}mVV.npy", vol)
+            np.save(sweep_dir / f"sweep_{tag}{unit_file_tag}.npy", vol)
             sweep_pairs.append((mv, vol))
 
         save_sweep_panel(

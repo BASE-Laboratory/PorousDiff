@@ -36,6 +36,7 @@ from porousdiff.data import (
     MultiElectrodePatchDataset,
     capture_rng_states,
     default_project_root,
+    resolve_manifest_state_subset,
     resolve_scan_load_value,
     restore_rng_states,
 )
@@ -82,19 +83,27 @@ def load_manifest_specs(
     with manifest_path.open("r") as f:
         manifest = json.load(f)
 
+    all_scans = list(manifest.get("scans", []))
+    inc_resolved = resolve_manifest_state_subset(
+        all_scans, sorted(include_states) if include_states is not None else None, "--include-states"
+    )
+    exc_resolved = resolve_manifest_state_subset(
+        all_scans, sorted(exclude_states) if exclude_states is not None else None, "--exclude-states"
+    )
+
     specs: list[dict[str, object]] = []
     max_phases = 2
     vox_list: list[float] = []
 
     filtered_scans: list[dict[str, object]] = []
-    for scan in manifest.get("scans", []):
+    for scan in all_scans:
         st = str(scan["state"])
         if not include_repeats and bool(scan.get("is_repeat_or_secondary", False)):
-            if include_states is None or st not in include_states:
+            if inc_resolved is None or st not in inc_resolved:
                 continue
-        if include_states is not None and st not in include_states:
+        if inc_resolved is not None and st not in inc_resolved:
             continue
-        if exclude_states is not None and st in exclude_states:
+        if exc_resolved is not None and st in exc_resolved:
             continue
         filtered_scans.append(scan)
 

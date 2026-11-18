@@ -39,6 +39,8 @@ from porousdiff.data import (
     default_project_root,
     load_split_patches,
     load_tall_or_split_patches,
+    resolve_checkpoint_path,
+    resolve_manifest_state_subset,
     resolve_material_id,
     resolve_patch_split_dir,
     resolve_scan_load_value,
@@ -190,7 +192,16 @@ def main() -> None:
     state_specs: list[dict[str, object]] = []
     if args.manifest_json is not None:
         manifest = json.loads(args.manifest_json.read_text())
-        for sc in manifest.get("scans", []):
+        all_manifest_scans = list(manifest.get("scans", []))
+        if all_manifest_scans and args.patch_size == 96 and "patch_size" in all_manifest_scans[0]:
+            args.patch_size = int(all_manifest_scans[0]["patch_size"])
+        if args.heldout_states:
+            resolved_held = resolve_manifest_state_subset(
+                all_manifest_scans, args.heldout_states, "--heldout-states"
+            )
+            assert resolved_held is not None
+            heldout_set = resolved_held
+        for sc in all_manifest_scans:
             if not args.include_repeats and bool(sc.get("is_repeat_or_secondary", False)):
                 continue
             sc_beam = str(sc.get("beamline", "primary"))
@@ -241,6 +252,7 @@ def main() -> None:
     tall_ref_cache: dict[str, np.ndarray] = {}
     lowest_state_by_group: dict[tuple[str, str], str] = {}
     lowest_load_by_group: dict[tuple[str, str], float] = {}
+    manifest_fallback_root = args.manifest_json.parent if args.manifest_json is not None else None
 
     for spec in state_specs:
         st = str(spec["state"])
@@ -249,7 +261,13 @@ def main() -> None:
         lv = float(spec["load_value"])  # type: ignore[arg-type]
         pdir_hint = str(spec["patch_dir_name"]) if spec.get("patch_dir_name") else None
         split_dir = resolve_patch_split_dir(
-            args.data_root, st, args.patch_size, args.version, "val", patch_dir_name=pdir_hint
+            args.data_root,
+            st,
+            args.patch_size,
+            args.version,
+            "val",
+            patch_dir_name=pdir_hint,
+            fallback_root=manifest_fallback_root,
         )
         vols = load_split_patches(split_dir, expected_shape=expected_shape)
         if vols.shape[0] > args.max_real_samples:
@@ -276,18 +294,11 @@ def main() -> None:
         else:
             raise RuntimeError("CUDA GPU required for --include-virtual-compression (or pass --allow-cpu)")
 
-        ckpt_dir = args.output_root / "checkpoints" / first_exp
-        ckpt_path = (
-            args.checkpoint
-            if args.checkpoint is not None
-            else (
-                ckpt_dir / "best_val.pth"
-                if (ckpt_dir / "best_val.pth").is_file()
-                else ckpt_dir / "latest.pth"
+        ckpt_path = resolve_checkpoint_path(args.output_root, first_exp, args.checkpoint)
+        if ckpt_path is None:
+            raise FileNotFoundError(
+                f"Checkpoint not found for virtual compression: experiment={first_exp!r}, requested={args.checkpoint}"
             )
-        )
-        if not ckpt_path.is_file():
-            raise FileNotFoundError(f"Checkpoint not found for virtual compression: {ckpt_path}")
 
         saved_ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         vc_cfg = saved_ckpt["config"]

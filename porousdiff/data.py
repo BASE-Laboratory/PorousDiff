@@ -66,15 +66,62 @@ def resolve_checkpoint_path(
     experiment: str,
     explicit_checkpoint: Path | None = None,
 ) -> Path | None:
-    """Locate `explicit_checkpoint`, `best_val.pth`, or `latest.pth` if present."""
-    if explicit_checkpoint is not None:
-        return explicit_checkpoint if explicit_checkpoint.is_file() else None
+    """Locate `explicit_checkpoint` (absolute or relative to experiment ckpt_dir), `best_val.pth`, or `latest.pth`."""
     ckpt_dir = Path(output_root) / "checkpoints" / experiment
+    if explicit_checkpoint is not None:
+        if explicit_checkpoint.is_file():
+            return explicit_checkpoint
+        rel_cand = ckpt_dir / explicit_checkpoint
+        return rel_cand if rel_cand.is_file() else None
     for name in ("best_val.pth", "latest.pth"):
         cand = ckpt_dir / name
         if cand.is_file():
             return cand
     return None
+
+
+def resolve_manifest_state_subset(
+    scans: Sequence[Mapping[str, object]],
+    requested: Sequence[str] | None,
+    flag_name: str = "--states",
+) -> set[str] | None:
+    """Resolve user-supplied state names against manifest `state`, `source_folder`/`folder`, or beamline-stripped suffix.
+
+    Raises `ValueError` if any requested name matches zero scans or ambiguously matches multiple
+    beamline-prefixed scans, preventing silent held-out data leakage from prefixes or typos.
+    """
+    if requested is None:
+        return None
+    req_list = [str(r).strip() for r in requested if str(r).strip()]
+    if not req_list:
+        return set()
+
+    resolved: set[str] = set()
+    available = [str(sc.get("state", "")) for sc in scans]
+    for req in req_list:
+        exact = [str(sc["state"]) for sc in scans if str(sc.get("state")) == req]
+        if exact:
+            resolved.update(exact)
+            continue
+        sub = [
+            str(sc["state"])
+            for sc in scans
+            if str(sc.get("folder", "")) == req
+            or str(sc.get("source_folder", "")) == req
+            or str(sc.get("state", "")).split("__", 1)[-1] == req
+        ]
+        if len(sub) == 1:
+            resolved.add(sub[0])
+        elif len(sub) > 1:
+            raise ValueError(
+                f"Ambiguous state {req!r} in {flag_name}; matches multiple beamlines: {sub}. "
+                "Specify the full beamline-prefixed state name."
+            )
+        else:
+            raise ValueError(
+                f"Unknown state {req!r} in {flag_name}; available manifest states: {available}"
+            )
+    return resolved
 
 
 def resolve_use_stress_kpa_from_checkpoints(
@@ -191,17 +238,22 @@ def resolve_patch_split_dir(
     version: str,
     split: str,
     patch_dir_name: str | None = None,
+    fallback_root: Path | None = None,
 ) -> Path:
     """Resolve `<state>_{binary,multiphase}_patches<P>_<version>/<split>` directory."""
+    roots = [data_root]
+    if fallback_root is not None and fallback_root != data_root:
+        roots.append(fallback_root)
     candidates: list[Path] = []
-    if patch_dir_name:
-        candidates.append(data_root / patch_dir_name / split)
-    candidates.extend(
-        [
-            data_root / f"{state_name}_binary_patches{patch_size}_{version}" / split,
-            data_root / f"{state_name}_multiphase_patches{patch_size}_{version}" / split,
-        ]
-    )
+    for root in roots:
+        if patch_dir_name:
+            candidates.append(root / patch_dir_name / split)
+        candidates.extend(
+            [
+                root / f"{state_name}_binary_patches{patch_size}_{version}" / split,
+                root / f"{state_name}_multiphase_patches{patch_size}_{version}" / split,
+            ]
+        )
     for cand in candidates:
         if cand.is_dir():
             return cand
