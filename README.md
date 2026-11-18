@@ -4,7 +4,7 @@
 
 Developed by [BASE Laboratory](https://github.com/BASE-Laboratory) using NVIDIA GH200 accelerators on Isambard-AI.
 
-**Research status:** Active development — unconditional 3D diffusion benchmarks completed; compression-conditioned generation planned.
+**Research status:** Active development — TiO₂ unconditional 3D diffusion benchmarks completed; carbon-felt load-cell-conditioned 3D diffusion implemented and trained for 28 epochs. Physical validation remains ongoing.
 
 ## Overview
 
@@ -78,6 +78,52 @@ These findings are preliminary. Comprehensive connectivity, spatial-correlation,
 
 Detailed experiment records are available in [experiments.md](experiments.md).
 
+### Carbon-Felt Conditional 3D Diffusion
+
+A load-cell-conditioned 3D DDPM has been implemented for carbon-felt XCT microstructures under three experimental loading conditions.
+
+**Dataset and preprocessing:**
+
+- Conditions: 8, 18, and 33 mV load-cell readings.
+- These readings are sensor measurements, not calibrated compression ratios.
+- Binary XCT patches: 96 x 96 x 96 voxels (1 = solid, 0 = pore).
+- Training patches: 2,880 (960 per condition).
+- Validation patches: 720 (240 per condition).
+- Preprocessing includes XCT segmentation and 3D patch extraction.
+
+**Model and training:**
+
+- MONAI Generative Models `DiffusionModelUNet`.
+- 3D UNet channels: (32, 64, 128).
+- Conditional cross-attention with a 32-dimensional embedding of the load-cell reading.
+- DDPM noise schedule: 1,000 timesteps.
+- Batch size: 1; AdamW optimizer; learning rate: 1e-4.
+- NVIDIA GH200 GPU training using Slurm.
+- Checkpoint saving and resumption implemented and tested.
+
+**Recorded progress:**
+
+| Metric | Value |
+|---|---:|
+| Completed epochs | 28 |
+| Epoch 28 training loss | 0.006122 |
+| Epoch 28 validation loss | 0.005096 |
+| Training patches | 2,880 |
+| Validation patches | 720 |
+
+The losses measure noise-prediction performance, not physical fidelity.
+The conditional model remains under evaluation; additional generation,
+morphological analysis, and physics-based validation are required.
+
+**Relevant scripts:**
+
+- `scripts/preprocessing/segment_carbon_xct.py`
+- `scripts/preprocessing/extract_carbon_3d_patches.py`
+- `scripts/training/train_carbon_conditional_96.py`
+- `scripts/evaluation/sample_carbon_conditional_96.py`
+- `slurm/train_carbon_conditional_96.slurm`
+- `slurm/resume_carbon_conditional_100.slurm`
+
 ## Technical Stack
 
 - **Language:** Python
@@ -118,21 +164,20 @@ The repository includes environment specifications and experimental scripts. Som
 
 Research datasets and trained checkpoints are not distributed through this repository.
 
-## Planned Work: Compression-Conditioned Generation
+## Next Steps: Conditional Generation and Validation
 
-The next research phase will investigate CuCHF electrode microstructures acquired under three experimental load-cell conditions.
+The carbon-felt conditional 3D DDPM has been implemented and trained for 28 epochs using three load-cell readings (8, 18, and 33 mV).
 
-The proposed conditional diffusion model will use an experimental condition as an input to generate synthetic microstructures corresponding to that condition.
+Remaining research objectives include:
 
-Planned developments include:
+- Continue training when GPU resources become available.
+- Evaluate conditional samples at all three loading conditions.
+- Compare generated and real solid-fraction distributions.
+- Assess connectivity, directional anisotropy, and spatial correlations.
+- Investigate physical transport properties and model generalization.
+- Improve portable inference and reproducibility documentation.
 
-- Conditioning on measured load-cell signals.
-- Generation across three observed experimental states.
-- Investigation of larger 3D patches.
-- Physical validation of generated structures.
-- Portable inference from trained model checkpoints.
-
-These capabilities are research objectives and are not yet presented as completed implementations.
+The current results are preliminary and do not yet establish physically validated digital twins.
 
 ## Limitations
 
