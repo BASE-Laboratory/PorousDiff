@@ -493,6 +493,19 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(summary_records)
 
+    provenance = {
+        "experiment": args.experiment,
+        "checkpoint": str(ckpt_path),
+        "epoch": int(saved["epoch"]) + 1,
+        "weight_source": weight_source,
+        "is_pre_registered_ema": weight_source == "ema",
+        "sampler": args.sampler,
+        "steps": int(args.steps),
+        "guidance_scale": float(args.guidance_scale),
+        "seed": int(args.seed),
+    }
+    (out_dir / "sampling_provenance.json").write_text(json.dumps(provenance, indent=2))
+
     if args.sweep_loads.strip():
         sweep_vals = [float(x.strip()) for x in args.sweep_loads.split(",") if x.strip()]
         if args.material == "auto":

@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
-#SBATCH --time=06:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=/projects/u6uc/asif/logs/beamtime-mult-%j.out
 #SBATCH --error=/projects/u6uc/asif/logs/beamtime-mult-%j.err
 
@@ -28,6 +28,8 @@ EXPERIMENT="${EXPERIMENT:-beamtime_multiplier_96}"
 VERSION="${VERSION:-carbon_calibrated_v1}"
 EPOCHS="${EPOCHS:-100}"
 PATCH_SIZE="${PATCH_SIZE:-96}"
+SEEDS="${SEEDS:-42 43 44}"
+read -r -a SEED_ARR <<< "$SEEDS"
 
 INCLUDE_ARGS=()
 if [ -n "${INCLUDE_STATES:-}" ]; then
@@ -43,23 +45,22 @@ if [ -n "${HELDOUT_STATES:-}" ]; then
     HELDOUT_ARGS+=(--heldout-states "${EXC_ARR[@]}")
 fi
 
-RESUME_ARGS=()
-if [ -f "${POROUSDIFF_ROOT}/checkpoints/${EXPERIMENT}/latest.pth" ]; then
-    echo "Existing checkpoint detected; resuming automatically."
-    RESUME_ARGS+=(--resume)
-fi
-
 PHYSICS_ARGS=()
 if [ "${PHYSICS_LOSS:-1}" = "1" ]; then
     PHYSICS_ARGS+=(--physics-loss)
+fi
+
+FIRST_SEED_EXP="$EXPERIMENT"
+if [ "${#SEED_ARR[@]}" -gt 1 ]; then
+    FIRST_SEED_EXP="${EXPERIMENT}_s${SEED_ARR[0]}"
 fi
 
 STRESS_ARGS=()
 if [ "${USE_STRESS_KPA:-auto}" = "1" ]; then
     STRESS_ARGS+=(--use-stress-kpa)
 elif [ "${USE_STRESS_KPA:-auto}" = "auto" ]; then
-    if [ -f "${POROUSDIFF_ROOT}/checkpoints/${EXPERIMENT}/latest.pth" ]; then
-        if python -c "import sys, torch; c = torch.load(sys.argv[1], map_location='cpu', weights_only=False).get('config', {}); sys.exit(0 if c.get('use_stress_kpa', False) else 1)" "${POROUSDIFF_ROOT}/checkpoints/${EXPERIMENT}/latest.pth"; then
+    if [ -f "${POROUSDIFF_ROOT}/checkpoints/${FIRST_SEED_EXP}/latest.pth" ]; then
+        if python -c "import sys, torch; c = torch.load(sys.argv[1], map_location='cpu', weights_only=False).get('config', {}); sys.exit(0 if c.get('use_stress_kpa', False) else 1)" "${POROUSDIFF_ROOT}/checkpoints/${FIRST_SEED_EXP}/latest.pth"; then
             STRESS_ARGS+=(--use-stress-kpa)
         fi
     elif [ -f "$MANIFEST" ]; then
@@ -71,42 +72,65 @@ elif [ "${USE_STRESS_KPA:-auto}" = "auto" ]; then
 fi
 
 echo "Started Beamtime Multiplier pipeline: $(date -u)"
-echo "Manifest: $MANIFEST | Experiment: $EXPERIMENT"
+echo "Manifest: $MANIFEST | Base Experiment: $EXPERIMENT | Seeds: ${SEED_ARR[*]}"
 nvidia-smi
 
-python -u scripts/training/train_carbon_conditional_96.py \
-    --experiment "$EXPERIMENT" \
-    --data-root "$DATA_ROOT" \
-    --manifest-json "$MANIFEST" \
-    --version "$VERSION" \
-    --patch-size "$PATCH_SIZE" \
-    --balanced-sampling \
-    --epochs "$EPOCHS" \
-    --batch-size "${BATCH_SIZE:-4}" \
-    --grad-accum "${GRAD_ACCUM:-2}" \
-    --lr "${LR:-2e-4}" \
-    --amp bf16 \
-    --num-workers 4 \
-    "${STRESS_ARGS[@]}" \
-    "${PHYSICS_ARGS[@]}" \
-    "${INCLUDE_ARGS[@]}" \
-    "${EXCLUDE_ARGS[@]}" \
-    "${RESUME_ARGS[@]}"
+EXP_LIST=()
+for SEED_VAL in "${SEED_ARR[@]}"; do
+    if [ "${#SEED_ARR[@]}" -gt 1 ]; then
+        CUR_EXP="${EXPERIMENT}_s${SEED_VAL}"
+    else
+        CUR_EXP="$EXPERIMENT"
+    fi
+    EXP_LIST+=("$CUR_EXP")
 
-python -u scripts/evaluation/sample_carbon_conditional_96.py \
-    --experiment "$EXPERIMENT" \
-    --manifest-json "$MANIFEST" \
-    --sampler "${SAMPLER:-ddim}" \
-    --steps "${STEPS:-100}" \
-    --guidance-scale "${GUIDANCE_SCALE:-1.5}" \
-    --num-samples "${NUM_SAMPLES:-20}" \
-    --batch-size "${BATCH_SIZE:-4}" \
-    --sweep-loads "" \
-    --export-openimpala
+    RESUME_ARGS=()
+    if [ -f "${POROUSDIFF_ROOT}/checkpoints/${CUR_EXP}/latest.pth" ]; then
+        echo "Existing checkpoint detected for ${CUR_EXP}; resuming automatically."
+        RESUME_ARGS+=(--resume)
+    fi
+
+    python -u scripts/training/train_carbon_conditional_96.py \
+        --experiment "$CUR_EXP" \
+        --seed "$SEED_VAL" \
+        --data-root "$DATA_ROOT" \
+        --manifest-json "$MANIFEST" \
+        --version "$VERSION" \
+        --patch-size "$PATCH_SIZE" \
+        --balanced-sampling \
+        --epochs "$EPOCHS" \
+        --batch-size "${BATCH_SIZE:-4}" \
+        --grad-accum "${GRAD_ACCUM:-2}" \
+        --lr "${LR:-2e-4}" \
+        --amp bf16 \
+        --num-workers 4 \
+        "${STRESS_ARGS[@]}" \
+        "${PHYSICS_ARGS[@]}" \
+        "${INCLUDE_ARGS[@]}" \
+        "${EXCLUDE_ARGS[@]}" \
+        "${RESUME_ARGS[@]}"
+
+    python -u scripts/evaluation/sample_carbon_conditional_96.py \
+        --experiment "$CUR_EXP" \
+        --seed "$SEED_VAL" \
+        --manifest-json "$MANIFEST" \
+        --sampler "${SAMPLER:-ddim}" \
+        --steps "${STEPS:-100}" \
+        --guidance-scale "${GUIDANCE_SCALE:-1.5}" \
+        --num-samples "${NUM_SAMPLES:-20}" \
+        --batch-size "${BATCH_SIZE:-4}" \
+        --sweep-loads "" \
+        --export-openimpala
+done
+
+EXP_CSV=$(IFS=,; echo "${EXP_LIST[*]}")
+OUT_BENCH="${POROUSDIFF_ROOT}/results/${EXPERIMENT}/beamtime_benchmark"
+OUT_CLAMP="${POROUSDIFF_ROOT}/results/${EXPERIMENT}/clamping_optimization"
 
 python -u scripts/evaluation/evaluate_beamtime_multiplier.py \
-    --experiments "porousdiff=${EXPERIMENT}" \
+    --experiments "porousdiff=${EXP_CSV}" \
     --data-root "$DATA_ROOT" \
+    --out-dir "$OUT_BENCH" \
     --manifest-json "$MANIFEST" \
     --version "$VERSION" \
     --patch-size "$PATCH_SIZE" \
@@ -116,8 +140,9 @@ python -u scripts/evaluation/evaluate_beamtime_multiplier.py \
     "${HELDOUT_ARGS[@]}"
 
 python -u scripts/evaluation/optimize_clamping_pressure.py \
-    --experiments "porousdiff=${EXPERIMENT}" \
+    --experiments "porousdiff=${EXP_CSV}" \
     --data-root "$DATA_ROOT" \
+    --out-dir "$OUT_CLAMP" \
     --manifest-json "$MANIFEST" \
     --version "$VERSION" \
     --patch-size "$PATCH_SIZE" \

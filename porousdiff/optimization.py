@@ -583,13 +583,30 @@ def find_optimal_clamping_pressure(
             }
         )
 
+    def _grid_resolution_stats(target_lv: float) -> tuple[float, float]:
+        if loads_arr.size <= 1:
+            return float(loads_arr[0]), 0.0
+        idx_near = int(np.argmin(np.abs(loads_arr - target_lv)))
+        gaps: list[float] = []
+        if idx_near > 0:
+            gaps.append(float(loads_arr[idx_near] - loads_arr[idx_near - 1]))
+        if idx_near + 1 < loads_arr.size:
+            gaps.append(float(loads_arr[idx_near + 1] - loads_arr[idx_near]))
+        return float(loads_arr[idx_near]), 0.5 * max(gaps)
+
+    near_fom_lv, fom_grid_hw = _grid_resolution_stats(opt_load)
+    near_asr_lv, asr_grid_hw = _grid_resolution_stats(opt_load_asr)
+
     return {
         "estimator_mode": estimator_mode,
         "uncertainty_note": (
-            "Bootstrap CIs quantify within-scan spatial patch variance; "
-            "model-form sensitivity is reported in weight_sensitivity and newman_asr.regime_sensitivity."
+            "Bootstrap CIs quantify within-scan spatial patch variance; discrete scan spacing bounds sub-grid "
+            "localization (see grid_spacing_halfwidth); continuum parameter sensitivity is reported in "
+            "weight_sensitivity and newman_asr.regime_sensitivity."
         ),
         "optimal_load": round(opt_load, 6),
+        "nearest_discrete_load": round(near_fom_lv, 6),
+        "grid_spacing_halfwidth": round(fom_grid_hw, 6),
         "optimal_load_ci95": [round(ci_low, 6), round(ci_high, 6)],
         "optimal_fom": round(opt_fom, 6),
         "weights": {"ionic": weights[0], "electronic": weights[1], "kinetic": weights[2]},
@@ -605,8 +622,15 @@ def find_optimal_clamping_pressure(
             "active_wired_interface": scales[2],
         },
         "newman_asr": {
+            "parameter_note": (
+                "1D Newman-Tobias porous-electrode ASR (not parameter-free: parameterized by bulk conductivities "
+                "kappa_0, sigma_0, interfacial kinetics R_ct, mass-transport R_mt, and pumping/contact terms; "
+                "see regime_sensitivity)."
+            ),
             "uncompressed_thickness_cm": float(uncompressed_thickness_cm),
             "optimal_load_asr": round(opt_load_asr, 6),
+            "nearest_discrete_load_asr": round(near_asr_lv, 6),
+            "grid_spacing_halfwidth_asr": round(asr_grid_hw, 6),
             "optimal_load_asr_ci95": [round(asr_opt_ci_low, 6), round(asr_opt_ci_high, 6)],
             "min_asr_ohm_cm2": round(min_asr, 6),
             "thickness_cm_grid": [float(x) for x in thick_grid_cm],

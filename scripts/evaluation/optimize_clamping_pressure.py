@@ -57,14 +57,17 @@ from porousdiff.optimization import (
 from porousdiff.preprocessing import infer_material_name, parse_load_value
 
 
-def _parse_experiments(entries: list[str]) -> dict[str, str]:
-    out: dict[str, str] = {}
+def _parse_experiments(entries: list[str]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
     for item in entries:
         if "=" in item:
-            lbl, exp = item.split("=", 1)
-            out[lbl.strip()] = exp.strip()
+            lbl, exp_raw = item.split("=", 1)
+            exps = [x.strip() for x in exp_raw.replace("+", ",").split(",") if x.strip()]
+            out[lbl.strip()] = exps
         else:
-            out[item.strip()] = item.strip()
+            exps = [x.strip() for x in item.replace("+", ",").split(",") if x.strip()]
+            if exps:
+                out[exps[0]] = exps
     return out
 
 
@@ -207,7 +210,8 @@ def main() -> None:
     weights = (w_parts[0], w_parts[1], w_parts[2])
 
     exp_map = _parse_experiments(args.experiments)
-    first_exp = next(iter(exp_map.values()))
+    all_exp_names = [e for exps in exp_map.values() for e in exps]
+    first_exp = all_exp_names[0]
     out_dir = (
         args.out_dir
         if args.out_dir is not None
@@ -217,7 +221,7 @@ def main() -> None:
 
     use_kpa, _ = resolve_use_stress_kpa_from_checkpoints(
         output_root=args.output_root,
-        experiments=list(exp_map.values()),
+        experiments=all_exp_names,
         explicit_checkpoint=args.checkpoint,
         default=args.use_stress_kpa,
     )
@@ -354,8 +358,8 @@ def main() -> None:
             mat = str(sp["material"])
             if st in real_cache:
                 mat_to_real_states.setdefault(mat, []).append(st)
-            for lbl, exp_name in exp_map.items():
-                if (args.output_root / "results" / exp_name / "samples" / st).is_dir():
+            for lbl, exp_list in exp_map.items():
+                if any((args.output_root / "results" / exp_n / "samples" / st).is_dir() for exp_n in exp_list):
                     mat_to_exp_states.setdefault((mat, lbl), []).append(st)
 
         def _check_oi_complete(mat_k: str, meth_k: str, states_list: list[str]) -> None:
@@ -380,6 +384,21 @@ def main() -> None:
         for (mat_k, lbl_k), g_sts in mat_to_exp_states.items():
             _check_oi_complete(mat_k, lbl_k, g_sts)
 
+    per_seed_records_tree: dict[str, dict[str, dict[str, dict[float, list[dict[str, float]]]]]] = {}
+    provenance_by_method: dict[str, dict[str, object]] = {}
+    for lbl, exp_list in exp_map.items():
+        ws_list: list[str] = []
+        for exp_name in exp_list:
+            prov_p = args.output_root / "results" / exp_name / "samples" / "sampling_provenance.json"
+            if prov_p.is_file():
+                prov = json.loads(prov_p.read_text())
+                ws_list.append(str(prov.get("weight_source", "unknown")))
+        provenance_by_method[lbl] = {
+            "experiments": exp_list,
+            "weight_sources": ws_list,
+            "used_non_ema_debug_weights": any(ws == "raw" for ws in ws_list),
+        }
+
     for sp in state_specs:
         st = str(sp["state"])
         mat = str(sp["material"])
@@ -402,8 +421,23 @@ def main() -> None:
             ]
             mat_bucket.setdefault("real", {}).setdefault(lv, []).extend(r_recs)
 
+            ref_st_mat = lowest_state_by_mat[mat]
+            noop_vols = real_cache[ref_st_mat]
+            noop_oi = oi_lookup.get(("real", ref_st_mat)) if oi_method_complete.get((mat, "real"), False) else None
+            mat_bucket.setdefault("noop_uncompressed", {}).setdefault(lv, []).extend(
+                [
+                    compute_transport_and_fom_record(
+                        evaluate_multiphase_physics(v, voxel_size=vox),
+                        openimpala_metrics=noop_oi,
+                        voxel_size_um=vox,
+                        strain_z=sz_opt,
+                    )
+                    for v in noop_vols
+                ]
+            )
+
             target_sf = float(np.mean([r["solid_fraction"] for r in r_recs]))
-            ref_vols = tall_real_cache[lowest_state_by_mat[mat]]
+            ref_vols = tall_real_cache[ref_st_mat]
             aff_vols = [
                 affine_z_compress_to_target(rv, target_solid_fraction=max(target_sf, 1e-3), output_depth=args.patch_size)
                 for rv in ref_vols
@@ -450,21 +484,29 @@ def main() -> None:
                 ]
             )
 
-        for lbl, exp_name in exp_map.items():
-            samples_dir = args.output_root / "results" / exp_name / "samples"
-            if (samples_dir / st).is_dir():
-                g_vols = _load_generated_volumes(samples_dir, st)
-                g_oi = oi_lookup.get((lbl, st)) if oi_method_complete.get((mat, lbl), False) else None
-                g_recs = [
-                    compute_transport_and_fom_record(
-                        evaluate_multiphase_physics(v, voxel_size=vox),
-                        openimpala_metrics=g_oi,
-                        voxel_size_um=vox,
-                        strain_z=sz_opt,
+        for lbl, exp_list in exp_map.items():
+            for exp_name in exp_list:
+                samples_dir = args.output_root / "results" / exp_name / "samples"
+                if (samples_dir / st).is_dir():
+                    g_vols = _load_generated_volumes(samples_dir, st)
+                    g_oi = oi_lookup.get((lbl, st)) if oi_method_complete.get((mat, lbl), False) else None
+                    g_recs = [
+                        compute_transport_and_fom_record(
+                            evaluate_multiphase_physics(v, voxel_size=vox),
+                            openimpala_metrics=g_oi,
+                            voxel_size_um=vox,
+                            strain_z=sz_opt,
+                        )
+                        for v in g_vols
+                    ]
+                    mat_bucket.setdefault(lbl, {}).setdefault(lv, []).extend(g_recs)
+                    (
+                        per_seed_records_tree.setdefault(mat, {})
+                        .setdefault(lbl, {})
+                        .setdefault(exp_name, {})
+                        .setdefault(lv, [])
+                        .extend(g_recs)
                     )
-                    for v in g_vols
-                ]
-                mat_bucket.setdefault(lbl, {}).setdefault(lv, []).extend(g_recs)
 
     # Optional continuous dense PorousDiff sweep for high-resolution sigma* discovery
     if args.dense_sweep_points >= 3:
@@ -598,6 +640,33 @@ def main() -> None:
                     opt_res["abs_err_optimal_load_asr_vs_real"] = round(
                         abs(float(opt_res["newman_asr"]["optimal_load_asr"]) - real_sigma_star_asr), 6  # type: ignore[index]
                     )
+                seed_maps = per_seed_records_tree.get(mat, {}).get(m_name, {})
+                valid_seed_maps = {s_k: s_m for s_k, s_m in seed_maps.items() if len(s_m) >= 2}
+                if len(valid_seed_maps) >= 2:
+                    s_opt_fom: list[float] = []
+                    s_opt_asr: list[float] = []
+                    for s_i, (_, s_lmap) in enumerate(valid_seed_maps.items()):
+                        s_res = find_optimal_clamping_pressure(
+                            s_lmap,
+                            weights=weights,
+                            n_bootstrap=max(10, args.bootstrap // 4),
+                            seed=args.seed + s_i,
+                            norm_scales=ref_scales,
+                            uncompressed_thickness_cm=args.uncompressed_thickness_cm,
+                        )
+                        s_opt_fom.append(float(s_res["optimal_load"]))
+                        s_opt_asr.append(float(s_res["newman_asr"]["optimal_load_asr"]))  # type: ignore[index]
+                    opt_res["multi_seed"] = {
+                        "num_seeds": len(valid_seed_maps),
+                        "per_seed_optimal_load": [round(v, 6) for v in s_opt_fom],
+                        "optimal_load_seed_mean": round(float(np.mean(s_opt_fom)), 6),
+                        "optimal_load_seed_std": round(float(np.std(s_opt_fom, ddof=1)), 6),
+                        "per_seed_optimal_load_asr": [round(v, 6) for v in s_opt_asr],
+                        "optimal_load_asr_seed_mean": round(float(np.mean(s_opt_asr)), 6),
+                        "optimal_load_asr_seed_std": round(float(np.std(s_opt_asr, ddof=1)), 6),
+                    }
+                if m_name in provenance_by_method:
+                    opt_res["provenance"] = provenance_by_method[m_name]
                 mat_summary[m_name] = opt_res
 
             for pt in opt_res["discrete_points"]:  # type: ignore[index]
@@ -615,7 +684,8 @@ def main() -> None:
                 f"[{mat} | {m_name}] sigma* (FoM) = {opt_res['optimal_load']} "  # type: ignore[index]
                 f"(95% CI {opt_res['optimal_load_ci95']}) | "  # type: ignore[index]
                 f"sigma* (Newman ASR) = {asr_info['optimal_load_asr']} "  # type: ignore[index]
-                f"(min ASR = {asr_info['min_asr_ohm_cm2']} Ohm*cm^2)",  # type: ignore[index]
+                f"(min ASR = {asr_info['min_asr_ohm_cm2']} Ohm*cm^2, "  # type: ignore[index]
+                f"grid halfwidth ±{asr_info['grid_spacing_halfwidth_asr']})",  # type: ignore[index]
                 flush=True,
             )
         summary_out[mat] = mat_summary

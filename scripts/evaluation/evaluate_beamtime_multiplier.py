@@ -98,15 +98,18 @@ def _s2_rmse(a: dict[str, np.ndarray], b: dict[str, np.ndarray]) -> float:
     return 0.5 * (dz + dxy)
 
 
-def _parse_experiments(entries: list[str]) -> dict[str, str]:
-    """Parse `label=experiment_name` or bare `experiment_name`."""
-    out: dict[str, str] = {}
+def _parse_experiments(entries: list[str]) -> dict[str, list[str]]:
+    """Parse `label=exp_s1,exp_s2,...` (or `+`-separated) or bare `experiment_name`."""
+    out: dict[str, list[str]] = {}
     for item in entries:
         if "=" in item:
-            lbl, exp = item.split("=", 1)
-            out[lbl.strip()] = exp.strip()
+            lbl, exp_raw = item.split("=", 1)
+            exps = [x.strip() for x in exp_raw.replace("+", ",").split(",") if x.strip()]
+            out[lbl.strip()] = exps
         else:
-            out[item.strip()] = item.strip()
+            exps = [x.strip() for x in item.replace("+", ",").split(",") if x.strip()]
+            if exps:
+                out[exps[0]] = exps
     return out
 
 
@@ -119,7 +122,7 @@ def main() -> None:
         "--experiments",
         nargs="+",
         required=True,
-        help="Experiment(s) to evaluate, e.g. porousdiff=beamtime_fewshot oracle=beamtime_oracle",
+        help="Experiment(s) to evaluate; pass comma-separated seeds for error bars (e.g. porousdiff=exp_s42,exp_s43,exp_s44)",
     )
     parser.add_argument("--data-root", type=Path, default=proj_root / "data" / "carbon_virgin")
     parser.add_argument("--output-root", type=Path, default=proj_root)
@@ -171,7 +174,8 @@ def main() -> None:
     args = parser.parse_args()
 
     exp_map = _parse_experiments(args.experiments)
-    first_exp = next(iter(exp_map.values()))
+    all_exp_names = [e for exps in exp_map.values() for e in exps]
+    first_exp = all_exp_names[0]
     out_dir = (
         args.out_dir
         if args.out_dir is not None
@@ -182,7 +186,7 @@ def main() -> None:
 
     use_kpa, _ = resolve_use_stress_kpa_from_checkpoints(
         output_root=args.output_root,
-        experiments=list(exp_map.values()),
+        experiments=all_exp_names,
         explicit_checkpoint=args.checkpoint,
         default=args.use_stress_kpa,
     )
@@ -457,18 +461,40 @@ def main() -> None:
         )
 
         methods_vols: dict[str, np.ndarray] = {
+            "noop_uncompressed": real_cache[ref_st],
             "affine_z_squash": affine_vols,
             "pillar_pore_deletion": pillar_vols,
         }
         if st in virtual_cache_by_state:
             methods_vols["virtual_compression"] = virtual_cache_by_state[st]
-        for lbl, exp_name in exp_map.items():
-            samples_dir = args.output_root / "results" / exp_name / "samples"
-            if (samples_dir / st).is_dir():
-                methods_vols[lbl] = _load_generated_volumes(samples_dir, st)
+
+        per_seed_vols_by_method: dict[str, list[np.ndarray]] = {}
+        provenance_by_method: dict[str, dict[str, object]] = {}
+        for lbl, exp_list in exp_map.items():
+            seed_vols: list[np.ndarray] = []
+            weight_sources: list[str] = []
+            for exp_name in exp_list:
+                samples_dir = args.output_root / "results" / exp_name / "samples"
+                if (samples_dir / st).is_dir():
+                    seed_vols.append(_load_generated_volumes(samples_dir, st))
+                prov_path = samples_dir / "sampling_provenance.json"
+                if prov_path.is_file():
+                    prov = json.loads(prov_path.read_text())
+                    weight_sources.append(str(prov.get("weight_source", "unknown")))
+            if seed_vols:
+                methods_vols[lbl] = np.concatenate(seed_vols, axis=0)
+                per_seed_vols_by_method[lbl] = seed_vols
+                provenance_by_method[lbl] = {
+                    "experiments": exp_list,
+                    "num_seeds": len(seed_vols),
+                    "weight_sources": weight_sources,
+                    "used_non_ema_debug_weights": any(ws == "raw" for ws in weight_sources),
+                }
 
         if want_openimpala:
             for m_name, m_vols in methods_vols.items():
+                if m_name == "noop_uncompressed":
+                    continue  # Identical to real_cache[ref_st], already exported under openimpala_real/
                 for b_i, mv_vol in enumerate(m_vols[: args.max_openimpala_per_method], start=1):
                     tif_p = out_dir / "openimpala_methods" / m_name / st / f"{m_name}_{b_i:03d}.tif"
                     export_openimpala_tiff(mv_vol, tif_p, preserve_multiphase=(n_ph == 3))
@@ -484,18 +510,44 @@ def main() -> None:
                         }
                     )
 
+        noop_s2_err = _s2_rmse(real_s2, _mean_s2_curves(methods_vols["noop_uncompressed"], max_lag=max_lag))
         methods_summary: dict[str, object] = {}
         for m_name, m_vols in methods_vols.items():
             m_recs = [evaluate_multiphase_physics(v, voxel_size=vox) for v in m_vols]
             m_sum = summarize_metric_records(m_recs)
-            m_s2 = _mean_s2_curves(m_vols, max_lag=max_lag)
-            s2_err = _s2_rmse(real_s2, m_s2)
 
-            methods_summary[m_name] = {
+            seed_vols_list = per_seed_vols_by_method.get(m_name, [])
+            per_seed_s2: list[float] = []
+            if len(seed_vols_list) >= 2:
+                per_seed_sums = []
+                for sv in seed_vols_list:
+                    sv_recs = [evaluate_multiphase_physics(v, voxel_size=vox) for v in sv]
+                    per_seed_sums.append(summarize_metric_records(sv_recs))
+                    per_seed_s2.append(_s2_rmse(real_s2, _mean_s2_curves(sv, max_lag=max_lag)))
+                s2_err = float(np.mean(per_seed_s2))
+                s2_std = float(np.std(per_seed_s2, ddof=1))
+                for mk, md in m_sum.items():
+                    s_means = [ps[mk]["mean"] for ps in per_seed_sums if np.isfinite(ps[mk]["mean"])]
+                    md["seed_std"] = float(np.std(s_means, ddof=1)) if len(s_means) >= 2 else 0.0
+            else:
+                m_s2 = _mean_s2_curves(m_vols, max_lag=max_lag)
+                s2_err = _s2_rmse(real_s2, m_s2)
+                s2_std = 0.0
+
+            s2_gain_vs_noop = round(noop_s2_err - s2_err, 6)
+            m_entry: dict[str, object] = {
                 "num_volumes": int(m_vols.shape[0]),
+                "num_seeds": max(1, len(seed_vols_list)),
                 "s2_rmse": s2_err,
+                "s2_rmse_std": s2_std,
+                "s2_improvement_over_noop": s2_gain_vs_noop,
                 "metrics": m_sum,
             }
+            if per_seed_s2:
+                m_entry["per_seed_s2_rmse"] = [round(v, 6) for v in per_seed_s2]
+            if m_name in provenance_by_method:
+                m_entry["provenance"] = provenance_by_method[m_name]
+            methods_summary[m_name] = m_entry
 
             row: dict[str, object] = {
                 "state": st,
@@ -505,7 +557,10 @@ def main() -> None:
                 "load_unit": unit_label,
                 "is_heldout": is_heldout,
                 "method": m_name,
+                "num_seeds": max(1, len(seed_vols_list)),
                 "s2_rmse": round(s2_err, 6),
+                "s2_rmse_std": round(s2_std, 6),
+                "s2_improvement_over_noop": s2_gain_vs_noop,
                 "baseline_mirror_tiled_fraction": (
                     round(mirror_frac, 6)
                     if m_name in ("affine_z_squash", "pillar_pore_deletion")
@@ -536,7 +591,8 @@ def main() -> None:
             "baseline_mirror_tiled_fraction": round(mirror_frac, 6),
             "baseline_oracle_porosity_note": (
                 "Affine and pillar baselines receive the held-out target solid_fraction by construction; "
-                "evaluate morphological fidelity via S2(r), chord anisotropy, EASA/TPB, and tortuosity."
+                "noop_uncompressed evaluates the unmodified lowest-load scan directly against each target state. "
+                "Evaluate morphological fidelity via S2(r), chord anisotropy, EASA/TPB, and tortuosity."
             ),
             "real": {"num_volumes": int(real_vols.shape[0]), "metrics": real_sum},
             "methods": methods_summary,
@@ -547,9 +603,14 @@ def main() -> None:
                     source_volumes=real_cache[ref_st],
                     compressed_volumes=virtual_cache_by_state[st],
                     same_load_reconstructions=vc_same_load_by_group.get((mat, beam)),
+                    is_target_same_as_source=(st == ref_st),
                 )
             )
             vc_diag.update(vc_extrap_by_group.get((mat, beam), {}))
+            vc_diag["noop_s2_rmse"] = round(noop_s2_err, 6)
+            vc_diag["s2_improvement_over_noop"] = methods_summary["virtual_compression"][  # type: ignore[index]
+                "s2_improvement_over_noop"
+            ]
             st_entry["virtual_compression_diagnostics"] = vc_diag
         report[st] = st_entry
         print(
@@ -621,10 +682,15 @@ def main() -> None:
             ax.plot(loads, real_y, "-o", color="black", lw=2.0, label="Real XCT (Val)")
 
             all_methods = list(report[mat_states[0]]["methods"].keys())  # type: ignore[index]
-            palette = ["tab:gray", "tab:orange", "tab:blue", "tab:green", "tab:red"]
+            palette = ["tab:purple", "tab:gray", "tab:orange", "tab:blue", "tab:green", "tab:red"]
             for m_i, m_name in enumerate(all_methods):
                 my = [
                     report[st]["methods"][m_name]["metrics"][m_key]["mean"]  # type: ignore[index]
+                    for st in mat_states
+                    if m_name in report[st]["methods"]  # type: ignore[index]
+                ]
+                my_err = [
+                    float(report[st]["methods"][m_name]["metrics"][m_key].get("seed_std", 0.0))  # type: ignore[index]
                     for st in mat_states
                     if m_name in report[st]["methods"]  # type: ignore[index]
                 ]
@@ -633,8 +699,13 @@ def main() -> None:
                     for st in mat_states
                     if m_name in report[st]["methods"]  # type: ignore[index]
                 ]
-                style = "--s" if m_name in ("affine_z_squash", "pillar_pore_deletion") else "-^"
-                ax.plot(mx, my, style, color=palette[m_i % len(palette)], lw=1.5, label=m_name)
+                is_base = m_name in ("noop_uncompressed", "affine_z_squash", "pillar_pore_deletion")
+                fmt = ":d" if m_name == "noop_uncompressed" else ("--s" if is_base else "-^")
+                col = palette[m_i % len(palette)]
+                if any(e > 0.0 for e in my_err):
+                    ax.errorbar(mx, my, yerr=my_err, fmt=fmt, color=col, lw=1.5, capsize=3, label=m_name)
+                else:
+                    ax.plot(mx, my, fmt, color=col, lw=1.5, label=m_name)
 
             ax.set_title(f"{mat} — {m_label}", fontsize=10)
             ax.set_xlabel(f"Compressive Load / Stress ({unit_label})")

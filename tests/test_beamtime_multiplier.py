@@ -387,6 +387,7 @@ def test_end_to_end_beamtime_multiplier_cli(tmp_path: Path) -> None:
     bm_report = json.loads((bm_dir / "beamtime_multiplier_report.json").read_text())
     assert bm_report["tio2_anode_0p028mVV"]["is_heldout"] is True
     assert set(bm_report["tio2_anode_0p028mVV"]["methods"].keys()) == {
+        "noop_uncompressed",
         "affine_z_squash",
         "pillar_pore_deletion",
         "porousdiff_fewshot",

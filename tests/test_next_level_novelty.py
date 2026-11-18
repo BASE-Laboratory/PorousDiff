@@ -1147,3 +1147,190 @@ def test_cli_manifest_state_subset_and_checkpoint_safeguards(tmp_path: Path) -> 
     assert resolved_split == val_dir
 
 
+def test_reviewer_round2_noop_baseline_multiseed_grid_bounds_and_provenance(tmp_path: Path) -> None:
+    """Verify no-op baseline, near-identity DDIM copy detection, discrete scan-grid spacing bounds,
+    Newman-Tobias parameter note, EMA vs raw weight provenance, and multi-seed error bars."""
+    from porousdiff.virtual_compression import compute_virtual_compression_fidelity
+
+    rng = np.random.default_rng(2026)
+
+    # 1. Near-identity copy detection in compute_virtual_compression_fidelity
+    src_vols = (rng.random((3, 16, 16, 16)) < 0.14).astype(np.uint8)
+    fid_copy = compute_virtual_compression_fidelity(
+        source_volumes=src_vols,
+        compressed_volumes=src_vols.copy(),
+        same_load_reconstructions=src_vols.copy(),
+        is_target_same_as_source=False,
+    )
+    assert fid_copy["changed_voxel_fraction_vs_source"] == 0.0
+    assert fid_copy["mean_delta_solid_fraction"] == 0.0
+    assert fid_copy["is_near_identity_copy"] is True
+
+    fid_same_target = compute_virtual_compression_fidelity(
+        source_volumes=src_vols,
+        compressed_volumes=src_vols.copy(),
+        is_target_same_as_source=True,
+    )
+    assert fid_same_target["is_near_identity_copy"] is False
+
+    comp_vols = src_vols.copy()
+    comp_vols[:, :6, :6, :6] = 1  # Genuine solid compaction
+    fid_comp = compute_virtual_compression_fidelity(
+        source_volumes=src_vols,
+        compressed_volumes=comp_vols,
+        is_target_same_as_source=False,
+    )
+    assert fid_comp["mean_delta_solid_fraction"] > 0.02
+    assert fid_comp["is_near_identity_copy"] is False
+
+    # 2. Discrete grid resolution bounds & explicit Newman-Tobias parameter note on [68, 153, 255, 374] kPa
+    four_loads = [68.0, 153.0, 255.0, 374.0]
+    recs_4pt: dict[float, list[dict[str, float]]] = {}
+    for lv in four_loads:
+        # Interior minimum ASR near 153 kPa
+        d_eff = max(0.015, 0.55 * np.exp(-lv / 105.0))
+        sig_eff = 0.02 + 0.14 * (1.0 - np.exp(-lv / 55.0))
+        act_if = 0.10 + 0.24 * (1.0 - np.exp(-lv / 50.0)) * np.exp(-max(0.0, lv - 130.0) / 140.0)
+        recs_4pt[lv] = [
+            {
+                "solid_fraction": 0.11 + 0.0004 * lv,
+                "porosity": 0.89 - 0.0004 * lv,
+                "strain_z": min(0.50, (lv - 68.0) / 600.0),
+                "d_eff_pore_z": d_eff,
+                "sigma_eff_solid_z": sig_eff,
+                "permeability_ck_um2": 12.0 * d_eff,
+                "active_wired_interface": act_if,
+                "used_openimpala": 0.0,
+            }
+            for _ in range(3)
+        ]
+    opt_4pt = find_optimal_clamping_pressure(recs_4pt, n_bootstrap=20, seed=7)
+    asr_4pt = opt_4pt["newman_asr"]  # type: ignore[index]
+    assert float(asr_4pt["nearest_discrete_load_asr"]) == 153.0  # type: ignore[index]
+    # Adjacent spacings around 153 kPa are (153-68)=85 and (255-153)=102 -> halfwidth = 0.5 * 102 = 51.0 kPa
+    assert float(asr_4pt["grid_spacing_halfwidth_asr"]) == 51.0  # type: ignore[index]
+    assert "not parameter-free" in str(asr_4pt["parameter_note"])  # type: ignore[index]
+
+    # 3. Multi-seed evaluation (porousdiff=seed_a,seed_b), noop_uncompressed, and EMA provenance audit
+    data_root = tmp_path / "ms_data"
+    out_root = tmp_path / "ms_out"
+    p_sz = 16
+    ver = "ms_v1"
+    scans = []
+    for st, kpa, sf in [("c_68", 68.0, 0.11), ("c_153", 153.0, 0.16), ("c_255", 255.0, 0.23)]:
+        pdir = f"patches_{st}_{p_sz}_{ver}"
+        for sp, n_p in (("train", 2), ("val", 2)):
+            sd = data_root / pdir / sp
+            sd.mkdir(parents=True, exist_ok=True)
+            arr = (rng.random((n_p, p_sz, p_sz, p_sz)) < sf).astype(np.uint8)
+            arr[:, :, 4, 4] = 1
+            np.save(sd / "patches.npy", arr)
+        scans.append(
+            {
+                "state": st,
+                "material": "virgin_carbon",
+                "beamline": "DLS_I12",
+                "is_repeat_or_secondary": False,
+                "load_mv_per_v": round(kpa / 8500.0, 5),
+                "stress_kpa": kpa,
+                "strain_z": round((kpa - 68.0) / 500.0, 4),
+                "effective_voxel_size_um": 1.6,
+                "num_phases": 2,
+                "patch_dir_name": pdir,
+            }
+        )
+    manifest_p = data_root / "bundle_manifest.json"
+    manifest_p.write_text(json.dumps({"version": ver, "patch_size": p_sz, "scans": scans}, indent=2))
+
+    # Populate synthetic generated samples + sampling_provenance.json for 2 seeds (one EMA, one raw debug)
+    for s_idx, (exp_n, w_src, sf_bias) in enumerate([("pd_s42", "ema", -0.01), ("pd_s43", "raw", +0.015)]):
+        s_base = out_root / "results" / exp_n / "samples"
+        s_base.mkdir(parents=True, exist_ok=True)
+        (s_base / "sampling_provenance.json").write_text(
+            json.dumps(
+                {
+                    "experiment": exp_n,
+                    "weight_source": w_src,
+                    "is_pre_registered_ema": (w_src == "ema"),
+                    "seed": 42 + s_idx,
+                },
+                indent=2,
+            )
+        )
+        for st, _, sf in [("c_68", 68.0, 0.11), ("c_153", 153.0, 0.16), ("c_255", 255.0, 0.23)]:
+            st_d = s_base / st
+            st_d.mkdir(parents=True, exist_ok=True)
+            g_arr = (rng.random((2, p_sz, p_sz, p_sz)) < max(0.05, sf + sf_bias)).astype(np.uint8)
+            g_arr[:, :, 4, 4] = 1
+            np.save(st_d / "generated_samples.npy", g_arr)
+
+    bench_out = tmp_path / "ms_bench"
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "evaluation" / "evaluate_beamtime_multiplier.py"),
+            "--experiments",
+            "porousdiff=pd_s42,pd_s43",
+            "--data-root",
+            str(data_root),
+            "--output-root",
+            str(out_root),
+            "--out-dir",
+            str(bench_out),
+            "--manifest-json",
+            str(manifest_p),
+            "--version",
+            ver,
+            "--patch-size",
+            str(p_sz),
+            "--use-stress-kpa",
+            "--heldout-states",
+            "c_255",
+        ],
+        check=True,
+    )
+    ms_rep = json.loads((bench_out / "beamtime_multiplier_report.json").read_text())
+    held_m = ms_rep["c_255"]["methods"]
+    assert "noop_uncompressed" in held_m
+    assert held_m["noop_uncompressed"]["s2_improvement_over_noop"] == 0.0
+    pd_m = held_m["porousdiff"]
+    assert pd_m["num_seeds"] == 2
+    assert pd_m["s2_rmse_std"] >= 0.0
+    assert len(pd_m["per_seed_s2_rmse"]) == 2
+    assert pd_m["provenance"]["used_non_ema_debug_weights"] is True
+    assert pd_m["metrics"]["solid_fraction"]["seed_std"] > 0.0
+
+    clamp_out = tmp_path / "ms_clamp"
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "evaluation" / "optimize_clamping_pressure.py"),
+            "--experiments",
+            "porousdiff=pd_s42,pd_s43",
+            "--data-root",
+            str(data_root),
+            "--output-root",
+            str(out_root),
+            "--out-dir",
+            str(clamp_out),
+            "--manifest-json",
+            str(manifest_p),
+            "--version",
+            ver,
+            "--patch-size",
+            str(p_sz),
+            "--use-stress-kpa",
+            "--bootstrap",
+            "15",
+        ],
+        check=True,
+    )
+    ms_clamp = json.loads((clamp_out / "optimal_clamping_summary.json").read_text())
+    vc_clamp = ms_clamp["virgin_carbon"]
+    assert "noop_uncompressed" in vc_clamp
+    assert vc_clamp["porousdiff"]["multi_seed"]["num_seeds"] == 2
+    assert len(vc_clamp["porousdiff"]["multi_seed"]["per_seed_optimal_load_asr"]) == 2
+    assert vc_clamp["porousdiff"]["provenance"]["used_non_ema_debug_weights"] is True
+
+
+

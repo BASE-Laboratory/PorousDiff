@@ -336,8 +336,9 @@ def compute_virtual_compression_fidelity(
     source_volumes: np.ndarray,
     compressed_volumes: np.ndarray,
     same_load_reconstructions: np.ndarray | None = None,
-) -> dict[str, float]:
-    """Quantify structural retention vs random resampling in DDIM virtual compression.
+    is_target_same_as_source: bool = False,
+) -> dict[str, float | bool]:
+    """Quantify structural retention, actual deformation, and near-identity copy risk in DDIM virtual compression.
 
     Computes:
       - `same_load_solid_dice`: Solid-phase Dice overlap (`2|A&B| / (|A|+|B|)`) for `sigma_0 -> sigma_0`
@@ -347,6 +348,11 @@ def compute_virtual_compression_fidelity(
       - `unpaired_xy_column_corr`: Baseline correlation against unrelated shifted inputs `source_{(i+1)%N}`.
       - `xy_correlation_lift`: `paired_xy_column_corr - unpaired_xy_column_corr` (`> 0` confirms
         specimen-specific structural memory rather than unconditional resampling).
+      - `mean_delta_solid_fraction`: `mean(comp >= 1) - mean(source >= 1)` verifying non-trivial compaction.
+      - `changed_voxel_fraction_vs_source`: `mean(comp != source)` detecting no-op / identity-copy behaviour.
+      - `solid_dice_vs_source`: Solid-phase Dice directly between `source` and `compressed` output.
+      - `is_near_identity_copy`: `True` when `not is_target_same_as_source` yet fewer than `1%` of voxels
+        changed and `|mean_delta_solid_fraction| < 0.005` (flags under-trained / weak-guidance no-op inversion).
     """
     src = np.asarray(source_volumes)
     cmp = np.asarray(compressed_volumes)
@@ -355,18 +361,21 @@ def compute_virtual_compression_fidelity(
     if cmp.ndim == 3:
         cmp = cmp[np.newaxis, ...]
 
+    def _solid_dice_batch(a_arr: np.ndarray, b_arr: np.ndarray) -> float:
+        dices: list[float] = []
+        for a_v, b_v in zip(a_arr, b_arr):
+            a_b = a_v >= 1
+            b_b = b_v >= 1
+            denom = int(a_b.sum()) + int(b_b.sum())
+            dices.append(1.0 if denom == 0 else 2.0 * float(np.count_nonzero(a_b & b_b)) / float(denom))
+        return float(np.mean(dices)) if dices else float("nan")
+
     same_dice = float("nan")
     if same_load_reconstructions is not None:
         rec = np.asarray(same_load_reconstructions)
         if rec.ndim == 3:
             rec = rec[np.newaxis, ...]
-        dices: list[float] = []
-        for s_v, r_v in zip(src, rec):
-            s_b = s_v >= 1
-            r_b = r_v >= 1
-            denom = int(s_b.sum()) + int(r_b.sum())
-            dices.append(1.0 if denom == 0 else 2.0 * float(np.count_nonzero(s_b & r_b)) / float(denom))
-        same_dice = float(np.mean(dices)) if dices else float("nan")
+        same_dice = _solid_dice_batch(src, rec)
 
     def _corr2d(a: np.ndarray, b: np.ndarray) -> float:
         af = a.ravel().astype(np.float64)
@@ -395,11 +404,30 @@ def compute_virtual_compression_fidelity(
         if (np.isfinite(paired_mean) and np.isfinite(unpaired_mean))
         else float("nan")
     )
+    src_n = src[:n]
+    cmp_n = cmp[:n]
+    src_sf = float((src_n >= 1).mean()) if n > 0 else float("nan")
+    cmp_sf = float((cmp_n >= 1).mean()) if n > 0 else float("nan")
+    delta_sf = cmp_sf - src_sf if (np.isfinite(src_sf) and np.isfinite(cmp_sf)) else float("nan")
+    changed_frac = float((cmp_n != src_n).mean()) if n > 0 else float("nan")
+    dice_vs_src = _solid_dice_batch(src_n, cmp_n) if n > 0 else float("nan")
+    near_identity = bool(
+        (not is_target_same_as_source)
+        and np.isfinite(changed_frac)
+        and changed_frac < 0.01
+        and abs(delta_sf) < 0.005
+    )
     return {
         "same_load_solid_dice": same_dice,
         "paired_xy_column_corr": paired_mean,
         "unpaired_xy_column_corr": unpaired_mean,
         "xy_correlation_lift": lift,
+        "source_solid_fraction_mean": src_sf,
+        "compressed_solid_fraction_mean": cmp_sf,
+        "mean_delta_solid_fraction": delta_sf,
+        "changed_voxel_fraction_vs_source": changed_frac,
+        "solid_dice_vs_source": dice_vs_src,
+        "is_near_identity_copy": near_identity,
     }
 
 
