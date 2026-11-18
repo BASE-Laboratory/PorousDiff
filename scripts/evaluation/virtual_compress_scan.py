@@ -34,8 +34,17 @@ from porousdiff.metrics import (
     evaluate_volume_physics,
     export_openimpala_tiff,
 )
-from porousdiff.models import ContinuousLoadConditionedUNet, EMAModel, build_noise_scheduler
-from porousdiff.virtual_compression import virtual_compress_volumes
+from porousdiff.models import (
+    ContinuousLoadConditionedUNet,
+    EMAModel,
+    build_noise_scheduler,
+    infer_use_ordinal_material_channel,
+)
+from porousdiff.virtual_compression import (
+    check_load_extrapolation,
+    compute_virtual_compression_fidelity,
+    virtual_compress_volumes,
+)
 
 PHASE_CMAP = ListedColormap(["#0b0e14", "#38bdf8", "#facc15"])
 
@@ -83,7 +92,7 @@ def _save_virtual_panel(
         axes[1, col].set_title("XZ (Compression ↓)", fontsize=9)
         axes[1, col].axis("off")
 
-    fig.suptitle("Zero-Beamtime Virtual In-Situ Compression via DDIM ODE Inversion", fontsize=12)
+    fig.suptitle("Conditional DDIM Microstructure Transfer Across Compressive Loads", fontsize=12)
     fig.tight_layout()
     fig.savefig(png_path, dpi=240, bbox_inches="tight")
     fig.savefig(pdf_path, bbox_inches="tight")
@@ -93,7 +102,7 @@ def _save_virtual_panel(
 def main() -> None:
     proj_root = default_project_root()
     parser = argparse.ArgumentParser(
-        description="Virtually compress a real uncompressed 3D XCT scan to target stresses via DDIM ODE inversion"
+        description="Transfer a real low-load 3D XCT scan across target compressive loads via DDIM ODE inversion"
     )
     parser.add_argument("--input", type=Path, required=True, help="Input 3D segmented .npy or .tif scan")
     parser.add_argument("--experiment", default="beamtime_multiplier_96")
@@ -113,7 +122,7 @@ def main() -> None:
     )
     parser.add_argument("--voxel-size-um", type=float, default=0.0)
     parser.add_argument("--steps", type=int, default=50)
-    parser.add_argument("--invert-strength", type=float, default=0.85)
+    parser.add_argument("--invert-strength", type=float, default=0.60)
     parser.add_argument("--guidance-scale", type=float, default=1.5)
     parser.add_argument("--export-openimpala", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
@@ -159,6 +168,7 @@ def main() -> None:
         num_phases=num_phases,
         num_materials=num_materials,
         ref_voxel_size_um=ref_vox,
+        use_ordinal_material_channel=infer_use_ordinal_material_channel(saved),
     ).to(device)
     if "ema" in saved:
         ema = EMAModel(model)
@@ -177,6 +187,18 @@ def main() -> None:
 
     source_vol = _load_input_volume(args.input)
     target_loads = [float(x.strip()) for x in args.target_loads.split(",") if x.strip()]
+    extrap = check_load_extrapolation(
+        [float(args.source_load), *target_loads],
+        float(cfg["load_min"]),
+        float(cfg["load_max"]),
+    )
+    if bool(extrap["is_extrapolated"]):
+        print(
+            f"Warning: Requested loads {extrap['extrapolated_loads']} extrapolate outside trained range "
+            f"[{extrap['load_min']}, {extrap['load_max']}] ({unit_label}).",
+            flush=True,
+        )
+
     mat_id = resolve_material_id(args.material) if num_materials > 1 else 0
     use_amp = device.type == "cuda"
     amp_dtype = (
@@ -185,12 +207,13 @@ def main() -> None:
         else torch.float16
     )
 
-    compressed = virtual_compress_volumes(
+    all_eval_loads = list(dict.fromkeys([float(args.source_load), *target_loads]))
+    all_compressed = virtual_compress_volumes(
         model=active_model,
         alphas_cumprod=scheduler.alphas_cumprod,
         source_volumes=source_vol,
         source_load=args.source_load,
-        target_loads=target_loads,
+        target_loads=all_eval_loads,
         prediction_type=str(cfg["prediction_type"]),
         num_steps=args.steps,
         invert_strength=args.invert_strength,
@@ -201,6 +224,8 @@ def main() -> None:
         use_amp=use_amp,
         amp_dtype=amp_dtype,
     )
+    same_load_vol = all_compressed[float(args.source_load)]
+    compressed = {float(tl): all_compressed[float(tl)] for tl in target_loads}
 
     out_dir = (
         args.out_dir
@@ -210,12 +235,19 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, object]] = []
+    fidelity_by_load: dict[str, dict[str, float]] = {}
     eval_fn = evaluate_multiphase_physics if num_phases == 3 else evaluate_volume_physics
     src_phys = eval_fn(source_vol, voxel_size=vox_um)
+    src_fid = compute_virtual_compression_fidelity(
+        source_vol, same_load_vol, same_load_reconstructions=same_load_vol
+    )
     src_row: dict[str, object] = {
         "kind": "real_source",
         "load_value": args.source_load,
+        "load_unit": unit_label,
         "material": args.material,
+        "same_load_solid_dice": round(float(src_fid["same_load_solid_dice"]), 6),
+        "paired_xy_column_corr": 1.0,
     }
     src_row.update({k: round(float(v), 6) if np.isfinite(v) else float("nan") for k, v in src_phys.items()})
     rows.append(src_row)
@@ -230,10 +262,17 @@ def main() -> None:
                 preserve_multiphase=(num_phases == 3),
             )
         phys = eval_fn(vol, voxel_size=vox_um)
+        fid = compute_virtual_compression_fidelity(
+            source_vol, vol, same_load_reconstructions=same_load_vol
+        )
+        fidelity_by_load[f"{lv:g}"] = fid
         row: dict[str, object] = {
             "kind": "virtual_compressed",
             "load_value": lv,
+            "load_unit": unit_label,
             "material": args.material,
+            "same_load_solid_dice": round(float(fid["same_load_solid_dice"]), 6),
+            "paired_xy_column_corr": round(float(fid["paired_xy_column_corr"]), 6),
         }
         row.update({k: round(float(v), 6) if np.isfinite(v) else float("nan") for k, v in phys.items()})
         rows.append(row)
@@ -243,7 +282,15 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    (out_dir / "virtual_compression_summary.json").write_text(json.dumps(rows, indent=2))
+    summary_payload = {
+        "load_unit": unit_label,
+        "invert_strength": float(args.invert_strength),
+        "extrapolation_check": extrap,
+        "same_load_solid_dice": round(float(src_fid["same_load_solid_dice"]), 6),
+        "fidelity_by_load": fidelity_by_load,
+        "records": rows,
+    }
+    (out_dir / "virtual_compression_summary.json").write_text(json.dumps(summary_payload, indent=2))
     _save_virtual_panel(
         source_vol=source_vol,
         source_load=args.source_load,

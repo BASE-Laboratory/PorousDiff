@@ -30,12 +30,19 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch
 
-from porousdiff.baselines import affine_z_compress_to_target, pillar_pore_deletion_compress
+from porousdiff.baselines import (
+    affine_z_compress_to_target,
+    compute_mirror_tiled_fraction,
+    pillar_pore_deletion_compress,
+)
 from porousdiff.data import (
     default_project_root,
     load_split_patches,
+    load_tall_or_split_patches,
     resolve_material_id,
     resolve_patch_split_dir,
+    resolve_scan_load_value,
+    resolve_use_stress_kpa_from_checkpoints,
 )
 from porousdiff.losses import compute_coating_retention_diagnostics
 from porousdiff.metrics import (
@@ -44,14 +51,23 @@ from porousdiff.metrics import (
     export_openimpala_tiff,
     summarize_metric_records,
 )
-from porousdiff.models import ContinuousLoadConditionedUNet, EMAModel, build_noise_scheduler
+from porousdiff.models import (
+    ContinuousLoadConditionedUNet,
+    EMAModel,
+    build_noise_scheduler,
+    infer_use_ordinal_material_channel,
+)
 from porousdiff.preprocessing import infer_material_name, parse_load_value
 from porousdiff.transport_and_xrd import (
     correlate_xrd_with_microstructure,
     generate_openimpala_job_suite,
     parse_openimpala_results,
 )
-from porousdiff.virtual_compression import virtual_compress_volumes
+from porousdiff.virtual_compression import (
+    check_load_extrapolation,
+    compute_virtual_compression_fidelity,
+    virtual_compress_volumes,
+)
 
 
 def _load_generated_volumes(samples_dir: Path, state_name: str) -> np.ndarray:
@@ -113,6 +129,11 @@ def main() -> None:
     parser.add_argument("--heldout-states", nargs="*", default=None)
     parser.add_argument("--include-repeats", action="store_true")
     parser.add_argument("--beamline", default=None, help="Optional beamline filter (e.g. DLS_K11_DIAD)")
+    parser.add_argument(
+        "--use-stress-kpa",
+        action="store_true",
+        help="Fallback load unit when no checkpoint exists under --output-root (otherwise read from checkpoint config)",
+    )
     parser.add_argument("--max-real-samples", type=int, default=20)
     parser.add_argument("--max-openimpala-per-method", type=int, default=5)
     parser.add_argument("--voxel-size-um", type=float, default=1.0)
@@ -121,6 +142,12 @@ def main() -> None:
         "--generate-openimpala-suite",
         action="store_true",
         help="Generate OpenImpala INI configs and run_openimpala_batch.sh across Real, Baselines & PorousDiff",
+    )
+    parser.add_argument(
+        "--openimpala-template-ini",
+        type=Path,
+        default=None,
+        help="Optional user OpenImpala INI template with {tiff_path}, {phase}, {transport_phase}, {output_prefix}",
     )
     parser.add_argument(
         "--xrd-csv",
@@ -135,7 +162,7 @@ def main() -> None:
     )
     parser.add_argument("--checkpoint", type=Path, default=None, help="Optional checkpoint override for --include-virtual-compression")
     parser.add_argument("--virtual-steps", type=int, default=40)
-    parser.add_argument("--invert-strength", type=float, default=0.85)
+    parser.add_argument("--invert-strength", type=float, default=0.60)
     parser.add_argument("--guidance-scale", type=float, default=1.5)
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -151,6 +178,14 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     heldout_set = set(args.heldout_states or [])
 
+    use_kpa, _ = resolve_use_stress_kpa_from_checkpoints(
+        output_root=args.output_root,
+        experiments=list(exp_map.values()),
+        explicit_checkpoint=args.checkpoint,
+        default=args.use_stress_kpa,
+    )
+    unit_label = "kPa" if use_kpa else "mV/V"
+
     # Build state specification list grouped by (material, beamline)
     state_specs: list[dict[str, object]] = []
     if args.manifest_json is not None:
@@ -161,12 +196,13 @@ def main() -> None:
             sc_beam = str(sc.get("beamline", "primary"))
             if args.beamline and sc_beam != args.beamline:
                 continue
+            lv_resolved = resolve_scan_load_value(sc, use_kpa)
             state_specs.append(
                 {
                     "state": str(sc["state"]),
                     "material": str(sc.get("material", "virgin_carbon")),
                     "beamline": sc_beam,
-                    "load_value": float(sc.get("stress_kpa") or sc["load_mv_per_v"]),
+                    "load_value": lv_resolved,
                     "voxel_size_um": float(sc.get("effective_voxel_size_um", args.voxel_size_um)),
                     "num_phases": int(sc.get("num_phases", 2)),
                     "patch_dir_name": sc.get("patch_dir_name"),
@@ -202,6 +238,7 @@ def main() -> None:
     rng = np.random.default_rng(args.seed)
     expected_shape = (args.patch_size, args.patch_size, args.patch_size)
     real_cache: dict[str, np.ndarray] = {}
+    tall_ref_cache: dict[str, np.ndarray] = {}
     lowest_state_by_group: dict[tuple[str, str], str] = {}
     lowest_load_by_group: dict[tuple[str, str], float] = {}
 
@@ -219,12 +256,18 @@ def main() -> None:
             idx = np.sort(rng.choice(vols.shape[0], size=args.max_real_samples, replace=False))
             vols = vols[idx]
         real_cache[st] = vols
+        tall_vols = load_tall_or_split_patches(split_dir, vols)
+        if tall_vols.shape[0] > args.max_real_samples:
+            tall_vols = tall_vols[: args.max_real_samples]
+        tall_ref_cache[st] = tall_vols
         if (mat, beam) not in lowest_state_by_group:
             lowest_state_by_group[(mat, beam)] = st
             lowest_load_by_group[(mat, beam)] = lv
 
-    # Optional: Virtual in-situ compression of real uncompressed scans via DDIM ODE inversion
+    # Optional: Virtual compression of real lowest-load scans via DDIM ODE inversion
     virtual_cache_by_state: dict[str, np.ndarray] = {}
+    vc_same_load_by_group: dict[tuple[str, str], np.ndarray] = {}
+    vc_extrap_by_group: dict[tuple[str, str], dict[str, object]] = {}
     if args.include_virtual_compression:
         if torch.cuda.is_available():
             vc_device = torch.device("cuda")
@@ -261,6 +304,7 @@ def main() -> None:
             num_phases=int(vc_cfg.get("num_phases", 2)),
             num_materials=vc_num_materials,
             ref_voxel_size_um=float(vc_cfg.get("ref_voxel_size_um", 1.0)),
+            use_ordinal_material_channel=infer_use_ordinal_material_channel(saved_ckpt),
         ).to(vc_device)
         if "ema" in saved_ckpt:
             vc_ema = EMAModel(vc_model)
@@ -291,7 +335,12 @@ def main() -> None:
             ref_st = lowest_state_by_group[(mat, beam)]
             ref_lv = lowest_load_by_group[(mat, beam)]
             ref_vols = real_cache[ref_st]
-            target_lvs = [float(sp["load_value"]) for sp in grp_specs]  # type: ignore[arg-type]
+            target_lvs = list(
+                dict.fromkeys([ref_lv, *[float(sp["load_value"]) for sp in grp_specs]])  # type: ignore[arg-type]
+            )
+            vc_extrap_by_group[(mat, beam)] = check_load_extrapolation(
+                target_lvs, float(vc_cfg["load_min"]), float(vc_cfg["load_max"])
+            )
             mat_id = resolve_material_id(mat) if vc_num_materials > 1 else 0
             vox_um = float(grp_specs[0]["voxel_size_um"])  # type: ignore[arg-type]
             vc_map = virtual_compress_volumes(
@@ -310,6 +359,7 @@ def main() -> None:
                 use_amp=vc_use_amp,
                 amp_dtype=vc_amp_dtype,
             )
+            vc_same_load_by_group[(mat, beam)] = vc_map[ref_lv]
             for sp in grp_specs:
                 st_k = str(sp["state"])
                 lv_k = float(sp["load_value"])  # type: ignore[arg-type]
@@ -363,15 +413,22 @@ def main() -> None:
         real_s2 = _mean_s2_curves(real_vols, max_lag=max_lag)
         target_sf = float(real_sum["solid_fraction"]["mean"])
 
-        # Construct literature Z-compression baselines from uncompressed scan of same (material, beamline)
+        # Construct literature Z-compression baselines from tall clean uncompressed real sub-volumes
         ref_st = lowest_state_by_group[(mat, beam)]
-        ref_vols = real_cache[ref_st]
+        base_src_vols = tall_ref_cache[ref_st]
+        phi_0_src = float((base_src_vols >= 1).mean())
+        mirror_frac = compute_mirror_tiled_fraction(
+            source_depth=int(base_src_vols.shape[1]),
+            output_depth=args.patch_size,
+            initial_solid_fraction=phi_0_src,
+            target_solid_fraction=max(target_sf, 1e-3),
+        )
         affine_vols = np.stack(
             [
                 affine_z_compress_to_target(
                     rv, target_solid_fraction=max(target_sf, 1e-3), output_depth=args.patch_size
                 )
-                for rv in ref_vols
+                for rv in base_src_vols
             ],
             axis=0,
         )
@@ -383,7 +440,7 @@ def main() -> None:
                     output_depth=args.patch_size,
                     rng=np.random.default_rng(args.seed + i),
                 )
-                for i, rv in enumerate(ref_vols)
+                for i, rv in enumerate(base_src_vols)
             ],
             axis=0,
         )
@@ -434,9 +491,15 @@ def main() -> None:
                 "material": mat,
                 "beamline": beam,
                 "load_value": lv,
+                "load_unit": unit_label,
                 "is_heldout": is_heldout,
                 "method": m_name,
                 "s2_rmse": round(s2_err, 6),
+                "baseline_mirror_tiled_fraction": (
+                    round(mirror_frac, 6)
+                    if m_name in ("affine_z_squash", "pillar_pore_deletion")
+                    else 0.0
+                ),
             }
             for km in key_metrics:
                 r_mu = real_sum[km]["mean"]
@@ -450,16 +513,34 @@ def main() -> None:
                 )
             csv_rows.append(row)
 
-        report[st] = {
+        st_entry: dict[str, object] = {
             "material": mat,
             "beamline": beam,
             "load_value": lv,
+            "load_unit": unit_label,
             "voxel_size_um": vox,
             "is_heldout": is_heldout,
             "reference_uncompressed_state": ref_st,
+            "baseline_source_depth": int(base_src_vols.shape[1]),
+            "baseline_mirror_tiled_fraction": round(mirror_frac, 6),
+            "baseline_oracle_porosity_note": (
+                "Affine and pillar baselines receive the held-out target solid_fraction by construction; "
+                "evaluate morphological fidelity via S2(r), chord anisotropy, EASA/TPB, and tortuosity."
+            ),
             "real": {"num_volumes": int(real_vols.shape[0]), "metrics": real_sum},
             "methods": methods_summary,
         }
+        if st in virtual_cache_by_state:
+            vc_diag = dict(
+                compute_virtual_compression_fidelity(
+                    source_volumes=real_cache[ref_st],
+                    compressed_volumes=virtual_cache_by_state[st],
+                    same_load_reconstructions=vc_same_load_by_group.get((mat, beam)),
+                )
+            )
+            vc_diag.update(vc_extrap_by_group.get((mat, beam), {}))
+            st_entry["virtual_compression_diagnostics"] = vc_diag
+        report[st] = st_entry
         print(
             f"[{st} | {mat} ({beam}) | heldout={is_heldout}] real φ_s={target_sf:.4f} | "
             + " | ".join(
@@ -486,6 +567,8 @@ def main() -> None:
         suite_info = generate_openimpala_job_suite(
             tiff_entries=openimpala_entries,
             suite_dir=out_dir / "openimpala_suite",
+            template_ini=args.openimpala_template_ini,
+            include_hetero_solid=True,
         )
         print(
             f"Generated OpenImpala batch suite ({suite_info['num_jobs']} jobs) -> {suite_info['script_path']}",
@@ -543,7 +626,7 @@ def main() -> None:
                 ax.plot(mx, my, style, color=palette[m_i % len(palette)], lw=1.5, label=m_name)
 
             ax.set_title(f"{mat} — {m_label}", fontsize=10)
-            ax.set_xlabel("Load / Stress")
+            ax.set_xlabel(f"Compressive Load / Stress ({unit_label})")
             ax.grid(True, alpha=0.3)
             if r_idx == 0 and c_idx == 0:
                 ax.legend(fontsize=8)

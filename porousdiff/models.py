@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import inspect
 import math
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import torch
 import torch.nn as nn
@@ -221,6 +221,7 @@ class ContinuousLoadConditionedUNet(nn.Module):
         num_phases: int = 2,
         num_materials: int = 1,
         ref_voxel_size_um: float = 1.0,
+        use_ordinal_material_channel: bool = False,
     ) -> None:
         super().__init__()
         if load_max <= load_min:
@@ -242,10 +243,11 @@ class ContinuousLoadConditionedUNet(nn.Module):
         self.num_materials = num_materials
         self.data_channels = 1 if num_phases == 2 else 2
         self.is_multimodal = (num_phases == 3) or (num_materials > 1)
+        self.use_ordinal_material_channel = bool(use_ordinal_material_channel)
 
         unet_params = inspect.signature(DiffusionModelUNet.__init__).parameters
         if conditioning_mode == "multiscale_fourier":
-            aux_channels = 4 if self.is_multimodal else 2
+            aux_channels = (4 if self.use_ordinal_material_channel else 3) if self.is_multimodal else 2
             unet_kwargs: dict[str, object] = {
                 "spatial_dims": 3,
                 "in_channels": self.data_channels + aux_channels,
@@ -350,7 +352,8 @@ class ContinuousLoadConditionedUNet(nn.Module):
             packed_labels = torch.stack([cond_norm, mask], dim=-1)
             return self.unet(x=unet_in, timesteps=timesteps, class_labels=packed_labels)
 
-        # Multi-modal / 3-phase forward path
+        # Multi-modal / 3-phase forward path: material chemistry conditioned purely via
+        # learned categorical embedding in MultiModalConditionEmbedder unless legacy flag set.
         if material_ids is None:
             mats = torch.zeros(b, device=x.device, dtype=torch.long)
         else:
@@ -372,10 +375,13 @@ class ContinuousLoadConditionedUNet(nn.Module):
             return self.unet(x=x, timesteps=timesteps, context=ctx)
 
         c_load = (cond_norm * mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
-        c_mat = (mat_norm * mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
         c_vox = (log_vox * mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
         c_msk = mask.to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
-        unet_in = torch.cat([x, c_load, c_mat, c_vox, c_msk], dim=1)
+        if self.use_ordinal_material_channel:
+            c_mat = (mat_norm * mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
+            unet_in = torch.cat([x, c_load, c_mat, c_vox, c_msk], dim=1)
+        else:
+            unet_in = torch.cat([x, c_load, c_vox, c_msk], dim=1)
 
         packed_mm = torch.stack([cond_norm, mats.float(), log_vox, mask], dim=-1)
         return self.unet(x=unet_in, timesteps=timesteps, class_labels=packed_mm)
@@ -466,3 +472,20 @@ class EMAModel:
         self.decay = float(state["decay"])  # type: ignore[arg-type]
         self.num_updates = int(state["num_updates"])  # type: ignore[arg-type]
         self.shadow_model.load_state_dict(state["shadow_state_dict"])  # type: ignore[arg-type]
+
+
+def infer_use_ordinal_material_channel(saved_payload: Mapping[str, object]) -> bool:
+    """Resolve `use_ordinal_material_channel` from checkpoint config or state_dict input channels."""
+    cfg = saved_payload.get("config", {})
+    if isinstance(cfg, Mapping) and "use_ordinal_material_channel" in cfg:
+        return bool(cfg["use_ordinal_material_channel"])
+
+    num_phases = int(cfg.get("num_phases", 2)) if isinstance(cfg, Mapping) else 2  # type: ignore[arg-type]
+    data_ch = 1 if num_phases == 2 else 2
+    model_sd = saved_payload.get("model", {})
+    if isinstance(model_sd, Mapping):
+        for k, v in model_sd.items():
+            if str(k).endswith("conv_in.conv.weight") and isinstance(v, torch.Tensor) and v.ndim == 5:
+                return int(v.shape[1]) == data_ch + 4
+    return False
+

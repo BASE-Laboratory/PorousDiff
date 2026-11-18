@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
 import tifffile
 from scipy.ndimage import label
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import dijkstra
 
 
 def validate_binary_volume(volume: np.ndarray) -> np.ndarray:
@@ -163,49 +166,86 @@ def connectivity_and_percolation(volume: np.ndarray) -> dict[str, float]:
     }
 
 
-def geodesic_pore_tortuosity(volume: np.ndarray, axis: int = 0) -> float:
-    """Fast vectorized 6-connected shortest-path geodesic tortuosity across `axis`.
+def _slice_pair(length: int, delta: int) -> tuple[slice, slice]:
+    if delta > 0:
+        return slice(0, length - delta), slice(delta, length)
+    if delta < 0:
+        return slice(-delta, length), slice(0, length + delta)
+    return slice(0, length), slice(0, length)
 
-    Returns `nan` if the pore space does not percolate from inlet (`0`) to outlet (`L - 1`).
+
+def geodesic_pore_tortuosity(
+    volume: np.ndarray,
+    axis: int = 0,
+    connectivity: int = 26,
+) -> float:
+    """26-connected Euclidean shortest-path geometric tortuosity across `axis`.
+
+    Uses exact `1.0`, `sqrt(2)`, and `sqrt(3)` voxel-center Euclidean step weights
+    via compiled Cython `scipy.sparse.csgraph.dijkstra` (eliminating the `~40%` Manhattan
+    staircase bias on diagonal `45 deg` channels while returning `nan` when non-percolating).
     """
+    if connectivity not in (6, 26):
+        raise ValueError(f"connectivity must be 6 or 26, got {connectivity}")
     vol = validate_binary_volume(volume)
     pore = np.moveaxis(vol == 0, axis, 0)
-    depth = pore.shape[0]
+    depth, height, width = pore.shape
     if depth < 2:
         return 1.0
-
-    dist = np.full(pore.shape, -1, dtype=np.int32)
-    frontier = np.zeros_like(pore, dtype=bool)
-    frontier[0] = pore[0]
-    if not frontier[0].any():
+    if not (pore[0].any() and pore[-1].any()):
         return float("nan")
 
-    dist[frontier] = 0
-    unvisited = pore & (~frontier)
+    idx_map = np.full(pore.shape, -1, dtype=np.int32)
+    n_pore = int(np.count_nonzero(pore))
+    idx_map[pore] = np.arange(n_pore, dtype=np.int32)
 
-    step = 0
-    max_steps = pore.size
-    while step < max_steps:
-        step += 1
-        nxt = np.zeros_like(frontier)
-        nxt[1:, :, :] |= frontier[:-1, :, :]
-        nxt[:-1, :, :] |= frontier[1:, :, :]
-        nxt[:, 1:, :] |= frontier[:, :-1, :]
-        nxt[:, :-1, :] |= frontier[:, 1:, :]
-        nxt[:, :, 1:] |= frontier[:, :, :-1]
-        nxt[:, :, :-1] |= frontier[:, :, 1:]
-        nxt &= unvisited
-        if not nxt.any():
-            break
-        dist[nxt] = step
-        unvisited &= ~nxt
-        frontier = nxt
+    inlet_ids = idx_map[0][idx_map[0] >= 0]
+    outlet_ids = idx_map[-1][idx_map[-1] >= 0]
+    if inlet_ids.size == 0 or outlet_ids.size == 0:
+        return float("nan")
 
-    outlet = dist[-1]
-    reached = outlet[outlet >= 0]
+    forward_offsets: list[tuple[int, int, int, float]] = []
+    for dz in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if (dz, dy, dx) == (0, 0, 0):
+                    continue
+                if dz < 0 or (dz == 0 and dy < 0) or (dz == 0 and dy == 0 and dx < 0):
+                    continue
+                norm_sq = dz * dz + dy * dy + dx * dx
+                if connectivity == 6 and norm_sq > 1:
+                    continue
+                forward_offsets.append((dz, dy, dx, math.sqrt(float(norm_sq))))
+
+    rows_list: list[np.ndarray] = [np.full(inlet_ids.shape, n_pore, dtype=np.int32)]
+    cols_list: list[np.ndarray] = [inlet_ids]
+    weights_list: list[np.ndarray] = [np.zeros(inlet_ids.shape, dtype=np.float32)]
+
+    for dz, dy, dx, step_w in forward_offsets:
+        sz0, sz1 = _slice_pair(depth, dz)
+        sy0, sy1 = _slice_pair(height, dy)
+        sx0, sx1 = _slice_pair(width, dx)
+        u = idx_map[sz0, sy0, sx0]
+        v = idx_map[sz1, sy1, sx1]
+        valid = (u >= 0) & (v >= 0)
+        if np.any(valid):
+            u_v = u[valid]
+            v_v = v[valid]
+            rows_list.append(u_v)
+            cols_list.append(v_v)
+            weights_list.append(np.full(u_v.shape, step_w, dtype=np.float32))
+
+    rows = np.concatenate(rows_list)
+    cols = np.concatenate(cols_list)
+    wts = np.concatenate(weights_list)
+    graph = coo_matrix((wts, (rows, cols)), shape=(n_pore + 1, n_pore + 1)).tocsr()
+
+    dists = dijkstra(csgraph=graph, directed=False, indices=n_pore)
+    outlet_dists = dists[outlet_ids]
+    reached = outlet_dists[np.isfinite(outlet_dists)]
     if reached.size == 0:
         return float("nan")
-    return float(reached.mean() / (depth - 1))
+    return float(reached.mean() / float(depth - 1))
 
 
 def _count_tpb_edges_along_axis(vol: np.ndarray, axis: int) -> int:
@@ -233,6 +273,7 @@ def multiphase_interfacial_metrics(volume: np.ndarray, voxel_size: float = 1.0) 
       - `ssa_carbon_coating`: Electronic current-collector/coating contact area (1/voxel_size)
       - `tpb_density`: Triple-Phase Boundary length per unit volume (1/voxel_size^2)
       - `wired_coating_fraction`: Fraction of active coating electrically wired to Z boundaries
+      - `specific_z_pinch_excess`: Z-contact probability divided by `solid_fraction^2`
     """
     if voxel_size <= 0:
         raise ValueError("voxel_size must be positive")
@@ -244,6 +285,7 @@ def multiphase_interfacial_metrics(volume: np.ndarray, voxel_size: float = 1.0) 
     area_norm = n_voxels * voxel_size
     carbon_frac = float((vol == 1).mean())
     coat_frac = float((vol == 2).mean())
+    solid_frac = carbon_frac + coat_frac
 
     def _pair_faces(a: int, b: int) -> float:
         total = 0
@@ -283,6 +325,11 @@ def multiphase_interfacial_metrics(volume: np.ndarray, voxel_size: float = 1.0) 
     solid_mask = vol >= 1
     z_solid_faces = int(np.count_nonzero(solid_mask[1:, :, :] & solid_mask[:-1, :, :]))
     z_pinch_density = float(z_solid_faces) / area_norm
+    n_z_pairs = max(1, (vol.shape[0] - 1) * vol.shape[1] * vol.shape[2])
+    z_pair_prob = float(z_solid_faces) / float(n_z_pairs)
+    specific_z_pinch_excess = (
+        z_pair_prob / max(solid_frac**2, 1e-6) if solid_frac > 1e-6 else 0.0
+    )
 
     if total_coat == 0 or vol.shape[0] < 3:
         coat_pinch_frac = 0.0
@@ -314,6 +361,7 @@ def multiphase_interfacial_metrics(volume: np.ndarray, voxel_size: float = 1.0) 
         "tpb_density": tpb_density,
         "wired_coating_fraction": wired_frac,
         "z_pinch_contact_density": z_pinch_density,
+        "specific_z_pinch_excess": specific_z_pinch_excess,
         "coating_pinch_fraction": coat_pinch_frac,
         "mean_coating_coordination": mean_coat_coord,
     }

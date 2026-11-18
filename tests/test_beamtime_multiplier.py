@@ -13,7 +13,7 @@ import torch
 from porousdiff.baselines import affine_z_compress_to_target, pillar_pore_deletion_compress
 from porousdiff.data import decode_channels_to_phases, encode_phases_to_channels
 from porousdiff.metrics import evaluate_multiphase_physics, export_openimpala_tiff
-from porousdiff.models import ContinuousLoadConditionedUNet, build_noise_scheduler
+from porousdiff.models import ContinuousLoadConditionedUNet
 from porousdiff.preprocessing import (
     CalibrationMetadata,
     calibrate_multiphase_thresholds,

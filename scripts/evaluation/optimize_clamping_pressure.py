@@ -35,11 +35,19 @@ from porousdiff.data import (
     decode_channels_to_phases,
     default_project_root,
     load_split_patches,
+    load_tall_or_split_patches,
     resolve_material_id,
     resolve_patch_split_dir,
+    resolve_scan_load_value,
+    resolve_use_stress_kpa_from_checkpoints,
 )
 from porousdiff.metrics import evaluate_multiphase_physics
-from porousdiff.models import ContinuousLoadConditionedUNet, EMAModel, build_noise_scheduler
+from porousdiff.models import (
+    ContinuousLoadConditionedUNet,
+    EMAModel,
+    build_noise_scheduler,
+    infer_use_ordinal_material_channel,
+)
 from porousdiff.optimization import (
     compute_transport_and_fom_record,
     find_optimal_clamping_pressure,
@@ -159,6 +167,11 @@ def main() -> None:
     parser.add_argument("--voxel-size-um", type=float, default=1.0)
     parser.add_argument("--include-repeats", action="store_true")
     parser.add_argument("--beamline", default=None)
+    parser.add_argument(
+        "--use-stress-kpa",
+        action="store_true",
+        help="Fallback load unit when no checkpoint exists under --output-root (otherwise read from checkpoint config)",
+    )
     parser.add_argument("--max-real-samples", type=int, default=20)
     parser.add_argument(
         "--openimpala-csv",
@@ -173,6 +186,12 @@ def main() -> None:
     )
     parser.add_argument("--dense-sweep-points", type=int, default=0, help=">0 runs continuous intermediate PorousDiff stress sweep")
     parser.add_argument("--dense-samples-per-load", type=int, default=4)
+    parser.add_argument(
+        "--uncompressed-thickness-cm",
+        type=float,
+        default=0.30,
+        help="Uncompressed felt thickness L_0 in cm (default 0.30 cm = 3.0 mm) for 1D Newman ASR",
+    )
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=1.5)
@@ -195,6 +214,13 @@ def main() -> None:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    use_kpa, _ = resolve_use_stress_kpa_from_checkpoints(
+        output_root=args.output_root,
+        experiments=list(exp_map.values()),
+        explicit_checkpoint=args.checkpoint,
+        default=args.use_stress_kpa,
+    )
+
     auto_oi_csv = (
         args.openimpala_csv
         if args.openimpala_csv is not None
@@ -212,12 +238,15 @@ def main() -> None:
             sc_beam = str(sc.get("beamline", "primary"))
             if args.beamline and sc_beam != args.beamline:
                 continue
+            lv_resolved = resolve_scan_load_value(sc, use_kpa)
+            raw_sz = sc.get("strain_z")
             state_specs.append(
                 {
                     "state": str(sc["state"]),
                     "material": str(sc.get("material", "virgin_carbon")),
                     "beamline": sc_beam,
-                    "load_value": float(sc.get("stress_kpa") or sc["load_mv_per_v"]),
+                    "load_value": lv_resolved,
+                    "strain_z": float(raw_sz) if raw_sz is not None else None,
                     "voxel_size_um": float(sc.get("effective_voxel_size_um", args.voxel_size_um)),
                     "patch_dir_name": sc.get("patch_dir_name"),
                 }
@@ -236,6 +265,7 @@ def main() -> None:
                     "material": infer_material_name(st),
                     "beamline": args.beamline or "primary",
                     "load_value": lv,
+                    "strain_z": None,
                     "voxel_size_um": args.voxel_size_um,
                     "patch_dir_name": None,
                 }
@@ -258,6 +288,7 @@ def main() -> None:
                         "material": str(row.get("material", infer_material_name(st))),
                         "beamline": "primary",
                         "load_value": float(row["load_value"]),
+                        "strain_z": None,
                         "voxel_size_um": float(row.get("voxel_size_um", args.voxel_size_um)),
                         "patch_dir_name": None,
                     }
@@ -272,6 +303,7 @@ def main() -> None:
 
     have_real_data = args.data_root is not None and args.data_root.is_dir()
     real_cache: dict[str, np.ndarray] = {}
+    tall_real_cache: dict[str, np.ndarray] = {}
     lowest_state_by_mat: dict[str, str] = {}
 
     if have_real_data:
@@ -284,37 +316,79 @@ def main() -> None:
                     args.data_root, st, args.patch_size, args.version, "val", patch_dir_name=pdir_hint  # type: ignore[arg-type]
                 )
                 vols = load_split_patches(split_dir, expected_shape=expected_shape)
-            except FileNotFoundError:
+            except (FileNotFoundError, RuntimeError):
                 continue
             if vols.shape[0] > args.max_real_samples:
                 idx = np.sort(rng.choice(vols.shape[0], size=args.max_real_samples, replace=False))
                 vols = vols[idx]
             real_cache[st] = vols
+            tall_vols = load_tall_or_split_patches(split_dir, vols)
+            if tall_vols.shape[0] > args.max_real_samples:
+                tall_vols = tall_vols[: args.max_real_samples]
+            tall_real_cache[st] = tall_vols
             if mat not in lowest_state_by_mat:
                 lowest_state_by_mat[mat] = st
+
+    # Verify per-(material, method) OpenImpala coverage so curves never mix partial OpenImpala + surrogate
+    oi_method_complete: dict[tuple[str, str], bool] = {}
+    if oi_lookup:
+        mat_to_real_states: dict[str, list[str]] = {}
+        mat_to_exp_states: dict[tuple[str, str], list[str]] = {}
+        for sp in state_specs:
+            st = str(sp["state"])
+            mat = str(sp["material"])
+            if st in real_cache:
+                mat_to_real_states.setdefault(mat, []).append(st)
+            for lbl, exp_name in exp_map.items():
+                if (args.output_root / "results" / exp_name / "samples" / st).is_dir():
+                    mat_to_exp_states.setdefault((mat, lbl), []).append(st)
+
+        def _check_oi_complete(mat_k: str, meth_k: str, states_list: list[str]) -> None:
+            if not states_list:
+                return
+            cov = sum(1 for st_k in states_list if (meth_k, st_k) in oi_lookup)
+            if cov == len(states_list):
+                oi_method_complete[(mat_k, meth_k)] = True
+            else:
+                oi_method_complete[(mat_k, meth_k)] = False
+                if cov > 0:
+                    print(
+                        f"Warning: OpenImpala results cover only {cov}/{len(states_list)} states for "
+                        f"({mat_k}, {meth_k}); falling back to uniform 26-connected geodesic estimator "
+                        "across all loads to avoid mixing two transport estimators.",
+                        flush=True,
+                    )
+
+        for mat_k, r_sts in mat_to_real_states.items():
+            for meth_k in ("real", "affine_z_squash", "pillar_pore_deletion"):
+                _check_oi_complete(mat_k, meth_k, r_sts)
+        for (mat_k, lbl_k), g_sts in mat_to_exp_states.items():
+            _check_oi_complete(mat_k, lbl_k, g_sts)
 
     for sp in state_specs:
         st = str(sp["state"])
         mat = str(sp["material"])
         lv = float(sp["load_value"])  # type: ignore[arg-type]
         vox = float(sp["voxel_size_um"])  # type: ignore[arg-type]
+        sz_opt = float(sp["strain_z"]) if sp.get("strain_z") is not None else None  # type: ignore[arg-type]
         mat_bucket = records_tree.setdefault(mat, {})
 
         if st in real_cache:
             r_vols = real_cache[st]
-            r_oi = oi_lookup.get(("real", st))
+            r_oi = oi_lookup.get(("real", st)) if oi_method_complete.get((mat, "real"), False) else None
             r_recs = [
                 compute_transport_and_fom_record(
                     evaluate_multiphase_physics(v, voxel_size=vox),
                     openimpala_metrics=r_oi,
                     voxel_size_um=vox,
+                    strain_z=sz_opt,
                 )
                 for v in r_vols
             ]
             mat_bucket.setdefault("real", {}).setdefault(lv, []).extend(r_recs)
 
             target_sf = float(np.mean([r["solid_fraction"] for r in r_recs]))
-            ref_vols = real_cache[lowest_state_by_mat[mat]]
+            ref_vols = tall_real_cache[lowest_state_by_mat[mat]]
             aff_vols = [
                 affine_z_compress_to_target(rv, target_solid_fraction=max(target_sf, 1e-3), output_depth=args.patch_size)
                 for rv in ref_vols
@@ -328,14 +402,23 @@ def main() -> None:
                 )
                 for i, rv in enumerate(ref_vols)
             ]
-            aff_oi = oi_lookup.get(("affine_z_squash", st))
-            pil_oi = oi_lookup.get(("pillar_pore_deletion", st))
+            aff_oi = (
+                oi_lookup.get(("affine_z_squash", st))
+                if oi_method_complete.get((mat, "affine_z_squash"), False)
+                else None
+            )
+            pil_oi = (
+                oi_lookup.get(("pillar_pore_deletion", st))
+                if oi_method_complete.get((mat, "pillar_pore_deletion"), False)
+                else None
+            )
             mat_bucket.setdefault("affine_z_squash", {}).setdefault(lv, []).extend(
                 [
                     compute_transport_and_fom_record(
                         evaluate_multiphase_physics(v, voxel_size=vox),
                         openimpala_metrics=aff_oi,
                         voxel_size_um=vox,
+                        strain_z=sz_opt,
                     )
                     for v in aff_vols
                 ]
@@ -346,6 +429,7 @@ def main() -> None:
                         evaluate_multiphase_physics(v, voxel_size=vox),
                         openimpala_metrics=pil_oi,
                         voxel_size_um=vox,
+                        strain_z=sz_opt,
                     )
                     for v in pil_vols
                 ]
@@ -355,12 +439,13 @@ def main() -> None:
             samples_dir = args.output_root / "results" / exp_name / "samples"
             if (samples_dir / st).is_dir():
                 g_vols = _load_generated_volumes(samples_dir, st)
-                g_oi = oi_lookup.get((lbl, st))
+                g_oi = oi_lookup.get((lbl, st)) if oi_method_complete.get((mat, lbl), False) else None
                 g_recs = [
                     compute_transport_and_fom_record(
                         evaluate_multiphase_physics(v, voxel_size=vox),
                         openimpala_metrics=g_oi,
                         voxel_size_um=vox,
+                        strain_z=sz_opt,
                     )
                     for v in g_vols
                 ]
@@ -400,6 +485,7 @@ def main() -> None:
             num_phases=int(cfg.get("num_phases", 2)),
             num_materials=num_materials,
             ref_voxel_size_um=float(cfg.get("ref_voxel_size_um", 1.0)),
+            use_ordinal_material_channel=infer_use_ordinal_material_channel(saved),
         ).to(device)
         if "ema" in saved:
             ema = EMAModel(model)
@@ -459,6 +545,7 @@ def main() -> None:
                 weights=weights,
                 n_bootstrap=args.bootstrap,
                 seed=args.seed,
+                uncompressed_thickness_cm=args.uncompressed_thickness_cm,
             )
             ns = real_opt["norm_scales"]  # type: ignore[index]
             ref_scales = (
@@ -473,6 +560,11 @@ def main() -> None:
             if "real" in mat_summary
             else float("nan")
         )
+        real_sigma_star_asr = (
+            float(mat_summary["real"]["newman_asr"]["optimal_load_asr"])  # type: ignore[index]
+            if "real" in mat_summary
+            else float("nan")
+        )
 
         for m_name, load_map in methods_map.items():
             if m_name == "real":
@@ -484,10 +576,15 @@ def main() -> None:
                     n_bootstrap=args.bootstrap,
                     seed=args.seed,
                     norm_scales=ref_scales,
+                    uncompressed_thickness_cm=args.uncompressed_thickness_cm,
                 )
                 if np.isfinite(real_sigma_star):
                     opt_res["abs_err_optimal_load_vs_real"] = round(
                         abs(float(opt_res["optimal_load"]) - real_sigma_star), 6
+                    )
+                if np.isfinite(real_sigma_star_asr):
+                    opt_res["abs_err_optimal_load_asr_vs_real"] = round(
+                        abs(float(opt_res["newman_asr"]["optimal_load_asr"]) - real_sigma_star_asr), 6  # type: ignore[index]
                     )
                 mat_summary[m_name] = opt_res
 
@@ -496,13 +593,17 @@ def main() -> None:
                     "material": mat,
                     "method": m_name,
                     "optimal_load_method": opt_res["optimal_load"],  # type: ignore[index]
+                    "optimal_load_asr_method": opt_res["newman_asr"]["optimal_load_asr"],  # type: ignore[index]
                 }
                 row.update(pt)
                 csv_rows.append(row)
 
+            asr_info = opt_res["newman_asr"]  # type: ignore[index]
             print(
-                f"[{mat} | {m_name}] sigma* = {opt_res['optimal_load']} "  # type: ignore[index]
-                f"(95% CI {opt_res['optimal_load_ci95']}) | FoM* = {opt_res['optimal_fom']}",  # type: ignore[index]
+                f"[{mat} | {m_name}] sigma* (FoM) = {opt_res['optimal_load']} "  # type: ignore[index]
+                f"(95% CI {opt_res['optimal_load_ci95']}) | "  # type: ignore[index]
+                f"sigma* (Newman ASR) = {asr_info['optimal_load_asr']} "  # type: ignore[index]
+                f"(min ASR = {asr_info['min_asr_ohm_cm2']} Ohm*cm^2)",  # type: ignore[index]
                 flush=True,
             )
         summary_out[mat] = mat_summary
@@ -566,9 +667,10 @@ def main() -> None:
                 f"{mat} — Wired Active Interface (1/µm)",
                 f"{mat} — Cell Conductance FoM & Optimal σ*",
             ]
+            unit_lbl = "kPa" if use_kpa else "mV/V"
             for c_idx, ttl in enumerate(titles):
                 axes[r_idx, c_idx].set_title(ttl, fontsize=10)
-                axes[r_idx, c_idx].set_xlabel("Compressive Load / Stress")
+                axes[r_idx, c_idx].set_xlabel(f"Compressive Load / Stress ({unit_lbl})")
                 axes[r_idx, c_idx].grid(True, alpha=0.3)
             axes[r_idx, 3].legend(fontsize=7.5, loc="best")
             if r_idx == 0:

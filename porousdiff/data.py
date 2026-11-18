@@ -32,26 +32,100 @@ def resolve_material_id(material: str | int) -> int:
 
 
 def default_project_root() -> Path:
-    """Resolve data/checkpoint root via `POROUSDIFF_ROOT` or sensible HPC fallback."""
+    """Resolve data/checkpoint root via `POROUSDIFF_ROOT` environment variable or CWD."""
     env = os.environ.get("POROUSDIFF_ROOT")
     if env:
         return Path(env).expanduser()
-    hpc_default = Path("/projects/u6uc/asif")
-    if hpc_default.exists():
-        return hpc_default
     return Path.cwd()
 
 
-def apply_compression_safe_symmetry(patch: np.ndarray, sym_id: int) -> np.ndarray:
-    """Apply one of the 16 symmetries of `D_4(XY) x Z_2(Z)` preserving compression axis Z.
+def resolve_scan_load_value(scan: Mapping[str, object], use_stress_kpa: bool) -> float:
+    """Extract physical load or calibrated compressive stress (`kPa`) without unit mixing.
+
+    Preserves `0.0 kPa` accurately and raises `ValueError` if the requested unit field
+    is missing (`None`) on `scan`.
+    """
+    st = str(scan.get("state", "<unknown>"))
+    if use_stress_kpa:
+        val = scan.get("stress_kpa")
+        if val is None:
+            raise ValueError(
+                f"use_stress_kpa=True, but scan {st!r} has stress_kpa=None. "
+                "Ensure all manifest scans carry calibrated stress_kpa."
+            )
+        return float(val)  # type: ignore[arg-type]
+
+    val_mv = scan.get("load_mv_per_v")
+    if val_mv is None:
+        raise ValueError(f"use_stress_kpa=False, but scan {st!r} has load_mv_per_v=None.")
+    return float(val_mv)  # type: ignore[arg-type]
+
+
+def resolve_checkpoint_path(
+    output_root: Path,
+    experiment: str,
+    explicit_checkpoint: Path | None = None,
+) -> Path | None:
+    """Locate `explicit_checkpoint`, `best_val.pth`, or `latest.pth` if present."""
+    if explicit_checkpoint is not None:
+        return explicit_checkpoint if explicit_checkpoint.is_file() else None
+    ckpt_dir = Path(output_root) / "checkpoints" / experiment
+    for name in ("best_val.pth", "latest.pth"):
+        cand = ckpt_dir / name
+        if cand.is_file():
+            return cand
+    return None
+
+
+def resolve_use_stress_kpa_from_checkpoints(
+    output_root: Path,
+    experiments: Sequence[str],
+    explicit_checkpoint: Path | None = None,
+    default: bool = False,
+) -> tuple[bool, bool]:
+    """Read `use_stress_kpa` directly from saved checkpoint config(s) as single source of truth.
+
+    Returns `(use_stress_kpa, found_any_checkpoint)`. Raises `ValueError` if multiple
+    compared checkpoints were trained with incompatible load units (`kPa` vs `mV/V`).
+    """
+    units_by_exp: dict[str, bool] = {}
+    for idx, exp in enumerate(experiments):
+        ckpt_p = resolve_checkpoint_path(
+            output_root=output_root,
+            experiment=exp,
+            explicit_checkpoint=explicit_checkpoint if idx == 0 else None,
+        )
+        if ckpt_p is not None:
+            saved = torch.load(ckpt_p, map_location="cpu", weights_only=False)
+            cfg = saved.get("config", {})
+            units_by_exp[exp] = bool(cfg.get("use_stress_kpa", False))
+
+    if not units_by_exp:
+        return bool(default), False
+
+    unique_units = set(units_by_exp.values())
+    if len(unique_units) > 1:
+        raise ValueError(
+            f"Cannot compare checkpoints trained with incompatible load units (use_stress_kpa={units_by_exp})."
+        )
+    return next(iter(unique_units)), True
+
+
+def apply_compression_safe_symmetry(
+    patch: np.ndarray,
+    sym_id: int,
+    allow_z_flip: bool = True,
+) -> np.ndarray:
+    """Apply symmetries of `D_4(XY) x Z_2(Z)` (16) or `D_4(XY)` (8) preserving compression axis Z.
 
     Axis 0 (`Z`) is the vertical compression plunger axis; axes 1 and 2 (`Y, X`)
     span the isotropic carbon-felt sheet plane. Never swaps `Z` with `X` or `Y`.
+    Set `allow_z_flip=False` to preserve directional plunger-vs-base Z compaction gradients.
     """
-    code = int(sym_id) % 16
+    code = int(sym_id) % (16 if allow_z_flip else 8)
     rot_k = code & 0b11
     flip_y = bool((code >> 2) & 0b1)
-    flip_z = bool((code >> 3) & 0b1)
+    flip_z = bool((code >> 3) & 0b1) if allow_z_flip else False
 
     out = patch
     if rot_k:
@@ -148,7 +222,9 @@ def load_split_patches(
             raise ValueError(f"Expected patch shape {expected_shape} in {stacked_path}, got {arr.shape[1:]}")
         return arr
 
-    files = sorted(p for p in split_dir.glob("*.npy") if p.name != "patches.npy")
+    files = sorted(
+        p for p in split_dir.glob("*.npy") if p.name not in ("patches.npy", "tall_patches.npy")
+    )
     if not files:
         raise RuntimeError(f"No patches found in {split_dir}")
 
@@ -163,6 +239,25 @@ def load_split_patches(
     return np.stack(patches, axis=0)
 
 
+def load_tall_or_split_patches(
+    split_dir: Path,
+    fallback_patches: np.ndarray,
+) -> np.ndarray:
+    """Load full-clean-height `[N, D_tall, H, W]` `tall_patches.npy` if available for mirror-free baselines."""
+    tall_path = Path(split_dir) / "tall_patches.npy"
+    if tall_path.is_file():
+        arr = np.load(tall_path)
+        if (
+            arr.ndim == 4
+            and arr.dtype == np.uint8
+            and arr.shape[0] >= 1
+            and arr.shape[1] >= fallback_patches.shape[1]
+            and arr.shape[2:] == fallback_patches.shape[2:]
+        ):
+            return arr
+    return fallback_patches
+
+
 class LoadConditionedPatchDataset(Dataset):
     """RAM-cached 3D microstructure dataset paired with continuous load values."""
 
@@ -175,6 +270,7 @@ class LoadConditionedPatchDataset(Dataset):
         version: str = "carbon_calibrated_v1",
         augment: bool = False,
         num_phases: int = 2,
+        allow_z_flip: bool = True,
     ) -> None:
         if split not in ("train", "val"):
             raise ValueError(f"Invalid split {split!r}; expected 'train' or 'val'")
@@ -188,6 +284,7 @@ class LoadConditionedPatchDataset(Dataset):
         self.version = version
         self.augment = augment
         self.num_phases = num_phases
+        self.allow_z_flip = allow_z_flip
 
         expected_shape = (patch_size, patch_size, patch_size)
         volume_blocks: list[np.ndarray] = []
@@ -212,8 +309,8 @@ class LoadConditionedPatchDataset(Dataset):
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         patch = self.patches[index]
         if self.augment:
-            sym_id = random.randrange(16)
-            patch = apply_compression_safe_symmetry(patch, sym_id)
+            sym_id = random.randrange(16 if self.allow_z_flip else 8)
+            patch = apply_compression_safe_symmetry(patch, sym_id, allow_z_flip=self.allow_z_flip)
 
         image = encode_phases_to_channels(patch, num_phases=self.num_phases)
         load_val = torch.tensor(float(self.loads[index]), dtype=torch.float32)
@@ -240,6 +337,7 @@ class MultiElectrodePatchDataset(Dataset):
         version: str = "carbon_calibrated_v1",
         num_phases: int = 3,
         augment: bool = False,
+        allow_z_flip: bool = True,
     ) -> None:
         if split not in ("train", "val"):
             raise ValueError(f"Invalid split {split!r}; expected 'train' or 'val'")
@@ -252,6 +350,7 @@ class MultiElectrodePatchDataset(Dataset):
         self.version = version
         self.num_phases = num_phases
         self.augment = augment
+        self.allow_z_flip = allow_z_flip
 
         expected_shape = (patch_size, patch_size, patch_size)
         vol_blocks: list[np.ndarray] = []
@@ -316,8 +415,8 @@ class MultiElectrodePatchDataset(Dataset):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         patch = self.patches[index]
         if self.augment:
-            sym_id = random.randrange(16)
-            patch = apply_compression_safe_symmetry(patch, sym_id)
+            sym_id = random.randrange(16 if self.allow_z_flip else 8)
+            patch = apply_compression_safe_symmetry(patch, sym_id, allow_z_flip=self.allow_z_flip)
 
         image = encode_phases_to_channels(patch, num_phases=self.num_phases)
         load_val = torch.tensor(float(self.loads[index]), dtype=torch.float32)

@@ -46,6 +46,7 @@ from porousdiff.preprocessing import (
     parse_load_with_unit,
     resolve_tiff_directory,
     segment_slice_multiphase,
+    split_xy_positions_with_buffer,
     split_z_intervals_with_buffer,
 )
 
@@ -230,10 +231,14 @@ def stream_bundle_single_scan(
     max_ring_score: float = 0.15,
     seam_margin: int = 12,
     calibration: CalibrationMetadata | None = None,
+    strip_halo_px: int = 1,
+    split_mode: str = "auto",
     preview_only: bool = False,
     resume: bool = False,
     seed: int = 42,
 ) -> dict[str, object]:
+    if split_mode not in ("auto", "z", "xy"):
+        raise ValueError(f"split_mode must be 'auto', 'z', or 'xy', got {split_mode!r}")
     calib = calibration or CalibrationMetadata(spatial_bin=spatial_bin)
     resolved_material = infer_material_name(scan_dir) if material == "auto" else material
     resolved_state = state_name or make_collision_safe_state_name(
@@ -268,9 +273,10 @@ def stream_bundle_single_scan(
     tiff_dir = resolve_tiff_directory(scan_dir)
     files = sorted(list(tiff_dir.glob("*.tif")) + list(tiff_dir.glob("*.tiff")))
     raw_window = patch_size * max(1, spatial_bin)
-    if not preview_only and len(files) < 2 * raw_window:
+    min_required_slices = raw_window if split_mode in ("auto", "xy") else 2 * raw_window
+    if not preview_only and len(files) < min_required_slices:
         raise RuntimeError(
-            f"[{resolved_state}] Need >= {2 * raw_window} slices in {tiff_dir}, found {len(files)}"
+            f"[{resolved_state}] Need >= {min_required_slices} slices in {tiff_dir}, found {len(files)}"
         )
 
     with tifffile.TiffFile(files[0]) as first_tif:
@@ -314,6 +320,7 @@ def stream_bundle_single_scan(
         delta_coating=delta_coating,
         roi_mask=roi_mask,
         sigma=sigma,
+        strip_halo_px=strip_halo_px,
     )
     _save_multiphase_preview(
         out_path=qa_dir / "multiphase_overlay_diagnostic.png",
@@ -340,6 +347,7 @@ def stream_bundle_single_scan(
             "num_phases": eff_num_phases,
             "delta_carbon": eff_delta_carbon,
             "delta_coating": delta_coating,
+            "strip_halo_px": int(strip_halo_px),
             "mid_slice_stats": mid_stats,
             "preview_figure": str(qa_dir / "multiphase_overlay_diagnostic.png"),
         }
@@ -379,6 +387,7 @@ def stream_bundle_single_scan(
             delta_coating=delta_coating,
             roi_mask=roi_mask,
             sigma=sigma,
+            strip_halo_px=strip_halo_px,
         )
         solid_fractions.append(stats["solid_fraction"])
         coating_fractions.append(stats["coating_fraction"])
@@ -404,12 +413,62 @@ def stream_bundle_single_scan(
         max_ring_score=max_ring_score,
         seam_margin=seam_margin,
     )
-    split_intervals = split_z_intervals_with_buffer(
-        intervals=valid_intervals,
-        patch_size=raw_window,
-        val_fraction=val_fraction,
-        buffer_slices=raw_window,
-    )
+    usable_z = [(s, e) for s, e in valid_intervals if (e - s) >= raw_window]
+    if not usable_z:
+        raise RuntimeError(
+            f"[{resolved_state}] No clean Z intervals of length >= {raw_window} available"
+        )
+    max_single_z_span = max(e - s for s, e in usable_z)
+
+    if split_mode == "xy":
+        split_xy = split_xy_positions_with_buffer(
+            xy_positions=xy_positions,
+            patch_size=raw_window,
+            val_fraction=val_fraction,
+        )
+        split_intervals = {"train": list(usable_z), "val": list(usable_z)}
+        effective_split_mode = "xy"
+    elif split_mode == "z":
+        split_intervals = split_z_intervals_with_buffer(
+            intervals=usable_z,
+            patch_size=raw_window,
+            val_fraction=val_fraction,
+            buffer_slices=raw_window,
+        )
+        split_xy = {"train": list(xy_positions), "val": list(xy_positions)}
+        effective_split_mode = "z"
+    elif max_single_z_span < 3 * raw_window and len(usable_z) < 2:
+        try:
+            split_xy = split_xy_positions_with_buffer(
+                xy_positions=xy_positions,
+                patch_size=raw_window,
+                val_fraction=val_fraction,
+            )
+            split_intervals = {"train": list(usable_z), "val": list(usable_z)}
+            effective_split_mode = "xy"
+            print(
+                f"  [{resolved_state}] Clean Z span ({max_single_z_span} slices < {3 * raw_window}) is thin; "
+                "switching to buffered XY-sector train/val split across full Z thickness.",
+                flush=True,
+            )
+        except RuntimeError:
+            split_intervals = split_z_intervals_with_buffer(
+                intervals=usable_z,
+                patch_size=raw_window,
+                val_fraction=val_fraction,
+                buffer_slices=raw_window,
+            )
+            split_xy = {"train": list(xy_positions), "val": list(xy_positions)}
+            effective_split_mode = "z"
+    else:
+        split_intervals = split_z_intervals_with_buffer(
+            intervals=usable_z,
+            patch_size=raw_window,
+            val_fraction=val_fraction,
+            buffer_slices=raw_window,
+        )
+        split_xy = {"train": list(xy_positions), "val": list(xy_positions)}
+        effective_split_mode = "z"
 
     _save_z_plot(
         out_path=qa_dir / "z_quality_diagnostic.png",
@@ -433,7 +492,7 @@ def stream_bundle_single_scan(
     for split_name in ("train", "val"):
         plan = build_stratified_patch_plan(
             z_intervals=split_intervals[split_name],
-            xy_positions=xy_positions,
+            xy_positions=split_xy[split_name],
             patch_size=raw_window,
             stride_z=raw_stride_z,
             max_patches=quotas[split_name],
@@ -457,6 +516,7 @@ def stream_bundle_single_scan(
                         delta_coating=delta_coating,
                         roi_mask=roi_mask,
                         sigma=sigma,
+                        strip_halo_px=strip_halo_px,
                     )
                     slice_cache[z_idx] = seg_slc
 
@@ -488,6 +548,52 @@ def stream_bundle_single_scan(
             flush=True,
         )
 
+    val_tall_depth = patch_size
+    if split_intervals["val"] and split_xy["val"]:
+        longest_val_iv = max(split_intervals["val"], key=lambda iv: iv[1] - iv[0])
+        val_span_raw = int(longest_val_iv[1] - longest_val_iv[0])
+        cand_tall_d = min(val_span_raw // spatial_bin, 3 * patch_size)
+        if cand_tall_d > patch_size:
+            tall_raw_d = cand_tall_d * spatial_bin
+            z0_tall = int(longest_val_iv[0]) + (val_span_raw - tall_raw_d) // 2
+            val_xy_pool = list(split_xy["val"])
+            rng.shuffle(val_xy_pool)
+            cand_xy = val_xy_pool[: min(len(val_xy_pool), max(val_quota, 4), 12)]
+            tall_raw_cols = np.empty(
+                (len(cand_xy), tall_raw_d, raw_window, raw_window), dtype=np.uint8
+            )
+            for z_rel, z_idx in enumerate(range(z0_tall, z0_tall + tall_raw_d)):
+                raw_slc = tifffile.imread(files[z_idx])
+                seg_slc, _ = segment_slice_multiphase(
+                    raw_slc,
+                    delta_carbon=eff_delta_carbon,
+                    delta_coating=delta_coating,
+                    roi_mask=roi_mask,
+                    sigma=sigma,
+                    strip_halo_px=strip_halo_px,
+                )
+                for c_idx, (y, x) in enumerate(cand_xy):
+                    tall_raw_cols[c_idx, z_rel] = seg_slc[y : y + raw_window, x : x + raw_window]
+
+            tall_accepted: list[np.ndarray] = []
+            for c_idx in range(len(cand_xy)):
+                if len(tall_accepted) >= min(val_quota, 8):
+                    break
+                tall_col = downsample_volume_rev(tall_raw_cols[c_idx], factor=spatial_bin)
+                wf_t = float((tall_col >= 1).mean())
+                if min_white <= wf_t <= max_white:
+                    tall_accepted.append(tall_col)
+
+            if tall_accepted:
+                tall_stacked = np.stack(tall_accepted, axis=0)
+                np.save(patch_dir / "val" / "tall_patches.npy", tall_stacked)
+                val_tall_depth = int(tall_stacked.shape[1])
+                print(
+                    f"  [{resolved_state}] val tall_patches: {tall_stacked.shape[0]} columns "
+                    f"of shape {tuple(tall_stacked.shape[1:])} (mirror-free baseline source)",
+                    flush=True,
+                )
+
     sf_arr = np.asarray(solid_fractions, dtype=np.float64)
     cf_arr = np.asarray(coating_fractions, dtype=np.float64)
     clean_sf = sf_arr[valid_mask] if valid_mask.any() else sf_arr
@@ -511,6 +617,9 @@ def stream_bundle_single_scan(
         "num_phases": eff_num_phases,
         "delta_carbon": eff_delta_carbon,
         "delta_coating": delta_coating,
+        "strip_halo_px": int(strip_halo_px),
+        "split_mode_used": effective_split_mode,
+        "val_tall_depth": int(val_tall_depth),
         "is_repeat_or_secondary": _is_repeat_or_secondary(resolved_state),
         "version": version,
         "patch_size": patch_size,
@@ -614,6 +723,8 @@ def build_bundle(
     kpa_per_mvv: float | None = None,
     punch_diameter_mm: float | None = None,
     beamline: str = "primary",
+    strip_halo_px: int = 1,
+    split_mode: str = "auto",
     preview_only: bool = False,
     append: bool = False,
     resume: bool = False,
@@ -718,6 +829,8 @@ def build_bundle(
             min_interval_length=min_interval_length,
             seam_margin=seam_margin,
             calibration=calib,
+            strip_halo_px=strip_halo_px,
+            split_mode=split_mode,
             preview_only=preview_only,
             resume=resume,
         )
@@ -768,6 +881,8 @@ def build_bundle(
         "punch_diameter_mm": punch_diameter_mm,
         "beamline": beamline,
         "delta_threshold": delta_threshold,
+        "strip_halo_px": int(strip_halo_px),
+        "split_mode": split_mode,
         "primary_states": dict(sorted(primary_states.items(), key=lambda kv: kv[1])),
         "states_by_material": {
             m: dict(sorted(d.items(), key=lambda kv: kv[1])) for m, d in sorted(by_material.items())
@@ -854,6 +969,18 @@ def main() -> None:
     parser.add_argument("--punch-diameter-mm", type=float, default=None)
     parser.add_argument("--beamline", default="primary")
     parser.add_argument(
+        "--strip-halo-px",
+        type=int,
+        default=1,
+        help="Width (px) of partial-volume carbon halo stripped around pore-coating interfaces (0 disables)",
+    )
+    parser.add_argument(
+        "--split-mode",
+        default="auto",
+        choices=["auto", "z", "xy"],
+        help="Train/val spatial split strategy: 'auto' uses Z-slabs and falls back to buffered XY sectors on thin compressed scans",
+    )
+    parser.add_argument(
         "--preview-only",
         action="store_true",
         help="Fast 10s check: save multiphase_overlay_diagnostic.png without extracting 3D patches",
@@ -896,6 +1023,8 @@ def main() -> None:
         kpa_per_mvv=args.kpa_per_mvv,
         punch_diameter_mm=args.punch_diameter_mm,
         beamline=args.beamline,
+        strip_halo_px=args.strip_halo_px,
+        split_mode=args.split_mode,
         preview_only=args.preview_only,
         append=args.append,
         resume=args.resume,

@@ -10,8 +10,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import numpy as np
-from scipy.ndimage import binary_closing, binary_dilation, gaussian_filter
-from skimage.filters import threshold_otsu
+from scipy.ndimage import binary_closing, binary_dilation, binary_erosion, gaussian_filter
 
 
 @dataclass(frozen=True)
@@ -454,12 +453,59 @@ def segment_slice_calibrated(
     return binary, stats
 
 
+def strip_partial_volume_carbon_halo(
+    labels: np.ndarray,
+    delta: np.ndarray,
+    delta_carbon: float,
+    delta_coating: float,
+    halo_px: int = 1,
+) -> np.ndarray:
+    """Remove thin partial-volume phase-`1` blur shells wrapping phase-`2` coating at pore boundaries.
+
+    Paganin phase retrieval and optical PSF blur cause sharp `pore (0) <-> high-Z coating (2)`
+    interfaces to pass continuously through `(delta_carbon, delta_coating]`, creating a fake
+    1-2 px phase-`1` ("carbon") rind that artificially zeroes direct `0-2` EASA. Eroding `labels == 1`
+    with a `3x3` structuring element isolates the spine of genuine carbon fibres (`>= 3 px` diameter)
+    so real fibres and their `0-1-2` triple-phase boundaries stay protected while fake partial-volume
+    rinds are reassigned across `0.5 * (delta_carbon + delta_coating)`.
+    """
+    if halo_px < 1:
+        return labels
+    carb = labels == 1
+    coat = labels == 2
+    if not (np.any(carb) and np.any(coat)):
+        return labels
+
+    pore = labels == 0
+    struct3 = np.ones((3, 3), dtype=bool)
+    iters = int(halo_px)
+
+    core_carbon = binary_erosion(carb, structure=struct3, iterations=1)
+    if np.any(core_carbon):
+        protected_carbon = binary_dilation(core_carbon, structure=struct3, iterations=iters + 1) & carb
+    else:
+        protected_carbon = np.zeros_like(carb)
+
+    near_coat = binary_dilation(coat, structure=struct3, iterations=iters + 1)
+    near_pore = binary_dilation(pore, structure=struct3, iterations=iters + 1)
+    suspect_halo = carb & near_coat & near_pore & (~protected_carbon)
+    if not np.any(suspect_halo):
+        return labels
+
+    cleaned = labels.copy()
+    mid_02 = 0.5 * (float(delta_carbon) + float(delta_coating))
+    cleaned[suspect_halo & (delta >= mid_02)] = 2
+    cleaned[suspect_halo & (delta < mid_02)] = 0
+    return cleaned
+
+
 def segment_slice_multiphase(
     image: np.ndarray,
     delta_carbon: float = 5500.0,
     delta_coating: float | None = None,
     roi_mask: np.ndarray | None = None,
     sigma: float = 32.0,
+    strip_halo_px: int = 0,
 ) -> tuple[np.ndarray, dict[str, float]]:
     """Segment a 2D XCT slice into `{0: pore, 1: carbon_fiber, 2: active_coating}`.
 
@@ -477,6 +523,14 @@ def segment_slice_multiphase(
     labels[delta > delta_carbon] = 1
     if delta_coating is not None:
         labels[delta > delta_coating] = 2
+        if strip_halo_px > 0:
+            labels = strip_partial_volume_carbon_halo(
+                labels,
+                delta,
+                delta_carbon=delta_carbon,
+                delta_coating=delta_coating,
+                halo_px=strip_halo_px,
+            )
 
     if roi_mask is not None:
         labels = np.where(roi_mask, labels, 0).astype(np.uint8)
@@ -498,11 +552,13 @@ def segment_slice_multiphase(
 
 
 def downsample_volume_rev(volume: np.ndarray, factor: int = 2) -> np.ndarray:
-    """Topology- and volume-fraction-preserving 3D block binning for REV-scale patches.
+    """Volume-fraction-conserving, neighborhood-ranked 3D block binning for REV patches.
 
     Pools `(factor x factor x factor)` voxel blocks using block occupancy ranked with
-    connected-neighborhood tie-breaking so global solid and active-coating volume
-    fractions are conserved (`< 0.5%` drift) without eroding thin carbon fibers.
+    Gaussian neighborhood tie-breaking so global solid and active-coating volume
+    fractions are conserved (`< 0.5%` drift) while favoring continuous fibre backbones.
+    Use `audit_binning_topology_preservation` to verify percolation and connectivity
+    retention on specific scans.
     """
     if factor < 1:
         raise ValueError("factor must be >= 1")
@@ -561,6 +617,34 @@ def downsample_volume_rev(volume: np.ndarray, factor: int = 2) -> np.ndarray:
                 out.ravel()[coat_idx] = 2
 
     return out
+
+
+def audit_binning_topology_preservation(
+    raw_volume: np.ndarray,
+    binned_volume: np.ndarray,
+) -> dict[str, float]:
+    """Audit volume-fraction drift and percolation/backbone retention after 3D block binning."""
+    from porousdiff.metrics import connectivity_and_percolation
+
+    raw = np.asarray(raw_volume, dtype=np.uint8)
+    binned = np.asarray(binned_volume, dtype=np.uint8)
+    c_raw = connectivity_and_percolation(raw >= 1)
+    c_bin = connectivity_and_percolation(binned >= 1)
+    perc_agree = float(
+        int(c_raw["pore_percolates_z"] == c_bin["pore_percolates_z"])
+        + int(c_raw["pore_percolates_y"] == c_bin["pore_percolates_y"])
+        + int(c_raw["pore_percolates_x"] == c_bin["pore_percolates_x"])
+    ) / 3.0
+    return {
+        "solid_fraction_abs_err": abs(float((binned >= 1).mean()) - float((raw >= 1).mean())),
+        "coating_fraction_abs_err": abs(float((binned == 2).mean()) - float((raw == 2).mean())),
+        "solid_connected_fraction_raw": float(c_raw["solid_connected_fraction"]),
+        "solid_connected_fraction_binned": float(c_bin["solid_connected_fraction"]),
+        "solid_connected_abs_drift": abs(
+            float(c_bin["solid_connected_fraction"]) - float(c_raw["solid_connected_fraction"])
+        ),
+        "pore_percolation_agreement": perc_agree,
+    }
 
 
 def compute_radial_ring_score(
@@ -783,6 +867,57 @@ def enumerate_cylinder_xy_positions(
                 positions.append((y, x))
 
     return positions
+
+
+def split_xy_positions_with_buffer(
+    xy_positions: Sequence[tuple[int, int]],
+    patch_size: int,
+    val_fraction: float = 0.2,
+    buffer_px: int = 0,
+) -> dict[str, list[tuple[int, int]]]:
+    """Partition `(y, x)` cylinder patch coordinates into strictly non-overlapping `train` and `val` sectors.
+
+    Used automatically when a heavily compressed electrode scan is thinner than `3 * raw_window`
+    in Z (where Z-slab splitting would either fail or bias `val` toward platen compaction),
+    guaranteeing zero shared voxels across splits while sampling the full clean Z thickness.
+    """
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError("val_fraction must be in (0, 1)")
+    pts = list(xy_positions)
+    if len(pts) < 2:
+        raise RuntimeError(
+            f"Need >= 2 XY patch positions to partition train/val in XY, got {len(pts)}"
+        )
+
+    ys = [p[0] for p in pts]
+    xs = [p[1] for p in pts]
+    axis = 1 if (max(xs) - min(xs)) >= (max(ys) - min(ys)) else 0
+
+    def _partition_with_gap(gap: int) -> tuple[list[tuple[int, int]], list[tuple[int, int]]] | None:
+        unique_coords = sorted({p[axis] for p in pts})
+        best_pair: tuple[list[tuple[int, int]], list[tuple[int, int]]] | None = None
+        best_err = float("inf")
+        for cut in unique_coords[1:]:
+            val_pts = [p for p in pts if p[axis] >= cut]
+            train_pts = [p for p in pts if (p[axis] + patch_size + gap) <= cut]
+            if not train_pts or not val_pts:
+                continue
+            frac = len(val_pts) / float(len(train_pts) + len(val_pts))
+            err = abs(frac - val_fraction)
+            if err < best_err:
+                best_err = err
+                best_pair = (train_pts, val_pts)
+        return best_pair
+
+    res = _partition_with_gap(max(0, int(buffer_px)))
+    if res is None and buffer_px > 0:
+        res = _partition_with_gap(0)
+    if res is None:
+        raise RuntimeError(
+            f"XY cylinder ROI cannot accommodate two non-overlapping patches of size {patch_size} "
+            f"(positions={pts}); decrease --patch-size or increase --roi-radius-fraction."
+        )
+    return {"train": res[0], "val": res[1]}
 
 
 def build_stratified_patch_plan(

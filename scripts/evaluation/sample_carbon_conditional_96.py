@@ -27,13 +27,23 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from porousdiff.data import decode_channels_to_phases, default_project_root, resolve_material_id
+from porousdiff.data import (
+    decode_channels_to_phases,
+    default_project_root,
+    resolve_material_id,
+    resolve_scan_load_value,
+)
 from porousdiff.metrics import (
     evaluate_multiphase_physics,
     evaluate_volume_physics,
     export_openimpala_tiff,
 )
-from porousdiff.models import ContinuousLoadConditionedUNet, EMAModel, build_noise_scheduler
+from porousdiff.models import (
+    ContinuousLoadConditionedUNet,
+    EMAModel,
+    build_noise_scheduler,
+    infer_use_ordinal_material_channel,
+)
 from porousdiff.preprocessing import infer_material_name, parse_load_value
 from porousdiff.virtual_compression import generate_tiled_3d
 
@@ -175,11 +185,7 @@ def _build_eval_specs(
                 and bool(scan.get("is_repeat_or_secondary", False))
             ):
                 continue
-            lv = (
-                float(scan["stress_kpa"])
-                if (use_kpa and scan.get("stress_kpa") is not None)
-                else float(scan["load_mv_per_v"])
-            )
+            lv = resolve_scan_load_value(scan, use_kpa)
             specs.append(
                 {
                     "state": st,
@@ -322,6 +328,7 @@ def main() -> None:
         num_phases=num_phases,
         num_materials=num_materials,
         ref_voxel_size_um=ref_vox,
+        use_ordinal_material_channel=infer_use_ordinal_material_channel(saved),
     ).to(device)
 
     if not args.no_ema and "ema" in saved:

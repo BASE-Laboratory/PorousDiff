@@ -36,9 +36,10 @@ from porousdiff.data import (
     MultiElectrodePatchDataset,
     capture_rng_states,
     default_project_root,
+    resolve_scan_load_value,
     restore_rng_states,
 )
-from porousdiff.losses import PhysicsInformedDiffusionLoss
+from porousdiff.losses import PhysicsInformedDiffusionLoss, reconstruct_x0
 from porousdiff.models import ContinuousLoadConditionedUNet, EMAModel, build_noise_scheduler
 from porousdiff.preprocessing import parse_load_value
 
@@ -85,6 +86,7 @@ def load_manifest_specs(
     max_phases = 2
     vox_list: list[float] = []
 
+    filtered_scans: list[dict[str, object]] = []
     for scan in manifest.get("scans", []):
         st = str(scan["state"])
         if not include_repeats and bool(scan.get("is_repeat_or_secondary", False)):
@@ -94,14 +96,45 @@ def load_manifest_specs(
             continue
         if exclude_states is not None and st in exclude_states:
             continue
+        filtered_scans.append(scan)
 
-        if use_stress_kpa and scan.get("stress_kpa") is not None:
-            load_val = float(scan["stress_kpa"])
+    if len(filtered_scans) < 2:
+        raise ValueError(f"Manifest filtering yielded < 2 training states ({len(filtered_scans)} found)")
+
+    eff_use_kpa = bool(use_stress_kpa)
+    units_seen = {str(sc.get("load_unit", "mv_per_v")).lower() for sc in filtered_scans}
+    beams_seen = {str(sc.get("beamline", "primary")) for sc in filtered_scans}
+    all_have_kpa = all(sc.get("stress_kpa") is not None for sc in filtered_scans)
+
+    if eff_use_kpa and not all_have_kpa:
+        missing = [str(sc["state"]) for sc in filtered_scans if sc.get("stress_kpa") is None]
+        raise ValueError(
+            f"--use-stress-kpa requested, but manifest scans lack calibrated stress_kpa: {missing}. "
+            "Supply --kpa-per-mvv / --punch-diameter-mm or stress_kpa in --loads-csv."
+        )
+
+    if not eff_use_kpa and (len(units_seen) > 1 or len(beams_seen) > 1):
+        if all_have_kpa:
+            print(
+                f"Notice: Multi-unit ({sorted(units_seen)}) or multi-beamline ({sorted(beams_seen)}) "
+                "manifest detected; automatically conditioning on calibrated stress_kpa.",
+                flush=True,
+            )
+            eff_use_kpa = True
         else:
-            load_val = float(scan["load_mv_per_v"])
+            missing = [str(sc["state"]) for sc in filtered_scans if sc.get("stress_kpa") is None]
+            raise ValueError(
+                f"Cannot mix uncalibrated load units {sorted(units_seen)} or beamlines {sorted(beams_seen)} "
+                f"without stress_kpa (missing on {missing}). Calibrate stress_kpa via --kpa-per-mvv, "
+                "--punch-diameter-mm, or --loads-csv before multi-rig training."
+            )
 
-        eff_vox = float(scan.get("effective_voxel_size_um", manifest.get("effective_voxel_size_um", 1.0)))
-        n_ph = int(scan.get("num_phases", 2))
+    for scan in filtered_scans:
+        st = str(scan["state"])
+        load_val = resolve_scan_load_value(scan, eff_use_kpa)
+
+        eff_vox = float(scan.get("effective_voxel_size_um", manifest.get("effective_voxel_size_um", 1.0)))  # type: ignore[arg-type]
+        n_ph = int(scan.get("num_phases", 2))  # type: ignore[arg-type]
         max_phases = max(max_phases, n_ph)
         vox_list.append(eff_vox)
 
@@ -113,16 +146,58 @@ def load_manifest_specs(
                 "state": st,
                 "material": str(scan.get("material", "virgin_carbon")),
                 "load_value": load_val,
+                "used_stress_kpa": eff_use_kpa,
                 "voxel_size_um": eff_vox,
                 "num_phases": n_ph,
                 "patch_dir": str(patch_dir) if (patch_dir and patch_dir.is_dir()) else None,
             }
         )
 
-    if len(specs) < 2:
-        raise ValueError(f"Manifest filtering yielded < 2 training states ({len(specs)} found)")
     ref_vox = float(np.median(vox_list)) if vox_list else 1.0
     return specs, max_phases, ref_vox
+
+
+def validate_resume_config(saved_cfg: dict[str, object], current_cfg: dict[str, object]) -> None:
+    """Prevent held-out state leakage or load-unit drift when auto-resuming a checkpoint."""
+    mismatches: list[str] = []
+    for key in ("use_stress_kpa", "num_phases", "num_materials"):
+        if saved_cfg.get(key) != current_cfg.get(key):
+            mismatches.append(f"{key}: saved={saved_cfg.get(key)!r} vs current={current_cfg.get(key)!r}")
+
+    for list_key in ("heldout_states", "include_states"):
+        if list_key in saved_cfg and saved_cfg.get(list_key) != current_cfg.get(list_key):
+            mismatches.append(
+                f"{list_key}: saved={saved_cfg.get(list_key)!r} vs current={current_cfg.get(list_key)!r}"
+            )
+
+    def _norm_states(d: object) -> dict[str, float]:
+        if not isinstance(d, dict):
+            return {}
+        return {str(k): round(float(v), 6) for k, v in sorted(d.items())}
+
+    if _norm_states(saved_cfg.get("states")) != _norm_states(current_cfg.get("states")):
+        mismatches.append(
+            f"states: saved={_norm_states(saved_cfg.get('states'))} vs current={_norm_states(current_cfg.get('states'))}"
+        )
+
+    def _norm_specs(items: object) -> list[tuple[str, float, str]]:
+        if not isinstance(items, list):
+            return []
+        return sorted(
+            (str(s["state"]), round(float(s["load_value"]), 6), str(s.get("material", "virgin_carbon")))
+            for s in items
+            if isinstance(s, dict)
+        )
+
+    if _norm_specs(saved_cfg.get("scan_specs")) != _norm_specs(current_cfg.get("scan_specs")):
+        mismatches.append("scan_specs (training states, loads, or materials) differ from checkpoint")
+
+    if mismatches:
+        raise ValueError(
+            "Refusing --resume because checkpoint configuration does not match current invocation "
+            "(risk of held-out data leakage or unit drift): " + "; ".join(mismatches)
+            + ". Use a new --experiment name or pass --allow-config-mismatch to override."
+        )
 
 
 def atomic_torch_save(payload: dict[str, object], target: Path) -> None:
@@ -194,11 +269,26 @@ def main() -> None:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--no-augment", action="store_true")
+    parser.add_argument(
+        "--no-z-flip",
+        action="store_true",
+        help="Disable Z-axis reflection augmentation when plunger-vs-base compaction is asymmetric",
+    )
+    parser.add_argument(
+        "--ordinal-material-channel",
+        action="store_true",
+        help="Legacy flag to concatenate an ordinal chemistry scalar spatial channel alongside learned embedding",
+    )
     parser.add_argument("--amp", choices=["auto", "bf16", "fp16", "off"], default="auto")
     parser.add_argument("--allow-cpu", action="store_true")
 
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--allow-config-mismatch",
+        action="store_true",
+        help="Override --resume safety check if training states/units intentionally changed",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-steps", type=int, default=0, help="Cap train steps/epoch for smoke tests")
     parser.add_argument("--max-val-steps", type=int, default=0)
@@ -267,6 +357,8 @@ def main() -> None:
             include_repeats=args.include_repeats,
             use_stress_kpa=args.use_stress_kpa,
         )
+        if scan_specs and bool(scan_specs[0].get("used_stress_kpa", False)):
+            args.use_stress_kpa = True
         num_phases = args.num_phases if args.num_phases in (2, 3) else inferred_phases
         num_materials = len(MATERIAL_TO_ID)
         states = {str(s["state"]): float(s["load_value"]) for s in scan_specs}  # type: ignore[arg-type]
@@ -283,6 +375,7 @@ def main() -> None:
             version=args.version,
             num_phases=num_phases,
             augment=not args.no_augment,
+            allow_z_flip=not args.no_z_flip,
         )
         val_data_mm = MultiElectrodePatchDataset(
             data_root=args.data_root,
@@ -343,6 +436,7 @@ def main() -> None:
             version=args.version,
             augment=not args.no_augment,
             num_phases=num_phases,
+            allow_z_flip=not args.no_z_flip,
         )
         val_data = LoadConditionedPatchDataset(
             data_root=args.data_root,
@@ -384,6 +478,7 @@ def main() -> None:
         num_phases=num_phases,
         num_materials=num_materials,
         ref_voxel_size_um=ref_vox,
+        use_ordinal_material_channel=args.ordinal_material_channel,
     ).to(device)
 
     ema = EMAModel(model, decay=args.ema_decay)
@@ -430,6 +525,10 @@ def main() -> None:
         "num_materials": num_materials,
         "ref_voxel_size_um": ref_vox,
         "use_stress_kpa": args.use_stress_kpa,
+        "allow_z_flip": not args.no_z_flip,
+        "use_ordinal_material_channel": bool(args.ordinal_material_channel),
+        "heldout_states": sorted(args.exclude_states) if args.exclude_states else [],
+        "include_states": sorted(args.include_states) if args.include_states else None,
         "physics_loss": args.physics_loss,
         "snr_gamma": args.snr_gamma if args.physics_loss else 0.0,
         "timesteps": args.timesteps,
@@ -448,6 +547,8 @@ def main() -> None:
         if not latest_path.is_file():
             raise FileNotFoundError(f"Cannot --resume; missing {latest_path}")
         saved = torch.load(latest_path, map_location=device, weights_only=False)
+        if not args.allow_config_mismatch:
+            validate_resume_config(saved.get("config", {}), model_config)
         model.load_state_dict(saved["model"])
         ema.load_state_dict(saved["ema"])
         optimizer.load_state_dict(saved["optimizer"])
@@ -581,6 +682,7 @@ def main() -> None:
         ema_model.eval()
         val_gen = torch.Generator(device=device).manual_seed(args.seed + 10_007)
         val_total = 0.0
+        val_sf_mae_total = 0.0
         val_steps = 0
 
         with torch.no_grad():
@@ -608,6 +710,16 @@ def main() -> None:
                         voxel_sizes=voxs,
                     )
                     v_loss = F.mse_loss(pred.float(), target.float())
+                x0_hat = reconstruct_x0(
+                    x_t=noisy,
+                    model_pred=pred,
+                    timesteps=timesteps,
+                    alphas_cumprod=scheduler.alphas_cumprod,
+                    prediction_type=args.prediction_type,
+                )
+                sf_hat = (x0_hat[:, 0] > 0.0).float().mean(dim=(1, 2, 3))
+                sf_true = (images[:, 0] > 0.0).float().mean(dim=(1, 2, 3))
+                val_sf_mae_total += float((sf_hat - sf_true).abs().mean().item())
                 val_total += float(v_loss.item())
                 val_steps += 1
                 if args.max_val_steps and val_steps >= args.max_val_steps:
@@ -617,6 +729,7 @@ def main() -> None:
             torch.cuda.synchronize()
 
         val_loss = val_total / max(1, val_steps)
+        val_x0_sf_mae = val_sf_mae_total / max(1, val_steps)
         is_best = val_loss < best_val_loss
         if is_best:
             best_val_loss = val_loss
@@ -625,6 +738,7 @@ def main() -> None:
             "epoch": epoch + 1,
             "train_loss": round(train_total / max(1, train_steps), 6),
             "val_loss_ema": round(val_loss, 6),
+            "val_x0_sf_mae": round(val_x0_sf_mae, 6),
             "best_val_loss": round(best_val_loss, 6),
             "epoch_seconds": round(time.perf_counter() - started, 2),
             "peak_allocated_gib": (

@@ -50,6 +50,25 @@ def resolve_compression_ratio(
     return float(np.clip(initial_solid_fraction / target_solid_fraction, 0.08, 1.0))
 
 
+def compute_mirror_tiled_fraction(
+    source_depth: int,
+    output_depth: int,
+    initial_solid_fraction: float,
+    target_solid_fraction: float | None = None,
+    compression_ratio: float | None = None,
+) -> float:
+    """Return the fraction in `[0.0, 1.0)` of required uncompressed Z slices extended via mirror tiling.
+
+    Equals `0.0` whenever `source_depth >= round(output_depth / ratio)` (i.e. when a tall
+    real uncompressed sub-volume supplies the full required Z height without reflection).
+    """
+    ratio = resolve_compression_ratio(initial_solid_fraction, target_solid_fraction, compression_ratio)
+    req_src_d = max(int(output_depth), int(round(output_depth / ratio)))
+    if source_depth >= req_src_d or req_src_d <= 0:
+        return 0.0
+    return float(req_src_d - source_depth) / float(req_src_d)
+
+
 def affine_z_compress_to_target(
     uncompressed_vol: np.ndarray,
     target_solid_fraction: float | None = None,

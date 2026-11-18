@@ -449,39 +449,46 @@ Direct inspection of raw synchrotron compression scans (`crbon_virgin_1_0p008mVV
 - **Physics & transport evaluation (`evaluate_carbon_physics.py`):** Automated comparison of solid fraction, specific surface area, directional chord lengths, `XY/Z` compression anisotropy, directional $S_2(r)$, 3D percolation, geodesic pore tortuosity, and OpenImpala multi-page TIFF export across both training and held-out interpolated loads.
 
 
-## Experiment 15: Unified Multi-Electrode, 3-Phase "Synchrotron Beamtime Multiplier" (`v0.3`)
+## Experiment 15: Multi-Electrode, 3-Phase Few-Shot Transfer Architecture (`v0.3`)
 
-**Status:** Implemented and verified end-to-end (`feature/paper-ready-conditional`) — ready for Virgin Carbon, $\text{TiO}_2$ Anode, CuHCF Cathode, and DLS K11 DIAD datasets
+**Status:** Software pipeline implemented and verified on synthetic test suites (`feature/paper-ready-conditional`) — awaiting full GH200 evaluation on Virgin Carbon, $\text{TiO}_2$ Anode, CuHCF Cathode, and DLS K11 DIAD datasets
 
 ### Scientific Motivation & Literature Gap
-Existing 3D diffusion papers for porous electrodes generate static microstructures or condition on global porosity, while recent compression-transport studies (*ACS Appl. Energy Mater.* 2025) still rely on heuristic numerical Z-squashing or column-wise pore-voxel deletion. Across our multi-electrode synchrotron compression suite—**Virgin Carbon Felt** (`virgin_carbon`), **$\text{TiO}_2$-coated Carbon Felt Anode** (`tio2_anode`), and **Copper Hexacyanoferrate Coated Cathode** (`cuhcf_cathode`)—plus an independent cross-resolution repeat at **Diamond Light Source K11 DIAD**, we upgraded `PorousDiff` into a unified **Synchrotron Beamtime Multiplier** surrogate.
+Existing 3D diffusion papers for porous electrodes generate static microstructures or condition on global porosity, while recent compression-transport studies (*ACS Appl. Energy Mater.* 2025) rely on heuristic numerical Z-squashing or column-wise pore-voxel deletion. Across our multi-electrode synchrotron compression suite—**Virgin Carbon Felt** (`virgin_carbon`), **$\text{TiO}_2$-coated Carbon Felt Anode** (`tio2_anode`), and **Copper Hexacyanoferrate Coated Cathode** (`cuhcf_cathode`)—plus an independent cross-resolution repeat at **Diamond Light Source K11 DIAD**, `PorousDiff` implements a held-out cross-electrode benchmark.
 
 ### Key `v0.3` Upgrades (`porousdiff/`)
-1. **3-Phase Solid-Masked Calibration & Physical-REV Binning (`preprocessing.py`):**
+1. **3-Phase Solid-Masked Calibration & Coarse-Grained Binning (`preprocessing.py`):**
    - Two-stage Otsu calibration (`calibrate_multiphase_thresholds` + `segment_slice_multiphase`) separates `0 = pore`, `1 = carbon_fiber`, and `2 = active_coating` ($\text{TiO}_2$ / CuHCF) without splitting the dominant 80–90% pore background peak.
-   - Topology- and volume-fraction-conserving `downsample_volume_rev` (`spatial_bin = 2` or `3`) enlarges $96^3$ patches to $2\times$–$3\times$ physical field-of-view (`~20–30` fiber diameters per patch edge).
+   - Volume-fraction-matched `downsample_volume_rev` (`spatial_bin = 2` or `3`, paired with `audit_binning_topology_preservation`) enlarges $96^3$ patches to $2\times$–$3\times$ physical field-of-view (`~20–30` fiber diameters per patch edge).
    - `CalibrationMetadata` records physical `voxel_size_um`, `kpa_per_mvv` mechanical stress conversion, `beamline`, and `is_repeat` in `bundle_manifest.json`, plus a ~10-second `--preview-only` Spyder mode (`qa/multiphase_overlay_diagnostic.png`).
 2. **Literature Numerical Z-Compression Baselines (`baselines.py`):**
-   - `affine_z_compress_to_target` (affine Z-resampling + calibrated distance-transform threshold matching target compressed porosity) and `pillar_pore_deletion_compress` (stochastic XY-column pore-layer removal).
+   - `affine_z_compress_to_target` (affine Z-resampling + occupancy-quantile projection matching target compressed porosity) and `pillar_pore_deletion_compress` (stochastic XY-column pore-layer removal).
 3. **Hierarchical 2-Channel 3-Phase Representation & Multi-Modal Conditioning (`data.py`, `models.py`):**
-   - Hierarchical encoding `[c_solid, c_coating]` in `{-1, +1}` aligns Channel 0 (`total solid vs. pore`) across 2-phase Virgin Felt and 3-phase coated electrodes so dense Virgin compression series transfer scaffold mechanics to sparse (`2–3` load) $\text{TiO}_2$/CuHCF schedules, while `decode_channels_to_phases` prevents floating unattached coating artifacts.
-   - `MultiModalConditionEmbedder` jointly embeds normalized stress/load + discrete `material_id` + continuous `log(dx / dx_ref)` voxel size into `temb` and spatial conditioning channels.
-4. **3-Phase Electrochemical Interfacial Metrics & Head-to-Head Benchmark (`metrics.py`, `evaluate_beamtime_multiplier.py`):**
-   - Computes Electrochemically Active Surface Area (`ssa_pore_coating`), Triple-Phase Boundary line density (`tpb_density` in $\mu\text{m}^{-2}$), electronically wired coating fraction (`wired_coating_fraction`), directional tortuosity, and multi-phase OpenImpala TIFF export (`{0, 1, 2}`), comparing Real Held-Out XCT vs. Numerical Z-Compression Baselines vs. Dense and Few-Shot PorousDiff (`slurm/run_beamtime_multiplier.slurm`).
+   - Hierarchical encoding `[c_solid, c_coating]` in `{-1, +1}` aligns Channel 0 (`total solid vs. pore`) across 2-phase Virgin Felt and 3-phase coated electrodes while `decode_channels_to_phases` prevents floating unattached coating artifacts.
+   - `MultiModalConditionEmbedder` embeds normalized stress/load + categorical `material_id` (`nn.Embedding`) + continuous `log(dx / dx_ref)` voxel size into `temb` and spatial conditioning channels.
+4. **3-Phase Electrochemical Interfacial Metrics & Held-Out Benchmark (`metrics.py`, `evaluate_beamtime_multiplier.py`):**
+   - Computes Electrochemically Active Surface Area (`ssa_pore_coating`), Triple-Phase Boundary line density (`tpb_density` in $\mu\text{m}^{-2}$), electronically wired coating fraction (`wired_coating_fraction`), 26-connected Euclidean geodesic tortuosity, and multi-phase OpenImpala TIFF export (`{0, 1, 2}`).
 
 
-## Experiment 16: Virtual *In-Situ* Compression, Seamless REV MultiDiffusion, Physics-Informed $\hat{x}_0$ Loss & OpenImpala Optimal Clamping-Pressure ($\sigma^*$) Discovery (`v0.4`)
+## Experiment 16: Conditional DDIM Transfer, MultiDiffusion Tiling, $\hat{x}_0$ Regularization & OpenImpala Clamping-Pressure ($\sigma^*$) Pipeline (`v0.4`)
 
-**Status:** Implemented and verified end-to-end (`feature/paper-ready-conditional`)
+**Status:** Software pipeline & peer-review audit fixes verified locally and in CI (`feature/paper-ready-conditional`)
 
-### Key `v0.4` Scientific Upgrades (`porousdiff/`)
-1. **Zero-Beamtime Virtual *In-Situ* Compression (`porousdiff/virtual_compression.py`, `scripts/evaluation/virtual_compress_scan.py`):**
-   - Deterministically inverts a real segmented $0\text{ kPa}$ / lowest-load 3D scan along the conditional DDIM probability-flow ODE (safely bounded away from Zero-SNR $\bar{\alpha}_{T-1} = 0$) and denoises to arbitrary target stresses $\sigma$. Enables 1-to-1 starting-volume comparison against `affine_z_squash` and `pillar_pore_deletion` (`--include-virtual-compression`).
+### Key `v0.4` Capabilities & Methodological Safeguards (`porousdiff/`)
+1. **Conditional DDIM Microstructure Transfer & Fidelity Audit (`porousdiff/virtual_compression.py`, `scripts/evaluation/virtual_compress_scan.py`):**
+   - Partially inverts a real low-load segmented 3D scan (`invert_strength = 0.60`, $\bar{\alpha} \approx 0.16$) along the conditional DDIM trajectory and denoises to higher in-range target stresses $\sigma$. Automatically evaluates `check_load_extrapolation`, roundtrip `same_load_solid_dice`, and `paired_xy_column_corr` vs. unpaired scans (`xy_correlation_lift`) to distinguish specimen-specific structural retention from unconditional resampling.
 2. **Seamless $>96^3$ 3D Volume Stitching (`generate_tiled_3d`, `--tiled-shape`):**
-   - Overlapped 3D raised-cosine (Hann) MultiDiffusion synthesizes arbitrarily large stitch-free electrode domains (e.g. $96 \times 96 \times 192$ or $160^3$) for OpenImpala REV convergence without increasing training GPU memory.
-3. **Physics-Informed $\hat{x}_0$ Training Objective & Delamination Audit (`porousdiff/losses.py`, `--physics-loss`):**
-   - Closed-form single-step $\hat{x}_0$ reconstruction paired with Min-SNR-$\gamma$ weighting, 3D finite-difference interfacial sharpness, hierarchical no-floating-coating support penalty $\text{ReLU}(\hat{c}_{\text{coating}} - \hat{c}_{\text{solid}})$, and solid-phase catalyst-to-scaffold ratio conservation, plus experimental coating-spallation diagnostics (`coating_retention_diagnostics.json`).
-4. **Optimal Clamping-Pressure $\sigma^*$ Sweet-Spot Finder + OpenImpala Integration (`porousdiff/optimization.py`, `scripts/evaluation/optimize_clamping_pressure.py`):**
-   - Couples OpenImpala continuum $D_{\text{eff},Z}/D_0$ & $\sigma_{\text{eff},Z}/\sigma_0$ (and 3D geodesic / Carman-Kozeny surrogates) with wired active catalyst area into a harmonic series-conductance Figure of Merit $\text{FoM}(\sigma)$ with bootstrap 95% confidence intervals on $\sigma^*$.
-5. **3D Compressive Pinch-Point & Coordination Metrics for K11 DIAD XRD (`porousdiff/metrics.py`, `porousdiff/transport_and_xrd.py`):**
-   - Quantifies through-plane solid contact density (`z_pinch_contact_density`), bilateral sandwiched coating fraction (`coating_pinch_fraction`), and 6-connected solid coordination (`mean_coating_coordination`), automatically correlated against co-registered DLS K11 DIAD XRD microstrain and peak broadening.
+   - Symmetrically spaced 3D raised-cosine (Hann) MultiDiffusion synthesizes larger domains (e.g. $96 \times 96 \times 192$ or $160^3$) so REV domain-size convergence can be tested explicitly in OpenImpala.
+3. **Auxiliary $\hat{x}_0$ Training Penalties & Coating-Retention Audit (`porousdiff/losses.py`, `--physics-loss`):**
+   - Closed-form single-step $\hat{x}_0$ reconstruction paired with Min-SNR-$\gamma$ weighting, 3D finite-difference interfacial sharpness, hierarchical no-floating-coating support penalty $\text{ReLU}(\hat{c}_{\text{coating}} - \hat{c}_{\text{solid}})$, and solid-phase catalyst-to-scaffold ratio conservation, plus `val_x0_sf_mae` validation logging and `coating_retention_diagnostics.json`.
+4. **Clamping-Pressure $\sigma^*$ Analysis via 1D Newman ASR & Weight Sensitivity (`porousdiff/optimization.py`, `scripts/evaluation/optimize_clamping_pressure.py`):**
+   - Computes both a normalized harmonic Figure of Merit (accompanied by an 11-point simplex `weight_sensitivity` sweep) and a dimensional **1D Newman & Tobias porous-electrode Area-Specific Resistance $R_{\text{ASR}}(\sigma)$ ($\Omega\cdot\text{cm}^2$)** incorporating compressed thickness $L(\sigma) = L_0(1 - \epsilon_Z)$, Nernst diffusive mass-transfer resistance, clamping contact resistance, Darcy hydraulic penalty, and 3-regime sensitivity (`kinetics_limited`, `balanced`, `mass_transport_limited`). Refuses to mix partial OpenImpala + surrogate estimates on the same curve.
+5. **Partial-Correlation DIAD XRD & Pinch-Point Analysis (`porousdiff/metrics.py`, `porousdiff/transport_and_xrd.py`):**
+   - Quantifies `specific_z_pinch_excess` (`P(solid[z] & solid[z-1]) / phi_s^2`), `coating_pinch_fraction`, and `mean_coating_coordination`, reporting both raw Pearson $r$ and OLS partial correlation `partial_pearson_r_given_sf` (controlling for solid fraction $\phi_s$) against co-registered DLS K11 DIAD XRD microstrain.
+6. **Peer-Review & Red-Team Engineering Hardening (`v0.4`):**
+   - **Single Load-Unit Source of Truth:** `sample_carbon_conditional_96.py`, `evaluate_beamtime_multiplier.py`, and `optimize_clamping_pressure.py` read `use_stress_kpa` directly from checkpoint config (`resolve_use_stress_kpa_from_checkpoints`) and resolve loads via `resolve_scan_load_value` (preserving `0.0 kPa` and raising on missing units rather than falling back to `mV/V`).
+   - **Resume Data-Leakage Guard (`validate_resume_config`):** `train_carbon_conditional_96.py --resume` verifies `heldout_states`, `include_states`, `use_stress_kpa`, `states`, and `scan_specs` match the saved checkpoint before loading weights.
+   - **Mirror-Free Tall Baseline Sub-Volumes (`val/tall_patches.npy`):** `prepare_local_drive_bundle.py` extracts full-clean-height validation columns so `affine_z_compress_to_target` and `pillar_pore_deletion_compress` operate with `baseline_mirror_tiled_fraction == 0.0` whenever clean scan height permits.
+   - **26-Connected Euclidean Geodesic Tortuosity:** Upgraded `geodesic_pore_tortuosity` from 6-neighbour Manhattan BFS to 26-neighbour Euclidean Dijkstra (`1, sqrt(2), sqrt(3)` step weights, recovering $\tau = \sqrt{2}$ on $45^\circ$ diagonal channels).
+   - **3-Phase Partial-Volume Halo Cleanup & Thin-Scan XY Split:** Strips 1–2 px Paganin/PSF phase-`1` blur rinds at `0–2` pore boundaries (`strip_partial_volume_carbon_halo`) and falls back to buffered XY-sector splitting (`split_xy_positions_with_buffer`) on thin compressed stacks.
+

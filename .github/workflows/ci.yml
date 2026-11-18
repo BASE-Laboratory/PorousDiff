@@ -41,6 +41,9 @@ jobs:
       - name: Validate Python syntax across package, scripts, and tests
         run: .venv/bin/python -m compileall -q porousdiff scripts tests
 
+      - name: Run Ruff static lint checks
+        run: .venv/bin/ruff check porousdiff scripts tests --select E9,F63,F7,F82,F401
+
       - name: Validate Slurm batch script syntax
         run: bash -n slurm/*.slurm
 

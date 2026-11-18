@@ -83,7 +83,7 @@ def ddim_invert_latent(
     source_load: float,
     prediction_type: str = "v_prediction",
     num_steps: int = 50,
-    invert_strength: float = 0.85,
+    invert_strength: float = 0.60,
     guidance_scale_inv: float = 1.0,
     material_id: int = 0,
     voxel_size_um: float = 1.0,
@@ -130,8 +130,14 @@ def ddim_invert_latent(
                 voxel_sizes=voxs,
             )
 
+        # Do NOT clamp x0_hat during forward ODE inversion: on discrete {-1, +1} targets,
+        # clamping zeroes out eps_eff whenever |x0_hat| > 1 and collapses latent norm.
         x0_hat, eps_eff = _pred_to_x0_and_eps(
-            cur, pred, float(ab_cpu[t_cur].item()), prediction_type=prediction_type
+            cur,
+            pred,
+            float(ab_cpu[t_cur].item()),
+            prediction_type=prediction_type,
+            clip_sample=False,
         )
         ab_next = float(ab_cpu[t_next].item())
         cur = math.sqrt(ab_next) * x0_hat + math.sqrt(max(1.0 - ab_next, 0.0)) * eps_eff
@@ -223,7 +229,7 @@ def virtual_compress_volumes(
     target_loads: list[float] | tuple[float, ...],
     prediction_type: str = "v_prediction",
     num_steps: int = 50,
-    invert_strength: float = 0.85,
+    invert_strength: float = 0.60,
     guidance_scale: float = 1.5,
     material_id: int = 0,
     voxel_size_um: float = 1.0,
@@ -232,11 +238,13 @@ def virtual_compress_volumes(
     use_amp: bool = False,
     amp_dtype: torch.dtype = torch.float32,
 ) -> dict[float, np.ndarray]:
-    """Virtually compress real 3D XCT patches `[N, D, H, W]` (or `[D, H, W]`) to `target_loads`.
+    """Transfer real low-load 3D XCT patches `[N, D, H, W]` (or `[D, H, W]`) to `target_loads`.
 
-    Inverts each batch of `source_volumes` ONCE at `source_load` and branches the reverse
-    DDIM trajectory to all requested `target_loads`, amortizing inversion cost across a full
-    virtual compression series.
+    Inverts each batch of `source_volumes` ONCE at `source_load` (`invert_strength=0.60`
+    retains macroscopic in-plane XY fibre architecture while allowing Z pore collapse) and
+    branches the reverse DDIM trajectory across `target_loads`. Note that fixed-cube windows
+    represent statistical / mesoscale local microstructure conditioned on input latent structure,
+    not Lagrangian material-point tracking.
     """
     vols = np.asarray(source_volumes, dtype=np.uint8)
     single_input = vols.ndim == 3
@@ -304,15 +312,112 @@ def virtual_compress_volumes(
     return results
 
 
+def check_load_extrapolation(
+    loads: list[float] | tuple[float, ...],
+    load_min: float,
+    load_max: float,
+    tol: float = 1e-6,
+) -> dict[str, object]:
+    """Identify whether any requested source or target load extrapolates outside `[load_min, load_max]`."""
+    out_of_range = [
+        float(lv)
+        for lv in loads
+        if float(lv) < float(load_min) - tol or float(lv) > float(load_max) + tol
+    ]
+    return {
+        "load_min": float(load_min),
+        "load_max": float(load_max),
+        "is_extrapolated": len(out_of_range) > 0,
+        "extrapolated_loads": out_of_range,
+    }
+
+
+def compute_virtual_compression_fidelity(
+    source_volumes: np.ndarray,
+    compressed_volumes: np.ndarray,
+    same_load_reconstructions: np.ndarray | None = None,
+) -> dict[str, float]:
+    """Quantify structural retention vs random resampling in DDIM virtual compression.
+
+    Computes:
+      - `same_load_solid_dice`: Solid-phase Dice overlap (`2|A&B| / (|A|+|B|)`) for `sigma_0 -> sigma_0`
+        roundtrip reconstruction (immune to high-porosity accuracy inflation).
+      - `paired_xy_column_corr`: Mean Pearson correlation between each input scan's Z-averaged
+        XY solid density `mean_Z(source_i >= 1)` and its own compressed output `mean_Z(comp_i >= 1)`.
+      - `unpaired_xy_column_corr`: Baseline correlation against unrelated shifted inputs `source_{(i+1)%N}`.
+      - `xy_correlation_lift`: `paired_xy_column_corr - unpaired_xy_column_corr` (`> 0` confirms
+        specimen-specific structural memory rather than unconditional resampling).
+    """
+    src = np.asarray(source_volumes)
+    cmp = np.asarray(compressed_volumes)
+    if src.ndim == 3:
+        src = src[np.newaxis, ...]
+    if cmp.ndim == 3:
+        cmp = cmp[np.newaxis, ...]
+
+    same_dice = float("nan")
+    if same_load_reconstructions is not None:
+        rec = np.asarray(same_load_reconstructions)
+        if rec.ndim == 3:
+            rec = rec[np.newaxis, ...]
+        dices: list[float] = []
+        for s_v, r_v in zip(src, rec):
+            s_b = s_v >= 1
+            r_b = r_v >= 1
+            denom = int(s_b.sum()) + int(r_b.sum())
+            dices.append(1.0 if denom == 0 else 2.0 * float(np.count_nonzero(s_b & r_b)) / float(denom))
+        same_dice = float(np.mean(dices)) if dices else float("nan")
+
+    def _corr2d(a: np.ndarray, b: np.ndarray) -> float:
+        af = a.ravel().astype(np.float64)
+        bf = b.ravel().astype(np.float64)
+        sa = float(np.std(af))
+        sb = float(np.std(bf))
+        if sa < 1e-12 or sb < 1e-12:
+            return 0.0
+        return float(np.corrcoef(af, bf)[0, 1])
+
+    n = min(src.shape[0], cmp.shape[0])
+    paired_corrs: list[float] = []
+    unpaired_corrs: list[float] = []
+    for i in range(n):
+        src_xy = (src[i] >= 1).mean(axis=0)
+        cmp_xy = (cmp[i] >= 1).mean(axis=0)
+        paired_corrs.append(_corr2d(src_xy, cmp_xy))
+        if n >= 2:
+            other_xy = (src[(i + 1) % n] >= 1).mean(axis=0)
+            unpaired_corrs.append(_corr2d(other_xy, cmp_xy))
+
+    paired_mean = float(np.mean(paired_corrs)) if paired_corrs else float("nan")
+    unpaired_mean = float(np.mean(unpaired_corrs)) if unpaired_corrs else float("nan")
+    lift = (
+        paired_mean - unpaired_mean
+        if (np.isfinite(paired_mean) and np.isfinite(unpaired_mean))
+        else float("nan")
+    )
+    return {
+        "same_load_solid_dice": same_dice,
+        "paired_xy_column_corr": paired_mean,
+        "unpaired_xy_column_corr": unpaired_mean,
+        "xy_correlation_lift": lift,
+    }
+
+
 def _compute_tile_starts(full_len: int, patch_size: int, overlap: float) -> list[int]:
     if full_len < patch_size:
         raise ValueError(f"Target dimension {full_len} must be >= patch_size {patch_size}")
     if full_len == patch_size:
         return [0]
-    stride = max(1, int(round(patch_size * (1.0 - overlap))))
-    starts = list(range(0, full_len - patch_size + 1, stride))
-    if starts[-1] != full_len - patch_size:
-        starts.append(full_len - patch_size)
+    max_stride = max(1, int(round(patch_size * (1.0 - overlap))))
+    span = full_len - patch_size
+    num_intervals = max(1, math.ceil(span / float(max_stride)))
+    raw_starts = [int(round(i * span / float(num_intervals))) for i in range(num_intervals + 1)]
+    starts: list[int] = []
+    for s in raw_starts:
+        if not starts or s > starts[-1]:
+            starts.append(s)
+    if starts[-1] != span:
+        starts.append(span)
     return starts
 
 

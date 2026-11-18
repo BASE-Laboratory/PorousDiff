@@ -54,6 +54,22 @@ if [ "${PHYSICS_LOSS:-1}" = "1" ]; then
     PHYSICS_ARGS+=(--physics-loss)
 fi
 
+STRESS_ARGS=()
+if [ "${USE_STRESS_KPA:-auto}" = "1" ]; then
+    STRESS_ARGS+=(--use-stress-kpa)
+elif [ "${USE_STRESS_KPA:-auto}" = "auto" ]; then
+    if [ -f "${POROUSDIFF_ROOT}/checkpoints/${EXPERIMENT}/latest.pth" ]; then
+        if python -c "import sys, torch; c = torch.load(sys.argv[1], map_location='cpu', weights_only=False).get('config', {}); sys.exit(0 if c.get('use_stress_kpa', False) else 1)" "${POROUSDIFF_ROOT}/checkpoints/${EXPERIMENT}/latest.pth"; then
+            STRESS_ARGS+=(--use-stress-kpa)
+        fi
+    elif [ -f "$MANIFEST" ]; then
+        if python -c "import json, sys; s = json.load(open(sys.argv[1])).get('scans', []); sys.exit(0 if (s and all(x.get('stress_kpa') is not None for x in s)) else 1)" "$MANIFEST"; then
+            echo "All manifest scans carry calibrated stress_kpa; enabling --use-stress-kpa."
+            STRESS_ARGS+=(--use-stress-kpa)
+        fi
+    fi
+fi
+
 echo "Started Beamtime Multiplier pipeline: $(date -u)"
 echo "Manifest: $MANIFEST | Experiment: $EXPERIMENT"
 nvidia-smi
@@ -71,6 +87,7 @@ python -u scripts/training/train_carbon_conditional_96.py \
     --lr "${LR:-2e-4}" \
     --amp bf16 \
     --num-workers 4 \
+    "${STRESS_ARGS[@]}" \
     "${PHYSICS_ARGS[@]}" \
     "${INCLUDE_ARGS[@]}" \
     "${EXCLUDE_ARGS[@]}" \

@@ -11,7 +11,6 @@ import tifffile
 
 from porousdiff.metrics import (
     connectivity_and_percolation,
-    directional_chord_metrics,
     directional_two_point_correlation,
     evaluate_volume_physics,
     export_openimpala_tiff,
