@@ -113,7 +113,11 @@ def catalyst_loading_conservation_loss(
     x0_true: torch.Tensor,
     sample_weights: torch.Tensor,
 ) -> torch.Tensor:
-    """Conserve catalyst-to-total-solid volume ratio (`phi_coating / phi_solid`) per patch."""
+    """Conserve catalyst-to-total-solid volume ratio (`phi_coating / phi_solid`) per patch.
+
+    Handles mixed 2-phase uncoated (`coat_true == 0`) + 3-phase coated batches cleanly without
+    dividing rectified `x0_hat` noise by small `solid_hat` on uncoated Virgin patches.
+    """
     if x0_hat.shape[1] < 2:
         return torch.zeros((), device=x0_hat.device, dtype=torch.float32)
 
@@ -122,9 +126,12 @@ def catalyst_loading_conservation_loss(
     solid_true = ((x0_true[:, 0].clamp(-1.0, 1.0) + 1.0) * 0.5).mean(dim=(1, 2, 3))
     coat_true = ((x0_true[:, 1].clamp(-1.0, 1.0) + 1.0) * 0.5).mean(dim=(1, 2, 3))
 
+    is_coated = (coat_true > 1e-4).to(dtype=torch.float32)
     ratio_hat = coat_hat / (solid_hat + 1e-3)
     ratio_true = coat_true / (solid_true + 1e-3)
-    return (sample_weights * (ratio_hat - ratio_true).pow(2)).mean()
+    coated_err = is_coated * (ratio_hat - ratio_true).pow(2)
+    uncoated_err = (1.0 - is_coated) * F.relu(x0_hat[:, 1] + 0.95).mean(dim=(1, 2, 3)).pow(2)
+    return (sample_weights * (coated_err + uncoated_err)).mean()
 
 
 class PhysicsInformedDiffusionLoss(nn.Module):
@@ -158,6 +165,7 @@ class PhysicsInformedDiffusionLoss(nn.Module):
         x_t: torch.Tensor,
         x_0: torch.Tensor,
         timesteps: torch.Tensor,
+        cond_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Compute total physics-informed diffusion loss and detached diagnostic components."""
         pred_f = model_pred.float()
@@ -174,6 +182,11 @@ class PhysicsInformedDiffusionLoss(nn.Module):
         loss_diff = (w_snr * per_sample_mse).mean()
 
         ab_weights = self.alphas_cumprod.to(device=x_t.device)[timesteps].clamp(min=0.05)
+        cond_weights = (
+            ab_weights * cond_mask.view(-1).to(device=ab_weights.device, dtype=torch.float32)
+            if cond_mask is not None
+            else ab_weights
+        )
         x0_hat = reconstruct_x0(
             x_t=x_t,
             model_pred=pred_f,
@@ -183,7 +196,7 @@ class PhysicsInformedDiffusionLoss(nn.Module):
         )
 
         loss_iface = (
-            spatial_gradient_l1(x0_hat, x0_f, ab_weights)
+            spatial_gradient_l1(x0_hat, x0_f, cond_weights)
             if self.interface_weight > 0.0
             else torch.zeros_like(loss_diff)
         )
@@ -193,7 +206,7 @@ class PhysicsInformedDiffusionLoss(nn.Module):
             else torch.zeros_like(loss_diff)
         )
         loss_loading = (
-            catalyst_loading_conservation_loss(x0_hat, x0_f, ab_weights)
+            catalyst_loading_conservation_loss(x0_hat, x0_f, cond_weights)
             if self.loading_weight > 0.0
             else torch.zeros_like(loss_diff)
         )

@@ -172,6 +172,9 @@ OI_CLAMP_ARGS=()
 if [ -f "${OUT_BENCH}/openimpala_transport_parity.csv" ]; then
     OI_CLAMP_ARGS+=(--openimpala-csv "${OUT_BENCH}/openimpala_transport_parity.csv")
 fi
+if [ "${RUN_OPENIMPALA:-1}" = "1" ] && python -c "import openimpala" >/dev/null 2>&1; then
+    OI_CLAMP_ARGS+=(--run-openimpala)
+fi
 
 python -u scripts/evaluation/optimize_clamping_pressure.py \
     --experiments "porousdiff=${EXP_CSV}" \

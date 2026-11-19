@@ -23,6 +23,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.interpolate import PchipInterpolator
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -236,6 +237,7 @@ def main() -> None:
                     "voxel_size_um": float(sc.get("effective_voxel_size_um", args.voxel_size_um)),
                     "num_phases": int(sc.get("num_phases", 2)),
                     "patch_dir_name": sc.get("patch_dir_name"),
+                    "strain_z": sc.get("strain_z"),
                 }
             )
     elif args.states:
@@ -255,6 +257,7 @@ def main() -> None:
                     "voxel_size_um": args.voxel_size_um,
                     "num_phases": 3 if infer_material_name(st) != "virgin_carbon" else 2,
                     "patch_dir_name": None,
+                    "strain_z": None,
                 }
             )
     else:
@@ -306,7 +309,7 @@ def main() -> None:
     vc_same_load_by_group: dict[tuple[str, str], np.ndarray] = {}
     vc_extrap_by_group: dict[tuple[str, str], dict[str, object]] = {}
     lagrangian_cache_by_state: dict[str, np.ndarray] = {}
-    lagrangian_info_by_state: dict[str, dict[str, float]] = {}
+    lagrangian_info_by_state: dict[str, dict[str, object]] = {}
     if args.include_virtual_compression or args.include_lagrangian_slab:
         if torch.cuda.is_available():
             vc_device = torch.device("cuda")
@@ -339,6 +342,7 @@ def main() -> None:
             num_materials=vc_num_materials,
             ref_voxel_size_um=float(vc_cfg.get("ref_voxel_size_um", 1.0)),
             use_ordinal_material_channel=infer_use_ordinal_material_channel(saved_ckpt),
+            cfg_mode=str(vc_cfg.get("cfg_mode", "all")),
         ).to(vc_device)
         if "ema" in saved_ckpt:
             vc_ema = EMAModel(vc_model)
@@ -364,6 +368,9 @@ def main() -> None:
         specs_by_group: dict[tuple[str, str], list[dict[str, object]]] = {}
         for sp in state_specs:
             specs_by_group.setdefault((str(sp["material"]), str(sp["beamline"])), []).append(sp)
+
+        first_lbl = next(iter(exp_map.keys()))
+        first_exp_list = exp_map[first_lbl]
 
         for (mat, beam), grp_specs in specs_by_group.items():
             ref_st = lowest_state_by_group[(mat, beam)]
@@ -402,10 +409,50 @@ def main() -> None:
 
             if args.include_lagrangian_slab:
                 tall_src = tall_ref_cache[ref_st]
+                # Build strictly non-heldout solid-fraction curve (never peeks at heldout_set)
+                train_pairs: dict[float, float] = {}
+                for sp_tr in grp_specs:
+                    st_tr = str(sp_tr["state"])
+                    if st_tr not in heldout_set:
+                        lv_tr = float(sp_tr["load_value"])  # type: ignore[arg-type]
+                        train_pairs[lv_tr] = float((real_cache[st_tr] >= 1).mean())
+                if not train_pairs:
+                    train_pairs[ref_lv] = float((tall_src >= 1).mean())
+                tr_lvs = np.asarray(sorted(train_pairs.keys()), dtype=np.float64)
+                tr_sfs = np.asarray([train_pairs[k] for k in tr_lvs], dtype=np.float64)
+
                 for sp in grp_specs:
                     st_k = str(sp["state"])
                     lv_k = float(sp["load_value"])  # type: ignore[arg-type]
-                    target_sf_k = max(float((real_cache[st_k] >= 1).mean()), 1e-3)
+                    raw_sz = sp.get("strain_z")
+                    # Zero-leakage target selection:
+                    # 1. PorousDiff blind generated ensemble mean phi_s (when sampled)
+                    # 2. Macroscopic mechanical strain_z from specimen load-frame height
+                    # 3. Non-heldout training PCHIP interpolation
+                    gen_sfs = [
+                        float((_load_generated_volumes(args.output_root / "results" / e_n / "samples", st_k) >= 1).mean())
+                        for e_n in first_exp_list
+                        if (args.output_root / "results" / e_n / "samples" / st_k).is_dir()
+                    ]
+                    target_sf_k: float | None = None
+                    comp_ratio_k: float | None = None
+                    if st_k == ref_st:
+                        comp_ratio_k = 1.0
+                        target_source = "reference_uncompressed"
+                    elif gen_sfs:
+                        target_sf_k = float(np.clip(np.mean(gen_sfs), 1e-3, 0.95))
+                        target_source = "porousdiff_blind"
+                    elif raw_sz is not None and np.isfinite(float(raw_sz)) and 0.0 <= float(raw_sz) < 0.90:  # type: ignore[arg-type]
+                        comp_ratio_k = max(0.15, 1.0 - float(raw_sz))  # type: ignore[arg-type]
+                        target_source = "mechanical_strain_z"
+                    elif tr_lvs.size >= 2:
+                        interp_sf = float(PchipInterpolator(tr_lvs, tr_sfs)(lv_k))
+                        target_sf_k = float(np.clip(interp_sf, 1e-3, 0.95))
+                        target_source = "non_heldout_interp"
+                    else:
+                        target_sf_k = float(np.clip(tr_sfs[0], 1e-3, 0.95))
+                        target_source = "non_heldout_interp"
+
                     lag_vols: list[np.ndarray] = []
                     lag_infos: list[dict[str, float]] = []
                     for s_idx, rv in enumerate(tall_src):
@@ -416,6 +463,7 @@ def main() -> None:
                             target_load=lv_k,
                             patch_size=args.patch_size,
                             target_solid_fraction=target_sf_k,
+                            compression_ratio=comp_ratio_k,
                             output_depth=args.patch_size,
                             prediction_type=str(vc_cfg["prediction_type"]),
                             num_steps=args.virtual_steps,
@@ -430,10 +478,13 @@ def main() -> None:
                         lag_vols.append(lv_vol)
                         lag_infos.append(lv_info)
                     lagrangian_cache_by_state[st_k] = np.stack(lag_vols, axis=0)
-                    lagrangian_info_by_state[st_k] = {
+                    agg_lag_info: dict[str, object] = {
                         k: round(float(np.mean([inf[k] for inf in lag_infos])), 6)
                         for k in lag_infos[0]
                     }
+                    agg_lag_info["target_source"] = target_source
+                    agg_lag_info["uses_heldout_oracle_porosity"] = False
+                    lagrangian_info_by_state[st_k] = agg_lag_info
 
     max_lag = min(32, args.patch_size // 2)
     report: dict[str, object] = {}
@@ -597,9 +648,11 @@ def main() -> None:
                 s2_std = 0.0
 
             s2_gain_vs_noop = round(noop_s2_err - s2_err, 6)
+            is_oracle_baseline = m_name in ("affine_z_squash", "pillar_pore_deletion")
             m_entry: dict[str, object] = {
                 "num_volumes": int(m_vols.shape[0]),
                 "num_seeds": max(1, len(seed_vols_list)),
+                "uses_heldout_oracle_porosity": is_oracle_baseline,
                 "s2_rmse": s2_err,
                 "s2_rmse_std": s2_std,
                 "s2_improvement_over_noop": s2_gain_vs_noop,
@@ -620,6 +673,7 @@ def main() -> None:
                 "load_unit": unit_label,
                 "is_heldout": is_heldout,
                 "method": m_name,
+                "uses_heldout_oracle_porosity": is_oracle_baseline,
                 "num_seeds": max(1, len(seed_vols_list)),
                 "s2_rmse": round(s2_err, 6),
                 "s2_rmse_std": round(s2_std, 6),

@@ -259,6 +259,12 @@ def main() -> None:
     )
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--cfg-drop-prob", type=float, default=0.10)
+    parser.add_argument(
+        "--cfg-mode",
+        default="auto",
+        choices=["auto", "load_only", "all"],
+        help="CFG dropout masking: 'load_only' keeps material_id & voxel_size anchored during unconditional passes (auto='load_only' for multi-modal)",
+    )
     parser.add_argument("--ema-decay", type=float, default=0.9995)
     parser.add_argument(
         "--physics-loss",
@@ -475,6 +481,17 @@ def main() -> None:
             pin_memory=pin,
         )
 
+    latest_path = checkpoint_dir / "latest.pth"
+    best_path = checkpoint_dir / "best_val.pth"
+    if args.cfg_mode == "auto":
+        if args.resume and latest_path.is_file():
+            peek_cfg = torch.load(latest_path, map_location="cpu", weights_only=False).get("config", {})
+            eff_cfg_mode = str(peek_cfg.get("cfg_mode", "all"))
+        else:
+            eff_cfg_mode = "load_only" if (num_phases == 3 or num_materials > 1) else "all"
+    else:
+        eff_cfg_mode = str(args.cfg_mode)
+
     model = ContinuousLoadConditionedUNet(
         channels=channels,
         attention_levels=attention_levels,
@@ -488,6 +505,7 @@ def main() -> None:
         num_materials=num_materials,
         ref_voxel_size_um=ref_vox,
         use_ordinal_material_channel=args.ordinal_material_channel,
+        cfg_mode=eff_cfg_mode,
     ).to(device)
 
     ema = EMAModel(model, decay=args.ema_decay)
@@ -536,6 +554,7 @@ def main() -> None:
         "use_stress_kpa": args.use_stress_kpa,
         "allow_z_flip": not args.no_z_flip,
         "use_ordinal_material_channel": bool(args.ordinal_material_channel),
+        "cfg_mode": eff_cfg_mode,
         "heldout_states": sorted(args.exclude_states) if args.exclude_states else [],
         "include_states": sorted(args.include_states) if args.include_states else None,
         "physics_loss": args.physics_loss,
@@ -546,8 +565,6 @@ def main() -> None:
         "version": args.version,
     }
 
-    latest_path = checkpoint_dir / "latest.pth"
-    best_path = checkpoint_dir / "best_val.pth"
     history: list[dict[str, object]] = []
     start_epoch = 0
     best_val_loss = float("inf")
@@ -635,6 +652,7 @@ def main() -> None:
                     x_t=noisy,
                     x_0=images,
                     timesteps=timesteps,
+                    cond_mask=cond_mask,
                 )
             else:
                 loss = F.mse_loss(pred.float(), target.float())

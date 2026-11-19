@@ -25,13 +25,20 @@ from scipy.interpolate import PchipInterpolator
 from porousdiff.metrics import CAUCHY_CROFTON_3D_FACTOR
 
 
-def load_openimpala_lookup(
+def load_openimpala_records(
     csv_path: Path,
-) -> dict[tuple[str, str], dict[str, float]]:
-    """Group `openimpala_transport_parity.csv` rows by `(method, state)` into mean transport dicts."""
+) -> dict[tuple[str, str], list[dict[str, float]]]:
+    """Group `openimpala_transport_parity.csv` rows by `(method, state)` into per-realization dicts.
+
+    Preserves deterministic realization order (`stem` extracted from `job_id = method__state__stem__phase`,
+    or sequential occurrence index per transport phase when `job_id` is absent) so each OpenImpala PDE
+    solve pairs 1-to-1 with its corresponding 3D volume realization.
+    """
     if not csv_path.is_file():
         return {}
-    buckets: dict[tuple[str, str], dict[str, list[float]]] = {}
+    per_stem: dict[tuple[str, str], dict[str, dict[str, list[float]]]] = {}
+    fallback_counters: dict[tuple[str, str, str], int] = {}
+
     with csv_path.open("r", newline="") as f:
         for row in csv.DictReader(f):
             method = str(row.get("method", "")).strip()
@@ -46,27 +53,64 @@ def load_openimpala_lookup(
                 continue
             if not np.isfinite(val):
                 continue
-            key = (method, state)
-            entry = buckets.setdefault(
-                key,
+
+            if "pore" in phase or "ion" in phase:
+                slot = "pore_d_eff_z"
+            elif "hetero" in phase:
+                slot = "solid_hetero_sigma_eff_z"
+            elif "carbon" in phase or "solid" in phase or "elec" in phase:
+                slot = "solid_sigma_eff_z"
+            else:
+                continue
+
+            job_id = str(row.get("job_id", "")).strip()
+            parts = job_id.split("__") if job_id else []
+            if len(parts) >= 4 and parts[0] == method and parts[1] == state:
+                stem = "__".join(parts[2:-1])
+            else:
+                cnt_key = (method, state, slot)
+                seq_i = fallback_counters.get(cnt_key, 0) + 1
+                fallback_counters[cnt_key] = seq_i
+                stem = f"sample_{seq_i:04d}"
+
+            state_map = per_stem.setdefault((method, state), {})
+            stem_bucket = state_map.setdefault(
+                stem,
                 {"pore_d_eff_z": [], "solid_sigma_eff_z": [], "solid_hetero_sigma_eff_z": []},
             )
-            if "pore" in phase or "ion" in phase:
-                entry["pore_d_eff_z"].append(val)
-            elif "hetero" in phase:
-                entry["solid_hetero_sigma_eff_z"].append(val)
-            elif "carbon" in phase or "solid" in phase or "elec" in phase:
-                entry["solid_sigma_eff_z"].append(val)
+            stem_bucket[slot].append(val)
 
+    out: dict[tuple[str, str], list[dict[str, float]]] = {}
+    for key, stem_map in per_stem.items():
+        recs: list[dict[str, float]] = []
+        for stem in sorted(stem_map.keys()):
+            vals = stem_map[stem]
+            rec: dict[str, float] = {}
+            if vals["pore_d_eff_z"]:
+                rec["pore_d_eff_z"] = float(np.mean(vals["pore_d_eff_z"]))
+            if vals["solid_hetero_sigma_eff_z"]:
+                rec["solid_hetero_sigma_eff_z"] = float(np.mean(vals["solid_hetero_sigma_eff_z"]))
+            if vals["solid_sigma_eff_z"]:
+                rec["solid_sigma_eff_z"] = float(np.mean(vals["solid_sigma_eff_z"]))
+            if rec:
+                recs.append(rec)
+        if recs:
+            out[key] = recs
+    return out
+
+
+def load_openimpala_lookup(
+    csv_path: Path,
+) -> dict[tuple[str, str], dict[str, float]]:
+    """Group `openimpala_transport_parity.csv` rows by `(method, state)` into mean transport dicts."""
+    records_map = load_openimpala_records(csv_path)
     lookup: dict[tuple[str, str], dict[str, float]] = {}
-    for key, vals in buckets.items():
+    for key, recs in records_map.items():
         agg: dict[str, float] = {}
-        if vals["pore_d_eff_z"]:
-            agg["pore_d_eff_z"] = float(np.mean(vals["pore_d_eff_z"]))
-        if vals["solid_hetero_sigma_eff_z"]:
-            agg["solid_hetero_sigma_eff_z"] = float(np.mean(vals["solid_hetero_sigma_eff_z"]))
-        if vals["solid_sigma_eff_z"]:
-            agg["solid_sigma_eff_z"] = float(np.mean(vals["solid_sigma_eff_z"]))
+        for field in ("pore_d_eff_z", "solid_hetero_sigma_eff_z", "solid_sigma_eff_z"):
+            fvals = [r[field] for r in recs if field in r and np.isfinite(r[field])]
+            if fvals:
+                agg[field] = float(np.mean(fvals))
         if agg:
             lookup[key] = agg
     return lookup
@@ -78,12 +122,15 @@ def compute_transport_and_fom_record(
     voxel_size_um: float = 1.0,
     strain_z: float | None = None,
     use_cauchy_crofton_ssa: bool = True,
+    tpb_ribbon_weight: float = 0.0,
 ) -> dict[str, float]:
     """Compute ionic, electronic, hydraulic, kinetic, and constriction observables for a 3D realization."""
     sf = float(phys_metrics.get("solid_fraction", 0.0))
     porosity = float(phys_metrics.get("porosity", max(0.0, 1.0 - sf)))
     coat_frac = float(phys_metrics.get("coating_fraction", 0.0))
     tau_pore_z = float(phys_metrics.get("geodesic_tortuosity_z", float("nan")))
+    tau_pore_y = float(phys_metrics.get("geodesic_tortuosity_y", float("nan")))
+    tau_pore_x = float(phys_metrics.get("geodesic_tortuosity_x", float("nan")))
     tau_solid_z = float(phys_metrics.get("geodesic_solid_tortuosity_z", float("nan")))
 
     # 1. Through-plane ionic effective diffusivity D_eff,Z / D_0
@@ -98,9 +145,14 @@ def compute_transport_and_fom_record(
         used_openimpala = 0.0
 
     # Continuum pore-throat constriction factor beta_Z = (D_eff,Z^PDE * tau_geo,Z^2) / porosity
-    if used_openimpala > 0.5 and porosity > 1e-6 and np.isfinite(tau_pore_z) and tau_pore_z >= 1.0:
-        constriction_factor_z = float(d_eff_pore_z * (tau_pore_z**2) / porosity)
+    if used_openimpala > 0.5 and porosity > 1e-6:
+        variational_bound_ok = float(d_eff_pore_z <= porosity + 1e-3)
+        if np.isfinite(tau_pore_z) and tau_pore_z >= 1.0:
+            constriction_factor_z = float(d_eff_pore_z * (tau_pore_z**2) / porosity)
+        else:
+            constriction_factor_z = 0.0 if d_eff_pore_z == 0.0 else float("nan")
     else:
+        variational_bound_ok = float("nan")
         constriction_factor_z = float("nan")
 
     # 2. Through-plane electronic effective conductivity sigma_eff,Z / sigma_0
@@ -129,15 +181,23 @@ def compute_transport_and_fom_record(
         # Fallback Bruggeman-percolation estimate when thin patches barely miss Z-face contact
         sigma_eff_solid_z = float((sf**1.8) * elec_factor * 0.25)
 
-    # 3. Carman-Kozeny hydraulic permeability proxy (um^2)
-    pore_chord_um = float(phys_metrics.get("pore_chord_z", 0.0)) * max(voxel_size_um, 1e-4)
-    if np.isfinite(tau_pore_z) and tau_pore_z >= 1.0 and porosity > 1e-4:
-        denom = 180.0 * max((1.0 - porosity) ** 2, 1e-5) * (tau_pore_z**2)
-        perm_ck_um2 = float((porosity**3) * (pore_chord_um**2) / denom)
-    else:
-        perm_ck_um2 = 0.0
+    # 3. Directional Carman-Kozeny hydraulic permeability proxies (um^2): through-plane K_Z & in-plane K_XY
+    vox_safe = max(float(voxel_size_um), 1e-4)
 
-    # 4. Electrochemically active wired interfacial density (1/um; Cauchy-Crofton 2/3 default)
+    def _ck_axis(chord_key: str, tau_val: float) -> float:
+        chord_um = float(phys_metrics.get(chord_key, 0.0)) * vox_safe
+        if np.isfinite(tau_val) and tau_val >= 1.0 and porosity > 1e-4 and chord_um > 0.0:
+            denom = 180.0 * max((1.0 - porosity) ** 2, 1e-5) * (tau_val**2)
+            return float((porosity**3) * (chord_um**2) / denom)
+        return 0.0
+
+    perm_ck_um2 = _ck_axis("pore_chord_z", tau_pore_z)
+    kx = _ck_axis("pore_chord_x", tau_pore_x)
+    ky = _ck_axis("pore_chord_y", tau_pore_y)
+    xy_vals = [v for v in (kx, ky) if v > 0.0]
+    perm_ck_xy_um2 = float(np.mean(xy_vals)) if xy_vals else perm_ck_um2
+
+    # 4. Electrochemically active wired interfacial density (1/um; pure 2D Cauchy-Crofton default)
     ssa_coat_raw = float(phys_metrics.get("ssa_pore_coating", 0.0))
     ssa_coat_cc = float(
         phys_metrics.get("ssa_pore_coating_cc", ssa_coat_raw * CAUCHY_CROFTON_3D_FACTOR)
@@ -147,9 +207,10 @@ def compute_transport_and_fom_record(
     ssa_total_cc = float(
         phys_metrics.get("ssa_total_cc", ssa_total_raw * CAUCHY_CROFTON_3D_FACTOR)
     )
+    tpb_add = float(tpb_ribbon_weight) * vox_safe * tpb * wired_frac
     if is_coated:
-        active_interface_raw = float(ssa_coat_raw * wired_frac + 0.05 * voxel_size_um * tpb * wired_frac)
-        active_interface_cc = float(ssa_coat_cc * wired_frac + 0.05 * voxel_size_um * tpb * wired_frac)
+        active_interface_raw = float(ssa_coat_raw * wired_frac + tpb_add)
+        active_interface_cc = float(ssa_coat_cc * wired_frac + tpb_add)
     else:
         active_interface_raw = float(ssa_total_raw * solid_conn)
         active_interface_cc = float(ssa_total_cc * solid_conn)
@@ -164,8 +225,10 @@ def compute_transport_and_fom_record(
         "strain_z": strain_val,
         "d_eff_pore_z": d_eff_pore_z,
         "constriction_factor_z": constriction_factor_z,
+        "variational_bound_ok": variational_bound_ok,
         "sigma_eff_solid_z": sigma_eff_solid_z,
         "permeability_ck_um2": perm_ck_um2,
+        "permeability_ck_xy_um2": perm_ck_xy_um2,
         "active_wired_interface": active_interface,
         "active_wired_interface_cc": active_interface_cc,
         "active_wired_interface_raw": active_interface_raw,
@@ -238,15 +301,16 @@ def evaluate_newman_asr_curve(
     r_ct_ohm_cm2: float = 2.5,
     r_mt_ohm_cm2: float = 0.05,
     r_contact_base_ohm_cm2: float = 0.04,
-    pump_penalty_ohm_cm2_um2_cm: float = 1.5e-3,
+    pump_penalty_ohm_cm2_um2_cm: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Evaluate dimensional 1D Newman & Tobias porous-electrode ASR (`Ohm * cm^2`) on `grid_loads`.
 
-    Incorporates macroscopic compressed thickness shrinkage `L(sigma) = L_0 * (1 - strain_z)`
+    Defaults to static Swagelok / coin / pouch cell architecture (`pump_penalty_ohm_cm2_um2_cm = 0.0`):
+    combines macroscopic compressed thickness shrinkage `L(sigma) = L_0 * (1 - strain_z)`
     (or uniaxial solid-conservation `L_0 * phi_s,min / phi_s(sigma)` when `strain_z` is absent),
-    analytical 1D porous-electrode transmission-line polarization `R_tl(sigma)`, Nernst diffusive
-    mass-transport concentration resistance `R_mt(sigma)`, clamping contact resistance `R_contact(sigma)`,
-    and flow-through hydraulic pumping penalty `R_pump(sigma)`.
+    analytical 1D porous-electrode transmission-line polarization `R_tl(sigma)`, thickness-scaled
+    Nernst electrolyte salt-depletion concentration resistance `R_mt(sigma)`, clamping contact
+    resistance `R_contact(sigma)`, and optional in-plane hydraulic pumping sensitivity `R_pump(sigma)`.
     """
     l0_cm = max(float(uncompressed_thickness_cm), 1e-3)
     ref_sf = float(max(np.min(solid_frac), 1e-3))
@@ -301,9 +365,12 @@ def evaluate_newman_asr_curve(
             np.sqrt(rk_b) * ((ri_b**2 + re_b**2) * coth_nu + 2.0 * ri_b * re_b * csch_nu)
         ) / (rs_b**1.5)
 
-    r_mt = r_mt_ohm_cm2 / np.maximum(d_g, 1e-6)
+    r_mt = r_mt_ohm_cm2 * (l_cm / l0_cm) / np.maximum(d_g, 1e-6)
     r_contact = r_contact_base_ohm_cm2 / np.maximum(sf_g + 2.0 * zp_g, 0.02)
-    r_pump = pump_penalty_ohm_cm2_um2_cm / np.maximum(k_g * l_cm, 1e-4)
+    if pump_penalty_ohm_cm2_um2_cm > 0.0:
+        r_pump = pump_penalty_ohm_cm2_um2_cm / np.maximum(k_g * l_cm, 1e-4)
+    else:
+        r_pump = np.zeros_like(grid_loads, dtype=np.float64)
     asr_grid = r_tl + r_mt + r_contact + r_pump
     return asr_grid, l_cm
 
@@ -314,21 +381,28 @@ NEWMAN_REGIMES: dict[str, dict[str, float]] = {
         "sigma_bulk_s_cm": 2.0,
         "r_ct_ohm_cm2": 6.0,
         "r_mt_ohm_cm2": 0.01,
-        "pump_penalty_ohm_cm2_um2_cm": 5e-4,
+        "pump_penalty_ohm_cm2_um2_cm": 0.0,
     },
     "balanced": {
         "kappa_bulk_s_cm": 0.05,
         "sigma_bulk_s_cm": 2.0,
         "r_ct_ohm_cm2": 2.5,
         "r_mt_ohm_cm2": 0.05,
-        "pump_penalty_ohm_cm2_um2_cm": 1.5e-3,
+        "pump_penalty_ohm_cm2_um2_cm": 0.0,
     },
     "mass_transport_limited": {
         "kappa_bulk_s_cm": 0.025,
         "sigma_bulk_s_cm": 2.0,
         "r_ct_ohm_cm2": 0.8,
         "r_mt_ohm_cm2": 0.22,
-        "pump_penalty_ohm_cm2_um2_cm": 6e-3,
+        "pump_penalty_ohm_cm2_um2_cm": 0.0,
+    },
+    "flow_pumped_sensitivity": {
+        "kappa_bulk_s_cm": 0.05,
+        "sigma_bulk_s_cm": 2.0,
+        "r_ct_ohm_cm2": 2.5,
+        "r_mt_ohm_cm2": 0.05,
+        "pump_penalty_ohm_cm2_um2_cm": 1.5e-3,
     },
 }
 
@@ -397,6 +471,13 @@ def find_optimal_clamping_pressure(
         [np.mean([float(r["permeability_ck_um2"]) for r in records_by_load[lv]]) for lv in sorted_loads],
         dtype=np.float64,
     )
+    mean_perm_xy = np.asarray(
+        [
+            np.mean([float(r.get("permeability_ck_xy_um2", r["permeability_ck_um2"])) for r in records_by_load[lv]])
+            for lv in sorted_loads
+        ],
+        dtype=np.float64,
+    )
     mean_sf = np.asarray(
         [np.mean([float(r.get("solid_fraction", 0.15)) for r in records_by_load[lv]]) for lv in sorted_loads],
         dtype=np.float64,
@@ -460,7 +541,7 @@ def find_optimal_clamping_pressure(
         mean_sigma,
         mean_active,
         mean_sf,
-        mean_perm,
+        mean_perm_xy,
         mean_zpinch,
         mean_strain,
         grid_loads,
@@ -478,7 +559,7 @@ def find_optimal_clamping_pressure(
             mean_sigma,
             mean_active,
             mean_sf,
-            mean_perm,
+            mean_perm_xy,
             mean_zpinch,
             mean_strain,
             grid_loads,
@@ -516,7 +597,9 @@ def find_optimal_clamping_pressure(
                 b_sig[i] = np.mean([float(recs[j]["sigma_eff_solid_z"]) for j in pick])
                 b_act[i] = np.mean([float(recs[j]["active_wired_interface"]) for j in pick])
                 b_sf[i] = np.mean([float(recs[j].get("solid_fraction", 0.15)) for j in pick])
-                b_perm[i] = np.mean([float(recs[j].get("permeability_ck_um2", 1.0)) for j in pick])
+                b_perm[i] = np.mean(
+                    [float(recs[j].get("permeability_ck_xy_um2", recs[j].get("permeability_ck_um2", 1.0))) for j in pick]
+                )
                 b_zp[i] = np.mean([float(recs[j].get("z_pinch_contact_density", 0.0)) for j in pick])
             b_fom, _, _, _, _ = _evaluate_harmonic_fom_curve(
                 loads_arr, b_deff, b_sig, b_act, grid_loads, weights=weights, norm_scales=scales
@@ -572,7 +655,7 @@ def find_optimal_clamping_pressure(
         mean_sigma,
         mean_active,
         mean_sf,
-        mean_perm,
+        mean_perm_xy,
         mean_zpinch,
         mean_strain,
         loads_arr,
@@ -594,6 +677,7 @@ def find_optimal_clamping_pressure(
                 "constriction_factor_z": mean_beta_z,
                 "sigma_eff_solid_z": float(mean_sigma[i]),
                 "permeability_ck_um2": float(mean_perm[i]),
+                "permeability_ck_xy_um2": float(mean_perm_xy[i]),
                 "active_wired_interface": float(mean_active[i]),
                 "wired_coating_fraction": float(
                     np.mean([float(r.get("wired_coating_fraction", 1.0)) for r in recs])
@@ -647,10 +731,11 @@ def find_optimal_clamping_pressure(
             "active_wired_interface": scales[2],
         },
         "newman_asr": {
+            "cell_architecture": "static_swagelok_coin_pouch",
             "parameter_note": (
-                "1D Newman-Tobias porous-electrode ASR (not parameter-free: parameterized by bulk conductivities "
-                "kappa_0, sigma_0, interfacial kinetics R_ct, mass-transport R_mt, and pumping/contact terms; "
-                "see regime_sensitivity)."
+                "1D Newman-Tobias porous-electrode ASR for static Swagelok/coin/pouch cells (not parameter-free; "
+                "pump_penalty=0 default; parameterized by bulk conductivities kappa_0, sigma_0, interfacial kinetics "
+                "R_ct, thickness-scaled Nernst mass-transport R_mt, and clamping contact resistance; see regime_sensitivity)."
             ),
             "kinetic_area_convention": "cauchy_crofton_2_3",
             "uncompressed_thickness_cm": float(uncompressed_thickness_cm),

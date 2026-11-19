@@ -19,6 +19,7 @@ import csv
 import json
 import sys
 from pathlib import Path
+from typing import Sequence
 
 import matplotlib
 matplotlib.use("Agg")
@@ -52,9 +53,13 @@ from porousdiff.models import (
 from porousdiff.optimization import (
     compute_transport_and_fom_record,
     find_optimal_clamping_pressure,
-    load_openimpala_lookup,
+    load_openimpala_records,
 )
 from porousdiff.preprocessing import infer_material_name, parse_load_value
+from porousdiff.transport_and_xrd import (
+    compute_openimpala_volume_transport,
+    has_openimpala_python,
+)
 
 
 def _parse_experiments(entries: list[str]) -> dict[str, list[str]]:
@@ -82,6 +87,47 @@ def _load_generated_volumes(samples_dir: Path, state_name: str) -> np.ndarray:
     return np.stack([np.load(p) for p in files], axis=0)
 
 
+def _pair_volumes_with_openimpala(
+    vols: Sequence[np.ndarray] | np.ndarray,
+    oi_recs: Sequence[dict[str, float]] | None,
+    voxel_size_um: float,
+    strain_z: float | None,
+    solve_in_process: bool = False,
+) -> list[dict[str, float]]:
+    """Pair each 3D volume 1-to-1 with its matching OpenImpala PDE record (never broadcasting a group mean)."""
+    vol_list = list(vols)
+    if oi_recs is None and not solve_in_process:
+        return [
+            compute_transport_and_fom_record(
+                evaluate_multiphase_physics(v, voxel_size=voxel_size_um),
+                openimpala_metrics=None,
+                voxel_size_um=voxel_size_um,
+                strain_z=strain_z,
+            )
+            for v in vol_list
+        ]
+
+    paired: list[dict[str, float]] = []
+    cached = list(oi_recs) if oi_recs is not None else []
+    can_solve = solve_in_process and has_openimpala_python()
+    for idx, v in enumerate(vol_list):
+        if idx < len(cached):
+            oi_m = cached[idx]
+        elif can_solve:
+            oi_m = compute_openimpala_volume_transport(v, voxel_size_um=voxel_size_um)["lookup_summary"]  # type: ignore[assignment]
+        else:
+            break
+        paired.append(
+            compute_transport_and_fom_record(
+                evaluate_multiphase_physics(v, voxel_size=voxel_size_um),
+                openimpala_metrics=oi_m,
+                voxel_size_um=voxel_size_um,
+                strain_z=strain_z,
+            )
+        )
+    return paired
+
+
 @torch.inference_mode()
 def _sample_dense_sweep_for_material(
     active_model: ContinuousLoadConditionedUNet,
@@ -95,6 +141,7 @@ def _sample_dense_sweep_for_material(
     seed: int,
     use_amp: bool,
     amp_dtype: torch.dtype,
+    use_openimpala: bool = False,
 ) -> dict[float, list[dict[str, float]]]:
     """Generate a continuous stress sweep with shared latent seeds to resolve `sigma*` finely."""
     device = next(active_model.parameters()).device
@@ -135,17 +182,24 @@ def _sample_dense_sweep_for_material(
                     material_ids=mats_t,
                     voxel_sizes=voxs_t,
                 )
-            img = scheduler.step(pred.float(), t_int, img, generator=step_gen)[0]  # type: ignore[attr-defined]
+            step_out = scheduler.step(pred.float(), t_int, img, generator=step_gen)[0]  # type: ignore[attr-defined]
+            img = torch.nan_to_num(step_out, nan=0.0, posinf=1.0, neginf=-1.0)
 
         vols = decode_channels_to_phases(img.float().cpu().numpy(), enforce_solid_support=True)
-        recs = [
-            compute_transport_and_fom_record(
-                evaluate_multiphase_physics(v, voxel_size=voxel_size_um),
-                openimpala_metrics=None,
-                voxel_size_um=voxel_size_um,
+        recs: list[dict[str, float]] = []
+        for v in vols:
+            oi_m = (
+                compute_openimpala_volume_transport(v, voxel_size_um=voxel_size_um)["lookup_summary"]  # type: ignore[assignment]
+                if use_openimpala
+                else None
             )
-            for v in vols
-        ]
+            recs.append(
+                compute_transport_and_fom_record(
+                    evaluate_multiphase_physics(v, voxel_size=voxel_size_um),
+                    openimpala_metrics=oi_m,
+                    voxel_size_um=voxel_size_um,
+                )
+            )
         records_by_load[lv_f] = recs
     return records_by_load
 
@@ -181,7 +235,17 @@ def main() -> None:
         "--openimpala-csv",
         type=Path,
         default=None,
-        help="Optional openimpala_transport_parity.csv from parse_openimpala_suite.py",
+        help="Optional openimpala_transport_parity.csv from parse_openimpala_suite.py / --run-openimpala",
+    )
+    parser.add_argument(
+        "--run-openimpala",
+        action="store_true",
+        help="Solve OpenImpala v4.6 PDE in-process across uncached realizations and dense sweep samples",
+    )
+    parser.add_argument(
+        "--allow-mixed-dense-estimator",
+        action="store_true",
+        help="Allow geodesic-surrogate porousdiff_dense curve alongside OpenImpala discrete curves when openimpala is uninstalled",
     )
     parser.add_argument(
         "--weights",
@@ -231,7 +295,7 @@ def main() -> None:
         if args.openimpala_csv is not None
         else (args.output_root / "results" / first_exp / "beamtime_benchmark" / "openimpala_transport_parity.csv")
     )
-    oi_lookup = load_openimpala_lookup(auto_oi_csv) if auto_oi_csv.is_file() else {}
+    oi_lookup = load_openimpala_records(auto_oi_csv) if auto_oi_csv.is_file() else {}
 
     # Build state specs from manifest, --states, or sampled directories
     state_specs: list[dict[str, object]] = []
@@ -410,33 +474,29 @@ def main() -> None:
         if st in real_cache:
             r_vols = real_cache[st]
             r_oi = oi_lookup.get(("real", st)) if oi_method_complete.get((mat, "real"), False) else None
-            r_recs = [
-                compute_transport_and_fom_record(
-                    evaluate_multiphase_physics(v, voxel_size=vox),
-                    openimpala_metrics=r_oi,
-                    voxel_size_um=vox,
-                    strain_z=sz_opt,
-                )
-                for v in r_vols
-            ]
+            r_recs = _pair_volumes_with_openimpala(
+                r_vols,
+                r_oi,
+                voxel_size_um=vox,
+                strain_z=sz_opt,
+                solve_in_process=args.run_openimpala,
+            )
             mat_bucket.setdefault("real", {}).setdefault(lv, []).extend(r_recs)
 
             ref_st_mat = lowest_state_by_mat[mat]
             noop_vols = real_cache[ref_st_mat]
             noop_oi = oi_lookup.get(("real", ref_st_mat)) if oi_method_complete.get((mat, "real"), False) else None
             mat_bucket.setdefault("noop_uncompressed", {}).setdefault(lv, []).extend(
-                [
-                    compute_transport_and_fom_record(
-                        evaluate_multiphase_physics(v, voxel_size=vox),
-                        openimpala_metrics=noop_oi,
-                        voxel_size_um=vox,
-                        strain_z=sz_opt,
-                    )
-                    for v in noop_vols
-                ]
+                _pair_volumes_with_openimpala(
+                    noop_vols,
+                    noop_oi,
+                    voxel_size_um=vox,
+                    strain_z=sz_opt,
+                    solve_in_process=args.run_openimpala,
+                )
             )
 
-            target_sf = float(np.mean([r["solid_fraction"] for r in r_recs]))
+            target_sf = float(np.mean([(v >= 1).mean() for v in r_vols]))
             ref_vols = tall_real_cache[ref_st_mat]
             aff_vols = [
                 affine_z_compress_to_target(rv, target_solid_fraction=max(target_sf, 1e-3), output_depth=args.patch_size)
@@ -462,51 +522,53 @@ def main() -> None:
                 else None
             )
             mat_bucket.setdefault("affine_z_squash", {}).setdefault(lv, []).extend(
-                [
-                    compute_transport_and_fom_record(
-                        evaluate_multiphase_physics(v, voxel_size=vox),
-                        openimpala_metrics=aff_oi,
-                        voxel_size_um=vox,
-                        strain_z=sz_opt,
-                    )
-                    for v in aff_vols
-                ]
+                _pair_volumes_with_openimpala(
+                    aff_vols,
+                    aff_oi,
+                    voxel_size_um=vox,
+                    strain_z=sz_opt,
+                    solve_in_process=args.run_openimpala,
+                )
             )
             mat_bucket.setdefault("pillar_pore_deletion", {}).setdefault(lv, []).extend(
-                [
-                    compute_transport_and_fom_record(
-                        evaluate_multiphase_physics(v, voxel_size=vox),
-                        openimpala_metrics=pil_oi,
-                        voxel_size_um=vox,
-                        strain_z=sz_opt,
-                    )
-                    for v in pil_vols
-                ]
+                _pair_volumes_with_openimpala(
+                    pil_vols,
+                    pil_oi,
+                    voxel_size_um=vox,
+                    strain_z=sz_opt,
+                    solve_in_process=args.run_openimpala,
+                )
             )
 
         for lbl, exp_list in exp_map.items():
+            g_oi_all = oi_lookup.get((lbl, st)) if oi_method_complete.get((mat, lbl), False) else None
+            oi_offset = 0
             for exp_name in exp_list:
                 samples_dir = args.output_root / "results" / exp_name / "samples"
                 if (samples_dir / st).is_dir():
                     g_vols = _load_generated_volumes(samples_dir, st)
-                    g_oi = oi_lookup.get((lbl, st)) if oi_method_complete.get((mat, lbl), False) else None
-                    g_recs = [
-                        compute_transport_and_fom_record(
-                            evaluate_multiphase_physics(v, voxel_size=vox),
-                            openimpala_metrics=g_oi,
-                            voxel_size_um=vox,
-                            strain_z=sz_opt,
-                        )
-                        for v in g_vols
-                    ]
-                    mat_bucket.setdefault(lbl, {}).setdefault(lv, []).extend(g_recs)
-                    (
-                        per_seed_records_tree.setdefault(mat, {})
-                        .setdefault(lbl, {})
-                        .setdefault(exp_name, {})
-                        .setdefault(lv, [])
-                        .extend(g_recs)
+                    seed_oi = (
+                        g_oi_all[oi_offset : oi_offset + int(g_vols.shape[0])]
+                        if g_oi_all is not None
+                        else None
                     )
+                    oi_offset += int(g_vols.shape[0])
+                    g_recs = _pair_volumes_with_openimpala(
+                        g_vols,
+                        seed_oi,
+                        voxel_size_um=vox,
+                        strain_z=sz_opt,
+                        solve_in_process=args.run_openimpala,
+                    )
+                    if g_recs:
+                        mat_bucket.setdefault(lbl, {}).setdefault(lv, []).extend(g_recs)
+                        (
+                            per_seed_records_tree.setdefault(mat, {})
+                            .setdefault(lbl, {})
+                            .setdefault(exp_name, {})
+                            .setdefault(lv, [])
+                            .extend(g_recs)
+                        )
 
     # Optional continuous dense PorousDiff sweep for high-resolution sigma* discovery
     if args.dense_sweep_points >= 3:
@@ -540,6 +602,7 @@ def main() -> None:
             num_materials=num_materials,
             ref_voxel_size_um=float(cfg.get("ref_voxel_size_um", 1.0)),
             use_ordinal_material_channel=infer_use_ordinal_material_channel(saved),
+            cfg_mode=str(cfg.get("cfg_mode", "all")),
         ).to(device)
         if "ema" in saved:
             ema = EMAModel(model)
@@ -566,6 +629,21 @@ def main() -> None:
             mat_loads = sorted({float(sp["load_value"]) for sp in state_specs if str(sp["material"]) == mat})  # type: ignore[arg-type]
             if len(mat_loads) < 2:
                 continue
+            mat_uses_oi = args.run_openimpala or any(
+                oi_method_complete.get((mat, m_k), False)
+                for m_k in ("real", "affine_z_squash", "pillar_pore_deletion", *exp_map.keys())
+            )
+            dense_oi = False
+            if mat_uses_oi:
+                if has_openimpala_python():
+                    dense_oi = True
+                elif not args.allow_mixed_dense_estimator:
+                    print(
+                        f"Warning: Skipping porousdiff_dense for {mat} because discrete curves use OpenImpala PDE "
+                        "while openimpala Python package is not installed (pass --allow-mixed-dense-estimator to override).",
+                        flush=True,
+                    )
+                    continue
             dense_grid = np.linspace(mat_loads[0], mat_loads[-1], args.dense_sweep_points)
             vox_um = float(
                 next(sp["voxel_size_um"] for sp in state_specs if str(sp["material"]) == mat)  # type: ignore[arg-type]
@@ -583,6 +661,7 @@ def main() -> None:
                 seed=args.seed,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
+                use_openimpala=dense_oi,
             )
 
     summary_out: dict[str, dict[str, object]] = {}

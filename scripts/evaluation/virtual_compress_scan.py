@@ -183,6 +183,7 @@ def main() -> None:
         num_materials=num_materials,
         ref_voxel_size_um=ref_vox,
         use_ordinal_material_channel=infer_use_ordinal_material_channel(saved),
+        cfg_mode=str(cfg.get("cfg_mode", "all")),
     ).to(device)
     if "ema" in saved:
         ema = EMAModel(model)

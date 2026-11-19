@@ -146,16 +146,20 @@ class MultiModalConditionEmbedder(nn.Module):
         freq_dim: int,
         embed_dim: int,
         max_period: float = 16.0,
+        cfg_mode: str = "all",
     ) -> None:
         super().__init__()
         if freq_dim % 2 != 0:
             raise ValueError("freq_dim must be even")
         if num_materials < 1:
             raise ValueError("num_materials must be >= 1")
+        if cfg_mode not in ("all", "load_only"):
+            raise ValueError(f"cfg_mode must be 'all' or 'load_only', got {cfg_mode!r}")
 
         self.num_materials = num_materials
         self.freq_dim = freq_dim
         self.embed_dim = embed_dim
+        self.cfg_mode = cfg_mode
 
         half = freq_dim // 2
         freqs = torch.exp(
@@ -166,12 +170,28 @@ class MultiModalConditionEmbedder(nn.Module):
         self.material_embedding = nn.Embedding(num_materials, embed_dim)
         nn.init.normal_(self.material_embedding.weight, std=0.02)
 
-        # Concatenate Fourier(load) [freq_dim + 1] + Fourier(log_voxel) [freq_dim + 1]
-        self.scalar_mlp = nn.Sequential(
-            nn.Linear(2 * (freq_dim + 1), embed_dim),
-            nn.SiLU(),
-            nn.Linear(embed_dim, embed_dim),
-        )
+        if cfg_mode == "load_only":
+            self.scalar_mlp: nn.Module | None = None
+            self.load_mlp: nn.Module | None = nn.Sequential(
+                nn.Linear(freq_dim + 1, embed_dim),
+                nn.SiLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+            self.vox_mlp: nn.Module | None = nn.Sequential(
+                nn.Linear(freq_dim + 1, embed_dim),
+                nn.SiLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+        else:
+            # Concatenate Fourier(load) [freq_dim + 1] + Fourier(log_voxel) [freq_dim + 1]
+            self.scalar_mlp = nn.Sequential(
+                nn.Linear(2 * (freq_dim + 1), embed_dim),
+                nn.SiLU(),
+                nn.Linear(embed_dim, embed_dim),
+            )
+            self.load_mlp = None
+            self.vox_mlp = None
+
         self.fusion_mlp = nn.Sequential(
             nn.SiLU(),
             nn.Linear(embed_dim, embed_dim),
@@ -190,12 +210,21 @@ class MultiModalConditionEmbedder(nn.Module):
         cond_mask = packed[:, 3:4].float()
 
         dtype = self.null_embedding.dtype
+        mask = cond_mask.to(dtype)
+        if self.cfg_mode == "load_only":
+            assert self.load_mlp is not None and self.vox_mlp is not None
+            load_feat = self.load_mlp(self._fourier_encode(load_norm).to(dtype))
+            null_load = self.null_embedding.expand(load_feat.shape[0], -1)
+            eff_load = mask * load_feat + (1.0 - mask) * null_load
+            ctx_feat = self.vox_mlp(self._fourier_encode(log_vox).to(dtype)) + self.material_embedding(mat_ids)
+            return self.fusion_mlp(eff_load + ctx_feat)
+
+        assert self.scalar_mlp is not None
         scalar_feat = torch.cat(
             [self._fourier_encode(load_norm), self._fourier_encode(log_vox)], dim=-1
         ).to(dtype)
         fused = self.fusion_mlp(self.scalar_mlp(scalar_feat) + self.material_embedding(mat_ids))
         null_emb = self.null_embedding.expand(fused.shape[0], -1)
-        mask = cond_mask.to(dtype)
         return mask * fused + (1.0 - mask) * null_emb
 
 
@@ -222,6 +251,7 @@ class ContinuousLoadConditionedUNet(nn.Module):
         num_materials: int = 1,
         ref_voxel_size_um: float = 1.0,
         use_ordinal_material_channel: bool = False,
+        cfg_mode: str = "all",
     ) -> None:
         super().__init__()
         if load_max <= load_min:
@@ -237,6 +267,8 @@ class ContinuousLoadConditionedUNet(nn.Module):
             raise ValueError(f"num_materials must be >= 1, got {num_materials}")
         if ref_voxel_size_um <= 0:
             raise ValueError("ref_voxel_size_um must be positive")
+        if cfg_mode not in ("all", "load_only"):
+            raise ValueError(f"cfg_mode must be 'all' or 'load_only', got {cfg_mode!r}")
 
         self.conditioning_mode = conditioning_mode
         self.num_phases = num_phases
@@ -244,6 +276,7 @@ class ContinuousLoadConditionedUNet(nn.Module):
         self.data_channels = 1 if num_phases == 2 else 2
         self.is_multimodal = (num_phases == 3) or (num_materials > 1)
         self.use_ordinal_material_channel = bool(use_ordinal_material_channel)
+        self.cfg_mode = cfg_mode
 
         unet_params = inspect.signature(DiffusionModelUNet.__init__).parameters
         if conditioning_mode == "multiscale_fourier":
@@ -287,6 +320,7 @@ class ContinuousLoadConditionedUNet(nn.Module):
                     num_materials=num_materials,
                     freq_dim=max(32, base_ch),
                     embed_dim=time_embed_dim,
+                    cfg_mode=cfg_mode,
                 )
             else:
                 self.unet.class_embedding = ContinuousScalarLoadEmbedder(
@@ -368,17 +402,18 @@ class ContinuousLoadConditionedUNet(nn.Module):
         mat_span = max(1, self.num_materials - 1)
         mat_norm = 2.0 * (mats.float() / float(mat_span)) - 1.0 if self.num_materials > 1 else torch.zeros_like(cond_norm)
 
+        ctx_mask = torch.ones_like(mask) if self.cfg_mode == "load_only" else mask
         if self.conditioning_mode == "legacy_crossattn":
             assert self.legacy_embedder is not None
-            vec = torch.stack([cond_norm * mask, mat_norm * mask, log_vox * mask], dim=-1)
+            vec = torch.stack([cond_norm * mask, mat_norm * ctx_mask, log_vox * ctx_mask], dim=-1)
             ctx = self.legacy_embedder(vec).unsqueeze(1).to(dtype=x.dtype)
             return self.unet(x=x, timesteps=timesteps, context=ctx)
 
         c_load = (cond_norm * mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
-        c_vox = (log_vox * mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
+        c_vox = (log_vox * ctx_mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
         c_msk = mask.to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
         if self.use_ordinal_material_channel:
-            c_mat = (mat_norm * mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
+            c_mat = (mat_norm * ctx_mask).to(dtype=x.dtype).view(b, 1, 1, 1, 1).expand(b, 1, d, h, w)
             unet_in = torch.cat([x, c_load, c_mat, c_vox, c_msk], dim=1)
         else:
             unet_in = torch.cat([x, c_load, c_vox, c_msk], dim=1)

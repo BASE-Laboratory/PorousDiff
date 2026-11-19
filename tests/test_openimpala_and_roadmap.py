@@ -338,6 +338,13 @@ def test_end_to_end_run_openimpala_cli_and_newman_asr(tmp_path: Path) -> None:
             "--patch-size",
             str(patch_sz),
             "--use-stress-kpa",
+            "--dense-sweep-points",
+            "3",
+            "--dense-samples-per-load",
+            "1",
+            "--steps",
+            "3",
+            "--allow-cpu",
             "--bootstrap",
             "20",
         ],
@@ -349,6 +356,8 @@ def test_end_to_end_run_openimpala_cli_and_newman_asr(tmp_path: Path) -> None:
     opt_json = json.loads((opt_dir / "optimal_clamping_summary.json").read_text())
     mat_opt = opt_json["tio2_anode"]["porousdiff"]
     assert mat_opt["estimator_mode"] == "openimpala"
+    assert opt_json["tio2_anode"]["porousdiff_dense"]["estimator_mode"] == "openimpala"
+    assert mat_opt["newman_asr"]["cell_architecture"] == "static_swagelok_coin_pouch"
     assert mat_opt["newman_asr"]["kinetic_area_convention"] == "cauchy_crofton_2_3"
     assert all(math.isfinite(pt["constriction_factor_z"]) for pt in mat_opt["discrete_points"])
 
@@ -477,3 +486,335 @@ def test_lagrangian_slab_virtual_compression_and_cli(tmp_path: Path) -> None:
     vc_summary = json.loads((vc_out / "virtual_compression_summary.json").read_text())
     assert vc_summary["mode"] == "lagrangian_slab"
     assert vc_summary["lagrangian_slab_diagnostics"]["200"]["compressed_depth"] == 18.0
+
+
+def test_redteam_zero_heldout_porosity_leakage_in_lagrangian_slab(tmp_path: Path) -> None:
+    """Prove lagrangian_slab on held-out loads is strictly invariant to held-out real_cache solid_fraction."""
+    patch_sz = 12
+    version = "v_noleak"
+    exp_name = "noleak_exp"
+    data_root = tmp_path / "data"
+    out_root = tmp_path / "out"
+
+    ckpt_dir = out_root / "checkpoints" / exp_name
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    model = ContinuousLoadConditionedUNet(
+        channels=(8, 16),
+        attention_levels=(False, True),
+        num_res_blocks=1,
+        norm_num_groups=4,
+        load_min=50.0,
+        load_max=300.0,
+        use_flash_attention=False,
+        num_phases=2,
+        num_materials=1,
+        ref_voxel_size_um=1.0,
+    ).eval()
+    torch.save(
+        {
+            "epoch": 0,
+            "model": model.state_dict(),
+            "config": {
+                "patch_size": patch_sz,
+                "channels": [8, 16],
+                "attention_levels": [False, True],
+                "num_res_blocks": 1,
+                "norm_groups": 4,
+                "load_min": 50.0,
+                "load_max": 300.0,
+                "conditioning_mode": "multiscale_fourier",
+                "num_phases": 2,
+                "num_materials": 1,
+                "ref_voxel_size_um": 1.0,
+                "use_stress_kpa": True,
+                "timesteps": 50,
+                "schedule": "zero_snr_scaled_linear",
+                "prediction_type": "v_prediction",
+            },
+        },
+        ckpt_dir / "best_val.pth",
+    )
+
+    rng = np.random.default_rng(0)
+    low_vol = (rng.random((1, patch_sz, patch_sz, patch_sz)) < 0.12).astype(np.uint8)
+    high_vol = (rng.random((1, patch_sz, patch_sz, patch_sz)) < 0.35).astype(np.uint8)
+
+    for st, v in (("v_low", low_vol), ("v_high", high_vol)):
+        vdir = data_root / st / "val"
+        vdir.mkdir(parents=True, exist_ok=True)
+        np.save(vdir / "patches.npy", v)
+        np.save(vdir / "tall_patches.npy", np.repeat(v, 2, axis=1))
+
+    mid_dir = data_root / "v_mid" / "val"
+    mid_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest_path = data_root / "bundle_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": version,
+                "patch_size": patch_sz,
+                "scans": [
+                    {"state": "v_low", "patch_dir_name": "v_low", "material": "virgin_carbon", "beamline": "DLS_I12", "stress_kpa": 50.0, "effective_voxel_size_um": 1.0, "num_phases": 2},
+                    {"state": "v_mid", "patch_dir_name": "v_mid", "material": "virgin_carbon", "beamline": "DLS_I12", "stress_kpa": 175.0, "effective_voxel_size_um": 1.0, "num_phases": 2},
+                    {"state": "v_high", "patch_dir_name": "v_high", "material": "virgin_carbon", "beamline": "DLS_I12", "stress_kpa": 300.0, "effective_voxel_size_um": 1.0, "num_phases": 2},
+                ],
+            }
+        )
+    )
+
+    # Run 1: held-out v_mid has sparse real solid fraction (0.0625)
+    mid_sparse = np.zeros((1, patch_sz, patch_sz, patch_sz), dtype=np.uint8)
+    mid_sparse[:, :, 3:6, 3:6] = 1
+    np.save(mid_dir / "patches.npy", mid_sparse)
+    bench_a = tmp_path / "bench_a"
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "evaluation" / "evaluate_beamtime_multiplier.py"),
+            "--experiments",
+            f"porousdiff={exp_name}",
+            "--data-root",
+            str(data_root),
+            "--output-root",
+            str(out_root),
+            "--out-dir",
+            str(bench_a),
+            "--manifest-json",
+            str(manifest_path),
+            "--version",
+            version,
+            "--patch-size",
+            str(patch_sz),
+            "--use-stress-kpa",
+            "--heldout-states",
+            "v_mid",
+            "--include-lagrangian-slab",
+            "--virtual-steps",
+            "3",
+            "--allow-cpu",
+        ],
+        check=True,
+        env=_subprocess_env(),
+    )
+
+    # Run 2: mutate held-out v_mid real XCT to massive solid fraction (0.75!)
+    mid_dense = np.ones((1, patch_sz, patch_sz, patch_sz), dtype=np.uint8)
+    mid_dense[:, :, :3, :] = 0
+    np.save(mid_dir / "patches.npy", mid_dense)
+    bench_b = tmp_path / "bench_b"
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "scripts" / "evaluation" / "evaluate_beamtime_multiplier.py"),
+            "--experiments",
+            f"porousdiff={exp_name}",
+            "--data-root",
+            str(data_root),
+            "--output-root",
+            str(out_root),
+            "--out-dir",
+            str(bench_b),
+            "--manifest-json",
+            str(manifest_path),
+            "--version",
+            version,
+            "--patch-size",
+            str(patch_sz),
+            "--use-stress-kpa",
+            "--heldout-states",
+            "v_mid",
+            "--include-lagrangian-slab",
+            "--virtual-steps",
+            "3",
+            "--allow-cpu",
+        ],
+        check=True,
+        env=_subprocess_env(),
+    )
+
+    rep_a = json.loads((bench_a / "beamtime_multiplier_report.json").read_text())["v_mid"]
+    rep_b = json.loads((bench_b / "beamtime_multiplier_report.json").read_text())["v_mid"]
+
+    # Oracle baseline changes drastically when held-out real scan changes, whereas lagrangian_slab is 100% invariant!
+    assert rep_a["methods"]["affine_z_squash"]["uses_heldout_oracle_porosity"] is True
+    assert rep_a["methods"]["lagrangian_slab"]["uses_heldout_oracle_porosity"] is False
+    assert rep_a["lagrangian_slab_diagnostics"]["target_source"] == "non_heldout_interp"
+    sf_lag_a = rep_a["methods"]["lagrangian_slab"]["metrics"]["solid_fraction"]["mean"]
+    sf_lag_b = rep_b["methods"]["lagrangian_slab"]["metrics"]["solid_fraction"]["mean"]
+    sf_aff_a = rep_a["methods"]["affine_z_squash"]["metrics"]["solid_fraction"]["mean"]
+    sf_aff_b = rep_b["methods"]["affine_z_squash"]["metrics"]["solid_fraction"]["mean"]
+    assert sf_lag_a == pytest.approx(sf_lag_b, abs=1e-9)
+    assert abs(sf_aff_b - sf_aff_a) > 0.30
+
+
+def test_redteam_per_realization_openimpala_bootstrap_and_static_asr(tmp_path: Path) -> None:
+    """Verify load_openimpala_records preserves per-patch variance and static-cell Newman ASR has zero pump penalty."""
+    import csv
+    from porousdiff.optimization import NEWMAN_REGIMES, load_openimpala_records
+
+    # 1. Static Swagelok/coin/pouch primary regimes have zero convective pumping penalty
+    for reg_key in ("kinetics_limited", "balanced", "mass_transport_limited"):
+        assert NEWMAN_REGIMES[reg_key]["pump_penalty_ohm_cm2_um2_cm"] == 0.0
+    assert NEWMAN_REGIMES["flow_pumped_sensitivity"]["pump_penalty_ohm_cm2_um2_cm"] > 0.0
+
+    # 2. Multi-stem OpenImpala CSV preserves distinct per-realization diffusivities (non-collapsed bootstrap CIs)
+    oi_csv = tmp_path / "parity_multi.csv"
+    rows = []
+    for lv, state, pore_vals, sig_vals in (
+        (50.0, "s_low", [0.45, 0.55, 0.62], [0.015, 0.025, 0.035]),
+        (175.0, "s_mid", [0.24, 0.31, 0.38], [0.11, 0.14, 0.17]),
+        (300.0, "s_high", [0.02, 0.06, 0.11], [0.15, 0.16, 0.18]),
+    ):
+        for idx, (pv, sv) in enumerate(zip(pore_vals, sig_vals), start=1):
+            rows.append(
+                {
+                    "job_id": f"real__{state}__real_{idx:03d}__pore_ionic",
+                    "method": "real",
+                    "state": state,
+                    "transport_phase": "pore_ionic",
+                    "d_eff_z": str(pv),
+                }
+            )
+            rows.append(
+                {
+                    "job_id": f"real__{state}__real_{idx:03d}__solid_hetero_electronic",
+                    "method": "real",
+                    "state": state,
+                    "transport_phase": "solid_hetero_electronic",
+                    "d_eff_z": str(sv),
+                }
+            )
+    with oi_csv.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["job_id", "method", "state", "transport_phase", "d_eff_z"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    rec_map = load_openimpala_records(oi_csv)
+    assert len(rec_map[("real", "s_mid")]) == 3
+    assert [r["pore_d_eff_z"] for r in rec_map[("real", "s_mid")]] == pytest.approx([0.24, 0.31, 0.38])
+
+    recs_by_load: dict[float, list[dict[str, float]]] = {}
+    for lv, st, sf in ((50.0, "s_low", 0.12), (175.0, "s_mid", 0.20), (300.0, "s_high", 0.32)):
+        recs_by_load[lv] = [
+            compute_transport_and_fom_record(
+                {
+                    "solid_fraction": sf,
+                    "porosity": 1.0 - sf,
+                    "ssa_pore_coating_cc": 0.18,
+                    "ssa_pore_coating": 0.27,
+                    "wired_coating_fraction": 0.9,
+                    "geodesic_tortuosity_z": 1.15,
+                },
+                openimpala_metrics=oi_r,
+            )
+            for oi_r in rec_map[("real", st)]
+        ]
+    opt_res = find_optimal_clamping_pressure(recs_by_load, n_bootstrap=120, seed=11)
+    ci_lo, ci_hi = opt_res["newman_asr"]["optimal_load_asr_ci95"]
+    # Because identical phys_metrics were passed across the 3 patches at each load, any nonzero CI width
+    # comes PURELY from preserving per-realization OpenImpala PDE variance!
+    assert ci_hi > ci_lo
+
+
+def test_redteam_load_only_cfg_physics_loss_and_bundle_audit(tmp_path: Path) -> None:
+    """Verify factored load_only CFG, cond_mask-gated uncoated-safe physics loss, and Gate 0 bundle audit."""
+    from porousdiff.losses import PhysicsInformedDiffusionLoss
+    from scripts.evaluation.audit_bundle_readiness import audit_manifest_bundle
+
+    # 1. Factored load_only CFG: zero dead grads, load-invariant at mask=0, material-distinct at mask=0
+    torch.manual_seed(4)
+    model = ContinuousLoadConditionedUNet(
+        channels=(8, 16),
+        attention_levels=(False, True),
+        num_res_blocks=1,
+        norm_num_groups=4,
+        load_min=20.0,
+        load_max=400.0,
+        num_phases=3,
+        num_materials=3,
+        ref_voxel_size_um=2.0,
+        cfg_mode="load_only",
+    )
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    for step in range(3):
+        opt.zero_grad()
+        x = torch.randn(4, 2, 12, 12, 12)
+        target = torch.randn_like(x)
+        t = torch.tensor([10, 200, 600, 950], dtype=torch.long)
+        lds = torch.tensor([20.0, 150.0, 300.0, 400.0], dtype=torch.float32)
+        mats = torch.tensor([0, 1, 2, 1], dtype=torch.long)
+        voxs = torch.tensor([1.6, 3.2, 3.2, 0.8], dtype=torch.float32)
+        msk = torch.tensor([1.0, 1.0, 1.0, 0.0], dtype=torch.float32)
+        out = model(x, t, lds, cond_mask=msk, material_ids=mats, voxel_sizes=voxs)
+        torch.nn.functional.mse_loss(out, target).backward()
+        if step < 2:
+            opt.step()
+
+    dead = [
+        n
+        for n, p in model.named_parameters()
+        if p.requires_grad and (p.grad is None or float(p.grad.abs().max().item()) == 0.0)
+    ]
+    assert dead == [], f"Dead parameters in cfg_mode='load_only': {dead}"
+
+    model.eval()
+    with torch.no_grad():
+        x1 = torch.randn(1, 2, 12, 12, 12)
+        t1 = torch.tensor([300], dtype=torch.long)
+        zero_m = torch.zeros(1, dtype=torch.float32)
+        vx = torch.tensor([3.2], dtype=torch.float32)
+        # At cond_mask == 0, load changes have zero effect, while material_id stays anchored!
+        u_low = model(x1, t1, torch.tensor([25.0]), cond_mask=zero_m, material_ids=torch.tensor([1]), voxel_sizes=vx)
+        u_high = model(x1, t1, torch.tensor([390.0]), cond_mask=zero_m, material_ids=torch.tensor([1]), voxel_sizes=vx)
+        u_virg = model(x1, t1, torch.tensor([25.0]), cond_mask=zero_m, material_ids=torch.tensor([0]), voxel_sizes=vx)
+        assert torch.allclose(u_low, u_high, atol=1e-6)
+        assert not torch.allclose(u_low, u_virg)
+
+    # 2. PhysicsInformedDiffusionLoss masks conditional terms when cond_mask == 0 and handles uncoated Virgin patches
+    sched = build_noise_scheduler("ddpm", 100, "zero_snr_scaled_linear", "v_prediction")
+    crit = PhysicsInformedDiffusionLoss(sched.alphas_cumprod, prediction_type="v_prediction")
+    # Uncoated 2-phase Virgin patch encoded in 2 channels: c_coating == -1 everywhere
+    x0_virg = torch.full((2, 2, 8, 8, 8), -1.0)
+    x0_virg[:, 0, 2:5, 2:5, 2:5] = 1.0
+    t_b = torch.tensor([20, 20], dtype=torch.long)
+    noise_b = torch.randn_like(x0_virg)
+    xt_b = sched.add_noise(x0_virg, noise_b, t_b)
+    v_targ = sched.get_velocity(x0_virg, noise_b, t_b)
+    _, stats_uncond = crit(
+        v_targ + 0.2 * torch.randn_like(v_targ),
+        v_targ,
+        xt_b,
+        x0_virg,
+        t_b,
+        cond_mask=torch.zeros(2),
+    )
+    assert stats_uncond["loss_loading"] == 0.0
+    assert stats_uncond["loss_interface"] == 0.0
+
+    # 3. Gate 0 bundle readiness audit catches non-monotonic solid fraction
+    b_root = tmp_path / "audit_bundle"
+    for st, sf_fill in (("c_50", 6), ("c_200", 2)):  # Intentional non-monotonic drop!
+        for sp in ("train", "val"):
+            sdir = b_root / st / sp
+            sdir.mkdir(parents=True, exist_ok=True)
+            arr = np.zeros((1, 8, 8, 8), dtype=np.uint8)
+            arr[:, :, :sf_fill, :sf_fill] = 1
+            np.save(sdir / "patches.npy", arr)
+    bad_manifest = b_root / "bundle_manifest.json"
+    bad_manifest.write_text(
+        json.dumps(
+            {
+                "version": "v_aud",
+                "patch_size": 8,
+                "scans": [
+                    {"state": "c_50", "patch_dir_name": "c_50", "material": "virgin_carbon", "beamline": "DLS_I12", "stress_kpa": 50.0, "effective_voxel_size_um": 1.0, "num_phases": 2},
+                    {"state": "c_200", "patch_dir_name": "c_200", "material": "virgin_carbon", "beamline": "DLS_I12", "stress_kpa": 200.0, "effective_voxel_size_um": 1.0, "num_phases": 2},
+                ],
+            }
+        )
+    )
+    rep_bad = audit_manifest_bundle(bad_manifest, data_root=b_root, patch_size=8)
+    assert rep_bad["passed"] is False
+    assert any("Non-monotonic solid fraction" in e for e in rep_bad["errors"])  # type: ignore[union-attr]
+
