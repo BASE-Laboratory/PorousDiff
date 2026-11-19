@@ -48,6 +48,7 @@ from porousdiff.data import (
 )
 from porousdiff.losses import compute_coating_retention_diagnostics
 from porousdiff.metrics import (
+    compute_ensemble_distribution_distances,
     directional_two_point_correlation,
     evaluate_multiphase_physics,
     export_openimpala_tiff,
@@ -63,7 +64,9 @@ from porousdiff.preprocessing import infer_material_name, parse_load_value
 from porousdiff.transport_and_xrd import (
     correlate_xrd_with_microstructure,
     generate_openimpala_job_suite,
+    has_openimpala_python,
     parse_openimpala_results,
+    run_openimpala_python_suite,
 )
 from porousdiff.virtual_compression import (
     check_load_extrapolation,
@@ -147,6 +150,11 @@ def main() -> None:
         "--generate-openimpala-suite",
         action="store_true",
         help="Generate OpenImpala INI configs and run_openimpala_batch.sh across Real, Baselines & PorousDiff",
+    )
+    parser.add_argument(
+        "--run-openimpala",
+        action="store_true",
+        help="Execute OpenImpala v4.6 PDE transport directly in-process and write openimpala_transport_parity.csv",
     )
     parser.add_argument(
         "--openimpala-template-ini",
@@ -384,7 +392,9 @@ def main() -> None:
     report: dict[str, object] = {}
     csv_rows: list[dict[str, object]] = []
     openimpala_entries: list[dict[str, object]] = []
-    want_openimpala = args.export_real_openimpala or args.generate_openimpala_suite
+    want_openimpala = (
+        args.export_real_openimpala or args.generate_openimpala_suite or args.run_openimpala
+    )
 
     key_metrics = [
         "solid_fraction",
@@ -420,6 +430,7 @@ def main() -> None:
                         "load_value": lv,
                         "tiff_path": tif_p,
                         "num_phases": n_ph,
+                        "voxel_size_um": vox,
                     }
                 )
 
@@ -507,6 +518,7 @@ def main() -> None:
                             "load_value": lv,
                             "tiff_path": tif_p,
                             "num_phases": n_ph,
+                            "voxel_size_um": vox,
                         }
                     )
 
@@ -515,6 +527,7 @@ def main() -> None:
         for m_name, m_vols in methods_vols.items():
             m_recs = [evaluate_multiphase_physics(v, voxel_size=vox) for v in m_vols]
             m_sum = summarize_metric_records(m_recs)
+            dist_d = compute_ensemble_distribution_distances(real_recs, m_recs, keys=key_metrics)
 
             seed_vols_list = per_seed_vols_by_method.get(m_name, [])
             per_seed_s2: list[float] = []
@@ -542,6 +555,7 @@ def main() -> None:
                 "s2_rmse_std": s2_std,
                 "s2_improvement_over_noop": s2_gain_vs_noop,
                 "metrics": m_sum,
+                "distribution_distances": dist_d,
             }
             if per_seed_s2:
                 m_entry["per_seed_s2_rmse"] = [round(v, 6) for v in per_seed_s2]
@@ -570,6 +584,7 @@ def main() -> None:
             for km in key_metrics:
                 r_mu = real_sum[km]["mean"]
                 m_mu = m_sum[km]["mean"]
+                w1_val = dist_d.get(km, {}).get("wasserstein_1", float("nan"))
                 row[f"real_{km}"] = round(r_mu, 6) if np.isfinite(r_mu) else float("nan")
                 row[f"pred_{km}"] = round(m_mu, 6) if np.isfinite(m_mu) else float("nan")
                 row[f"abs_err_{km}"] = (
@@ -577,6 +592,7 @@ def main() -> None:
                     if (np.isfinite(r_mu) and np.isfinite(m_mu))
                     else float("nan")
                 )
+                row[f"w1_{km}"] = round(w1_val, 6) if np.isfinite(w1_val) else float("nan")
             csv_rows.append(row)
 
         st_entry: dict[str, object] = {
@@ -646,7 +662,23 @@ def main() -> None:
             f"Generated OpenImpala batch suite ({suite_info['num_jobs']} jobs) -> {suite_info['script_path']}",
             flush=True,
         )
-        if (out_dir / "openimpala_suite" / "outputs").is_dir():
+        if args.run_openimpala:
+            if not has_openimpala_python():
+                raise RuntimeError(
+                    "--run-openimpala requested, but the 'openimpala' Python package is not installed."
+                )
+            oi_rows = run_openimpala_python_suite(
+                tiff_entries=openimpala_entries,
+                suite_dir=out_dir / "openimpala_suite",
+                out_csv=out_dir / "openimpala_transport_parity.csv",
+                include_hetero_solid=True,
+            )
+            print(
+                f"Executed OpenImpala v4.6 in-process ({len(oi_rows)} phase solves) -> "
+                f"{out_dir / 'openimpala_transport_parity.csv'}",
+                flush=True,
+            )
+        elif (out_dir / "openimpala_suite" / "outputs").is_dir():
             parse_openimpala_results(
                 suite_dir=out_dir / "openimpala_suite",
                 out_csv=out_dir / "openimpala_transport_parity.csv",

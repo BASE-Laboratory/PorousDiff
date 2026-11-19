@@ -825,7 +825,6 @@ def split_z_intervals_with_buffer(
         if train_end - s < patch_size or e - val_start < patch_size:
             # Fallback if interval is tight: shrink buffer only if unavoidable, else error
             if span >= 2 * patch_size:
-                mid = s + (span - patch_size) // 2
                 train_end = max(s + patch_size, e - patch_size - min(buf, span - 2 * patch_size))
                 val_start = e - patch_size
             else:

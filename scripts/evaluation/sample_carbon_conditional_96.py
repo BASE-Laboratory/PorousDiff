@@ -47,6 +47,10 @@ from porousdiff.models import (
     infer_use_ordinal_material_channel,
 )
 from porousdiff.preprocessing import infer_material_name, parse_load_value
+from porousdiff.transport_and_xrd import (
+    has_openimpala_python,
+    run_openimpala_rev_convergence,
+)
 from porousdiff.virtual_compression import generate_tiled_3d
 
 PHASE_CMAP = ListedColormap(["#0b0e14", "#38bdf8", "#facc15"])
@@ -93,7 +97,8 @@ def generate_batch(
                 material_ids=mats,
                 voxel_sizes=voxs,
             )
-        image = scheduler.step(pred.float(), t_int, image, generator=generator)[0]  # type: ignore[attr-defined]
+        next_img = scheduler.step(pred.float(), t_int, image, generator=generator)[0]  # type: ignore[attr-defined]
+        image = torch.nan_to_num(next_img, nan=0.0, posinf=1.0, neginf=-1.0)
 
     raw_np = image.float().cpu().numpy()
     phases = decode_channels_to_phases(raw_np, enforce_solid_support=True, threshold=0.0)
@@ -273,6 +278,11 @@ def main() -> None:
     )
     parser.add_argument("--tiled-overlap", type=float, default=0.5)
     parser.add_argument("--tile-batch-size", type=int, default=4)
+    parser.add_argument(
+        "--run-rev-study",
+        action="store_true",
+        help="Run OpenImpala v4.6 REV sub-volume convergence & Z-uniformity study on sample 1 of each state",
+    )
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -460,6 +470,18 @@ def main() -> None:
                         pdf_path=figures_dir / f"figure_generated_{state_name}.pdf",
                         num_phases=num_phases,
                     )
+                    if args.run_rev_study:
+                        if not has_openimpala_python():
+                            raise RuntimeError(
+                                "--run-rev-study requires the 'openimpala' Python package."
+                            )
+                        run_openimpala_rev_convergence(
+                            b_vol,
+                            phase=0,
+                            voxel_size_um=vox_um,
+                            out_dir=state_dir / "rev_study",
+                            seed=args.seed,
+                        )
             remaining -= cur_b
 
         elapsed = time.perf_counter() - started

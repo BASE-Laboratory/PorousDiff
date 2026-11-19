@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import json
 import re
 from pathlib import Path
-from typing import Iterable, Mapping
+from typing import Iterable, Mapping, Sequence
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+import tifffile
 from scipy.stats import pearsonr, spearmanr
 
 
@@ -248,6 +250,390 @@ def parse_openimpala_results(
             writer.writeheader()
             writer.writerows(rows)
     return rows
+
+
+def has_openimpala_python() -> bool:
+    """Return True if the `openimpala` v4.6+ Python facade is installed in the current environment."""
+    return importlib.util.find_spec("openimpala") is not None
+
+
+def _solve_openimpala_phase_transport(
+    volume: np.ndarray,
+    phase: int,
+    voxel_size_um: float = 1.0,
+    phase_diffusivities: Mapping[int, float] | None = None,
+    compute_homogenized_tensor: bool = False,
+) -> dict[str, float]:
+    """Solve directional steady-state PDE transport (and optional 3x3 homogenization) via OpenImpala."""
+    import openimpala as oi
+
+    oi.Session.ensure_active()
+    vol = np.asarray(volume, dtype=np.uint8)
+    vox = max(float(voxel_size_um), 1e-6)
+
+    if phase_diffusivities is not None:
+        active_labels = [int(k) for k, v in phase_diffusivities.items() if float(v) > 0.0]
+        vol_frac = float(np.mean(np.isin(vol, active_labels))) if active_labels else 0.0
+    else:
+        vol_frac = float(np.mean(vol == int(phase)))
+
+    try:
+        res_all = oi.tortuosity_all(
+            vol,
+            phase=int(phase),
+            strict=False,
+            voxel_size=vox,
+            phase_diffusivities=phase_diffusivities,
+        )
+    except oi.OpenImpalaError:
+        res_all = {"x": None, "y": None, "z": None}
+
+    metrics: dict[str, float] = {"volume_fraction": vol_frac}
+    conv_flags: list[float] = []
+    for axis_name in ("x", "y", "z"):
+        r = res_all.get(axis_name)
+        if r is None:
+            metrics[f"d_eff_{axis_name}"] = 0.0
+            metrics[f"tau_{axis_name}"] = float("nan")
+            metrics[f"percolates_{axis_name}"] = 0.0
+            conv_flags.append(1.0)
+        else:
+            deff_val = float(r.effective_diffusivity)
+            tau_val = float(r.tortuosity)
+            metrics[f"d_eff_{axis_name}"] = max(0.0, deff_val) if np.isfinite(deff_val) else 0.0
+            metrics[f"tau_{axis_name}"] = tau_val if np.isfinite(tau_val) else float("nan")
+            metrics[f"percolates_{axis_name}"] = 1.0
+            conv_flags.append(1.0 if bool(r.solver_converged) else 0.0)
+    metrics["solver_converged"] = float(min(conv_flags)) if conv_flags else 0.0
+
+    if compute_homogenized_tensor:
+        try:
+            eff_res = oi.effective_diffusivity(
+                vol,
+                phase=int(phase),
+                voxel_size=vox,
+                phase_diffusivities=phase_diffusivities,
+            )
+            ten = np.asarray(eff_res.tensor, dtype=np.float64)
+            metrics["homogenized_d_xx"] = float(max(0.0, ten[0, 0]))
+            metrics["homogenized_d_yy"] = float(max(0.0, ten[1, 1]))
+            metrics["homogenized_d_zz"] = float(max(0.0, ten[2, 2]))
+            metrics["homogenized_d_xy"] = float(ten[0, 1])
+            metrics["homogenized_d_xz"] = float(ten[0, 2])
+            metrics["homogenized_d_yz"] = float(ten[1, 2])
+        except oi.OpenImpalaError:
+            metrics["homogenized_d_xx"] = 0.0
+            metrics["homogenized_d_yy"] = 0.0
+            metrics["homogenized_d_zz"] = 0.0
+            metrics["homogenized_d_xy"] = 0.0
+            metrics["homogenized_d_xz"] = 0.0
+            metrics["homogenized_d_yz"] = 0.0
+
+    return metrics
+
+
+def compute_openimpala_volume_transport(
+    volume: np.ndarray,
+    voxel_size_um: float = 1.0,
+    num_phases: int | None = None,
+    include_hetero_solid: bool = True,
+    coating_rel_conductivity: float = 0.05,
+    compute_homogenized_tensor: bool = False,
+) -> dict[str, object]:
+    """Run in-process OpenImpala v4.6 PDE transport & interfacial characterization on a 3D `(Z, Y, X)` volume."""
+    import openimpala as oi
+
+    oi.Session.ensure_active()
+    vol = np.asarray(volume, dtype=np.uint8)
+    if vol.ndim != 3:
+        raise ValueError(f"Expected 3D volume (Z, Y, X), got shape {vol.shape}")
+    vox = max(float(voxel_size_um), 1e-6)
+    n_ph = int(num_phases) if num_phases is not None else (3 if int(np.max(vol)) >= 2 else 2)
+
+    vol_bin = (vol > 0).astype(np.uint8)
+    phases_out: dict[str, dict[str, float]] = {}
+
+    phases_out["pore_ionic"] = _solve_openimpala_phase_transport(
+        vol if n_ph == 3 else vol_bin,
+        phase=0,
+        voxel_size_um=vox,
+        compute_homogenized_tensor=compute_homogenized_tensor,
+    )
+    phases_out["carbon_electronic"] = _solve_openimpala_phase_transport(
+        vol if n_ph == 3 else vol_bin,
+        phase=1,
+        voxel_size_um=vox,
+        compute_homogenized_tensor=compute_homogenized_tensor,
+    )
+    if n_ph == 3:
+        phases_out["coating_active"] = _solve_openimpala_phase_transport(
+            vol,
+            phase=2,
+            voxel_size_um=vox,
+            compute_homogenized_tensor=compute_homogenized_tensor,
+        )
+        if include_hetero_solid:
+            phases_out["solid_hetero_electronic"] = _solve_openimpala_phase_transport(
+                vol,
+                phase=1,
+                voxel_size_um=vox,
+                phase_diffusivities={0: 0.0, 1: 1.0, 2: float(coating_rel_conductivity)},
+                compute_homogenized_tensor=compute_homogenized_tensor,
+            )
+
+    ssa_bin = oi.specific_surface_area(vol_bin, phase_a=0, phase_b=1, voxel_size=vox)
+    interfacial: dict[str, float] = {
+        "ssa_total_raw": float(ssa_bin.ssa),
+        "ssa_total_cc": float(ssa_bin.ssa_corrected),
+    }
+    if n_ph == 3:
+        ssa_pc = oi.specific_surface_area(vol, phase_a=0, phase_b=2, voxel_size=vox)
+        ssa_pcarb = oi.specific_surface_area(vol, phase_a=0, phase_b=1, voxel_size=vox)
+        ssa_cc = oi.specific_surface_area(vol, phase_a=1, phase_b=2, voxel_size=vox)
+        interfacial.update(
+            {
+                "ssa_pore_coating_raw": float(ssa_pc.ssa),
+                "ssa_pore_coating_cc": float(ssa_pc.ssa_corrected),
+                "ssa_pore_carbon_raw": float(ssa_pcarb.ssa),
+                "ssa_pore_carbon_cc": float(ssa_pcarb.ssa_corrected),
+                "ssa_carbon_coating_raw": float(ssa_cc.ssa),
+                "ssa_carbon_coating_cc": float(ssa_cc.ssa_corrected),
+            }
+        )
+
+    prof_z = oi.through_thickness_profile(vol_bin, phase=1, direction="z", voxel_size=vox)
+    prof_arr = np.asarray(prof_z.profile, dtype=np.float64)
+
+    lookup_summary: dict[str, float] = {
+        "pore_d_eff_z": float(phases_out["pore_ionic"]["d_eff_z"]),
+        "solid_sigma_eff_z": float(phases_out["carbon_electronic"]["d_eff_z"]),
+    }
+    if "solid_hetero_electronic" in phases_out:
+        lookup_summary["solid_hetero_sigma_eff_z"] = float(
+            phases_out["solid_hetero_electronic"]["d_eff_z"]
+        )
+
+    return {
+        "num_phases": n_ph,
+        "voxel_size_um": vox,
+        "phases": phases_out,
+        "interfacial": interfacial,
+        "through_thickness_solid_z": {
+            "mean": float(np.mean(prof_arr)),
+            "std": float(np.std(prof_arr)),
+            "min": float(np.min(prof_arr)),
+            "max": float(np.max(prof_arr)),
+        },
+        "lookup_summary": lookup_summary,
+    }
+
+
+def run_openimpala_python_suite(
+    tiff_entries: Iterable[Mapping[str, object]],
+    suite_dir: Path,
+    out_csv: Path | None = None,
+    include_hetero_solid: bool = True,
+    coating_rel_conductivity: float = 0.05,
+    compute_homogenized_tensor: bool = False,
+) -> list[dict[str, object]]:
+    """Execute OpenImpala v4.6 PDE transport directly in-process across Real, Baselines & PorousDiff.
+
+    Writes per-job JSON artifacts under `suite_dir / 'outputs'`, `openimpala_jobs.json`, and
+    `out_csv` (`openimpala_transport_parity.csv`) directly consumable by `load_openimpala_lookup`.
+    """
+    suite_dir = Path(suite_dir)
+    outputs_dir = suite_dir / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+
+    jobs: list[dict[str, object]] = []
+    rows: list[dict[str, object]] = []
+
+    for idx, entry in enumerate(tiff_entries, start=1):
+        method = str(entry["method"])
+        state = str(entry["state"])
+        material = str(entry.get("material", "virgin_carbon"))
+        beamline = str(entry.get("beamline", "primary"))
+        load_val = float(entry.get("load_value", 0.0))  # type: ignore[arg-type]
+        n_ph = int(entry.get("num_phases", 2))  # type: ignore[arg-type]
+        vox = float(entry.get("voxel_size_um", 1.0))  # type: ignore[arg-type]
+
+        if "volume" in entry and entry["volume"] is not None:
+            vol = np.asarray(entry["volume"], dtype=np.uint8)
+            stem = str(entry.get("stem", f"vol_{idx:03d}"))
+            tiff_str = str(entry.get("tiff_path", ""))
+        else:
+            tiff_path = Path(str(entry["tiff_path"]))
+            vol = np.asarray(tifffile.imread(tiff_path), dtype=np.uint8)
+            stem = tiff_path.stem
+            tiff_str = str(tiff_path.resolve())
+
+        vol_res = compute_openimpala_volume_transport(
+            vol,
+            voxel_size_um=vox,
+            num_phases=n_ph,
+            include_hetero_solid=include_hetero_solid,
+            coating_rel_conductivity=coating_rel_conductivity,
+            compute_homogenized_tensor=compute_homogenized_tensor,
+        )
+        phases_map: dict[str, dict[str, float]] = vol_res["phases"]  # type: ignore[assignment]
+        for transport_name, p_metrics in phases_map.items():
+            job_id = f"{method}__{state}__{stem}__{transport_name}"
+            out_json = outputs_dir / f"{job_id}.json"
+            out_json.write_text(json.dumps(p_metrics, indent=2))
+            jobs.append(
+                {
+                    "job_id": job_id,
+                    "method": method,
+                    "state": state,
+                    "material": material,
+                    "beamline": beamline,
+                    "load_value": load_val,
+                    "transport_phase": transport_name,
+                    "tiff_path": tiff_str,
+                    "output_json": str(out_json.resolve()),
+                }
+            )
+            row: dict[str, object] = {
+                "job_id": job_id,
+                "method": method,
+                "state": state,
+                "material": material,
+                "beamline": beamline,
+                "load_value": load_val,
+                "transport_phase": transport_name,
+            }
+            row.update(p_metrics)
+            rows.append(row)
+
+    (suite_dir / "openimpala_jobs.json").write_text(
+        json.dumps({"num_jobs": len(jobs), "jobs": jobs, "executed_in_process": True}, indent=2)
+    )
+
+    if out_csv is not None and rows:
+        out_csv = Path(out_csv)
+        out_csv.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames: list[str] = []
+        for r in rows:
+            for k in r:
+                if k not in fieldnames:
+                    fieldnames.append(k)
+        with out_csv.open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+    return rows
+
+
+def run_openimpala_rev_convergence(
+    volume: np.ndarray,
+    sizes: Sequence[int] | None = None,
+    phase: int = 0,
+    num_samples: int = 3,
+    voxel_size_um: float = 1.0,
+    out_dir: Path | None = None,
+    seed: int = 42,
+) -> dict[str, object]:
+    """Run an OpenImpala Representative Elementary Volume (REV) convergence & Z-uniformity study."""
+    import openimpala as oi
+
+    oi.Session.ensure_active()
+    vol = np.asarray(volume, dtype=np.uint8)
+    if vol.ndim != 3:
+        raise ValueError(f"Expected 3D volume (Z, Y, X), got shape {vol.shape}")
+    min_dim = int(min(vol.shape))
+    vox = max(float(voxel_size_um), 1e-6)
+
+    if sizes is None:
+        cand_sizes = sorted({max(8, min_dim // 2), max(8, (3 * min_dim) // 4), min_dim})
+    else:
+        cand_sizes = sorted({int(s) for s in sizes if 4 <= int(s) <= min_dim})
+    if not cand_sizes:
+        cand_sizes = [min_dim]
+
+    csv_path_str = str((Path(out_dir) / "rev_convergence.csv").resolve()) if out_dir is not None else None
+    if out_dir is not None:
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    size_rows: list[dict[str, float]] = []
+    try:
+        rev_res = oi.rev_study(
+            vol,
+            sizes=cand_sizes,
+            num_samples=max(1, int(num_samples)),
+            phase=int(phase),
+            voxel_size=vox,
+            csv_path=csv_path_str,
+        )
+        for sz in rev_res.sizes:
+            mu = np.asarray(rev_res.mean_diagonal[sz], dtype=np.float64)
+            sd = np.asarray(rev_res.std_diagonal[sz], dtype=np.float64)
+            cov_zz = float(sd[2] / max(mu[2], 1e-8)) if mu[2] > 1e-8 else 0.0
+            size_rows.append(
+                {
+                    "subvolume_size": float(sz),
+                    "mean_d_xx": float(mu[0]),
+                    "mean_d_yy": float(mu[1]),
+                    "mean_d_zz": float(mu[2]),
+                    "std_d_xx": float(sd[0]),
+                    "std_d_yy": float(sd[1]),
+                    "std_d_zz": float(sd[2]),
+                    "cov_d_zz": cov_zz,
+                }
+            )
+    except oi.OpenImpalaError:
+        # Graceful fallback when random sub-cubes contain non-percolating throats
+        rng = np.random.default_rng(seed)
+        d_dim, h_dim, w_dim = vol.shape
+        for sz in cand_sizes:
+            n_s = 1 if sz == min_dim else max(1, int(num_samples))
+            samples_xyz: list[list[float]] = []
+            for _ in range(n_s):
+                z0 = int(rng.integers(0, d_dim - sz + 1)) if d_dim > sz else 0
+                y0 = int(rng.integers(0, h_dim - sz + 1)) if h_dim > sz else 0
+                x0 = int(rng.integers(0, w_dim - sz + 1)) if w_dim > sz else 0
+                sub = vol[z0 : z0 + sz, y0 : y0 + sz, x0 : x0 + sz]
+                pm = _solve_openimpala_phase_transport(sub, phase=int(phase), voxel_size_um=vox)
+                samples_xyz.append([pm["d_eff_x"], pm["d_eff_y"], pm["d_eff_z"]])
+            arr = np.asarray(samples_xyz, dtype=np.float64)
+            mu = arr.mean(axis=0)
+            sd = arr.std(axis=0)
+            cov_zz = float(sd[2] / max(mu[2], 1e-8)) if mu[2] > 1e-8 else 0.0
+            size_rows.append(
+                {
+                    "subvolume_size": float(sz),
+                    "mean_d_xx": float(mu[0]),
+                    "mean_d_yy": float(mu[1]),
+                    "mean_d_zz": float(mu[2]),
+                    "std_d_xx": float(sd[0]),
+                    "std_d_yy": float(sd[1]),
+                    "std_d_zz": float(sd[2]),
+                    "cov_d_zz": cov_zz,
+                }
+            )
+        if out_dir is not None and size_rows:
+            with (Path(out_dir) / "rev_convergence.csv").open("w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(size_rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(size_rows)
+
+    prof = oi.through_thickness_profile(
+        (vol > 0).astype(np.uint8), phase=1, direction="z", voxel_size=vox
+    )
+    prof_arr = np.asarray(prof.profile, dtype=np.float64)
+    largest_cov = float(size_rows[-1]["cov_d_zz"]) if size_rows else float("nan")
+    summary: dict[str, object] = {
+        "volume_shape": list(vol.shape),
+        "phase": int(phase),
+        "voxel_size_um": vox,
+        "largest_subvolume_cov_d_zz": largest_cov,
+        "rev_converged_5pct": bool(np.isfinite(largest_cov) and largest_cov <= 0.05),
+        "z_solid_profile_mean": float(np.mean(prof_arr)),
+        "z_solid_profile_std": float(np.std(prof_arr)),
+        "sizes": size_rows,
+    }
+    if out_dir is not None:
+        (Path(out_dir) / "rev_convergence_summary.json").write_text(json.dumps(summary, indent=2))
+    return summary
 
 
 def correlate_xrd_with_microstructure(

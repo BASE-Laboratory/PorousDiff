@@ -16,7 +16,7 @@ PorousDiff is designed to evaluate two core hypotheses on held-out synchrotron c
 
 ---
 
-### Key Capabilities (`v0.4` Multi-Electrode & OpenImpala Pipeline)
+### Key Capabilities (`v0.5` Multi-Electrode & Native OpenImpala v4.6 Pipeline)
 
 1. **Calibrated 2-Phase & 3-Phase XCT Segmentation, Partial-Volume Halo Cleanup & Mirror-Free Baseline Slabs** (`porousdiff/preprocessing.py`, `scripts/preprocessing/prepare_local_drive_bundle.py`)
    - Masks exterior air outside the circular electrode punch (`--roi-radius-fraction 0.70`), subtracts pore-mode-clamped background, applies shared per-`(material, beamline)` lowest-load thresholds (`delta_carbon`, `delta_coating`), and strips Paganin/PSF partial-volume "carbon rind" blur shells at `0–2` pore–coating boundaries (`--strip-halo-px 1`) while preserving $\ge 3\text{ px}$ carbon fibres and `0–1–2` triple-phase junctions.
@@ -26,13 +26,13 @@ PorousDiff is designed to evaluate two core hypotheses on held-out synchrotron c
    - **Hierarchical 2-channel Zero-SNR representation (`c_solid`, `c_coating`):** Aligns 2-phase Virgin Felt and 3-phase $\text{TiO}_2$/CuHCF electrodes via Channel 0 (`total solid`) and Channel 1 (`active coating`), conditioned on stress/load, categorical electrode chemistry (`nn.Embedding`), and `log(dx / dx_ref)` voxel size. Enforces a single load-unit source of truth across training, `--resume`, sampling, and evaluation so `mV/V` and `kPa` can never be mixed.
    - **Optional $\hat{x}_0$ auxiliary penalties (`--physics-loss`):** Combines Min-SNR-$\gamma$ timestep weighting with 3D finite-difference interfacial sharpness, hierarchical no-floating-coating support penalties, and catalyst-to-scaffold mass-loading conservation, alongside high-load coating-retention diagnostics (`coating_retention_diagnostics.json`).
 
-3. **Conditional DDIM Microstructure Transfer & Seamless $>96^3$ MultiDiffusion Tiling** (`porousdiff/virtual_compression.py`, `scripts/evaluation/virtual_compress_scan.py`)
-   - **Conditional DDIM Transfer (`invert_strength = 0.60`):** Partially inverts a real low-load segmented scan along the conditional DDIM trajectory and denoises it at higher in-range target stresses $\sigma$. Automatically audits `check_load_extrapolation`, roundtrip `same_load_solid_dice`, and `paired_xy_column_corr` vs. unpaired scans to verify specimen-specific structural retention rather than unconditional resampling (note: fixed Eulerian $96^3$ windows model mesoscale morphology rather than Lagrangian material-point tracking).
-   - **Seamless $>96^3$ 3D MultiDiffusion (`--tiled-shape`):** Synthesizes larger 3D domains (e.g. `96 × 96 × 192` or `160³`) via symmetrically spaced 3D raised-cosine (Hann) overlapped denoising so domain-size REV convergence can be tested explicitly in OpenImpala.
+3. **Eulerian & Mass-Conserving Lagrangian Slab Virtual Compression + $>96^3$ MultiDiffusion REV** (`porousdiff/virtual_compression.py`, `scripts/evaluation/virtual_compress_scan.py`)
+   - **Eulerian DDIM (`--mode eulerian_ddim`) & Mass-Conserving Lagrangian Slab (`--mode lagrangian_slab`):** Supports both fixed-box conditional DDIM ODE inversion (`invert_strength = 0.60`) and mass-conserving Lagrangian slab compression (`virtual_compress_lagrangian_slab`, affine Z-prewarping $Z_0 \to Z(\sigma)$ + `refine_strength = 0.35` 3D Hann MultiDiffusion refinement conserving solid and coating mass while restoring circular fiber cross-sections).
+   - **Seamless $>96^3$ 3D MultiDiffusion & OpenImpala REV (`--tiled-shape`, `--run-rev-study`):** Synthesizes larger 3D domains (e.g. `96 × 96 × 192` or `160³`) via 3D raised-cosine (Hann) overlapped denoising with automated OpenImpala sub-volume REV convergence and Z-profile uniformity audits.
 
-4. **Optimal Clamping-Pressure ($\sigma^*$) Analysis via 1D Newman ASR ($\Omega\cdot\text{cm}^2$), Weight Sensitivity & DIAD XRD Partial Correlation** (`porousdiff/optimization.py`, `scripts/evaluation/optimize_clamping_pressure.py`, `porousdiff/transport_and_xrd.py`)
-   - Couples uniform OpenImpala continuum transport (`openimpala_transport_parity.csv`, refusing mixed partial OpenImpala + surrogate curves) into both a normalized harmonic Figure of Merit (with an 11-point simplex `weight_sensitivity` sweep) and a **dimensional 1D Newman & Tobias porous-electrode Area-Specific Resistance $R_{\text{ASR}}(\sigma)$ ($\Omega\cdot\text{cm}^2$)** accounting for compressed thickness $L(\sigma) = L_0(1 - \epsilon_Z)$, Nernst mass-transfer resistance, clamping contact resistance, Darcy pumping penalty, and 3-regime sensitivity (`kinetics_limited`, `balanced`, `mass_transport_limited`).
-   - Quantifies 3D compressive contact metrics (`specific_z_pinch_excess`, `coating_pinch_fraction`, `mean_coating_coordination`) correlated against co-registered DLS K11 DIAD XRD microstrain with OLS partial correlation (`partial_pearson_r_given_sf`) controlling for solid fraction $\phi_s$.
+4. **Native `OpenImpala` v4.6 PDE Coupling, Cauchy–Crofton Morphology, Constriction $\beta_Z(\sigma)$ & 1D Newman ASR ($\sigma^*$)** (`porousdiff/transport_and_xrd.py`, `porousdiff/metrics.py`, `porousdiff/optimization.py`)
+   - **In-process OpenImpala v4.6 Python API (`--run-openimpala`):** Solves steady-state PDE diffusivity/conductivity directly in Python (`tortuosity_all`, composite 3-phase `phase_diffusivities`, optional $3 \times 3$ `effective_diffusivity`, `rev_study`) while preserving legacy batch INI generation for multi-node MPI jobs.
+   - **Unbiased 3D stereology, topology & ensemble fidelity:** Computes isotropic $2/3$ Cauchy–Crofton interfacial areas (`ssa_*_cc`, used by default in Newman ASR kinetic resistance to eliminate $1.5\times$ Manhattan voxel staircasing bias), 3D cubical Euler characteristic density (`euler_density`), EDT inscribed pore-throat radii (`pore_radius_median_um`, `pore_radius_p90_um`), continuum pore-throat constriction factor $\beta_Z(\sigma) = D_{\text{eff},Z}^{\text{PDE}} \tau_{\text{geo},Z}^2 / \varepsilon$, and ensemble Wasserstein-1 ($W_1$) / two-sample KS distances.
 
 ---
 
@@ -47,10 +47,10 @@ PorousDiff/
 │   ├── data.py                  # Hierarchical {0,1,2} <-> [-1,1]^2 encoding, load-unit source-of-truth helpers, symmetries
 │   ├── models.py                # Zero-SNR schedule, MultiModalConditionEmbedder (stress + chemistry + voxel size), 3D UNet, EMA
 │   ├── losses.py                # Auxiliary x0_hat loss (Min-SNR, 3D gradients, support, loading) & coating-retention check
-│   ├── virtual_compression.py   # Conditional DDIM microstructure transfer, fidelity diagnostics & >96^3 Hann MultiDiffusion
-│   ├── optimization.py          # 1D Newman ASR (Ohm*cm^2), simplex weight-sensitivity & bootstrap sigma* analysis
-│   ├── metrics.py               # Porosity, EASA, TPB, wired coating, pinch excess, S2(r), 26-neighbour Euclidean tortuosity
-│   └── transport_and_xrd.py     # OpenImpala INI/batch suite generator & parser + partial-correlation K11 DIAD XRD analysis
+│   ├── virtual_compression.py   # Eulerian DDIM & Lagrangian slab virtual compression + >96^3 Hann MultiDiffusion
+│   ├── optimization.py          # Cauchy-Crofton 1D Newman ASR (Ohm*cm^2), constriction beta_Z & bootstrap sigma* analysis
+│   ├── metrics.py               # Cauchy-Crofton SSA, EASA, TPB, Euler chi_V, EDT pore radii, W1/KS & 26-conn tortuosity
+│   └── transport_and_xrd.py     # Native OpenImpala v4.6 Python bridge, REV study, batch INI suite & K11 DIAD XRD analysis
 ├── scripts/
 │   ├── preprocessing/
 │   │   ├── prepare_local_drive_bundle.py   # Spyder/CLI multi-electrode stream-bundler + tall baseline slabs + --preview-only
@@ -59,15 +59,15 @@ PorousDiff/
 │   ├── training/
 │   │   └── train_carbon_conditional_96.py  # Multi-electrode 3-phase training + --resume config guard + --physics-loss
 │   └── evaluation/
-│       ├── sample_carbon_conditional_96.py # Standard & >96^3 (--tiled-shape) 3D sampling + OpenImpala TIFFs
-│       ├── virtual_compress_scan.py        # Conditional DDIM transfer across loads + same-load Dice & XY fidelity audit
+│       ├── sample_carbon_conditional_96.py # Standard & >96^3 (--tiled-shape, --run-rev-study) 3D sampling + OpenImpala TIFFs
+│       ├── virtual_compress_scan.py        # Eulerian DDIM & Lagrangian slab virtual compression + XY fidelity audit
 │       ├── evaluate_carbon_physics.py
-│       ├── evaluate_beamtime_multiplier.py # Real Held-Out XCT vs. Mirror-Free Baselines vs. PorousDiff
+│       ├── evaluate_beamtime_multiplier.py # Real Held-Out XCT vs. Baselines vs. PorousDiff + --run-openimpala + W1/KS
 │       ├── parse_openimpala_suite.py       # Ingest OpenImpala solver outputs into openimpala_transport_parity.csv
 │       └── optimize_clamping_pressure.py   # Newman ASR & FoM clamping-pressure sigma* + weight-sensitivity analysis
 ├── legacy/scripts/              # Archived pre-conditional v0.1-v0.2 prototype scripts (Exps 1-8)
 ├── slurm/                       # Isambard-AI GH200 Slurm batch scripts (configurable via POROUSDIFF_ROOT)
-├── tests/                       # Automated pytest unit, trained-model DDIM fidelity, and end-to-end CLI verification
+├── tests/                       # Automated pytest unit, OpenImpala v4.6 PDE, analytical phantom, and CLI verification
 ├── experiments.md               # Chronological experimental log
 ├── pyproject.toml
 ├── environment.yml
@@ -86,7 +86,7 @@ cd "$POROUSDIFF_ROOT/code/PorousDiff"
 git fetch origin && git checkout feature/paper-ready-conditional && git pull
 source "$POROUSDIFF_ROOT/.venv/bin/activate"
 pip install --no-build-isolation --no-deps -e .
-pytest -v
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 pytest -v
 ```
 
 ### 2. Local Drive Bundling (Windows Lab PC / Spyder)
@@ -117,7 +117,7 @@ pytest -v
        --beamline "DLS_K11_DIAD" --append --resume --zip
    ```
 
-### 3. Training, OpenImpala Transport, Conditional DDIM Transfer & Clamping $\sigma^*$ Analysis
+### 3. Training, Native OpenImpala v4.6 Transport, Lagrangian Slab Compression & $\sigma^*$ Analysis
 
 ```bash
 # Core Paper Benchmark: Multi-electrode training (auto-detecting calibrated stress_kpa),
@@ -125,25 +125,28 @@ pytest -v
 sbatch --export=ALL,POROUSDIFF_ROOT="$POROUSDIFF_ROOT",EXPERIMENT="beamtime_fewshot_96",HELDOUT_STATES="tio2_0p018mVV tio2_0p033mVV cuhcf_0p018mVV cuhcf_0p033mVV" \
     slurm/run_beamtime_multiplier.slurm
 
-# Run generated OpenImpala continuum diffusion/conduction jobs & re-evaluate Newman ASR + sigma*:
-bash "$POROUSDIFF_ROOT/results/beamtime_fewshot_96/beamtime_benchmark/openimpala_suite/run_openimpala_batch.sh"
-python scripts/evaluation/parse_openimpala_suite.py \
-    --suite-dir "$POROUSDIFF_ROOT/results/beamtime_fewshot_96/beamtime_benchmark/openimpala_suite"
+# Execute OpenImpala v4.6 PDE transport directly in-process (--run-openimpala) & compute Newman ASR sigma*:
+python scripts/evaluation/evaluate_beamtime_multiplier.py \
+    --experiments porousdiff=beamtime_fewshot_96 \
+    --data-root "$POROUSDIFF_ROOT/data/carbon_virgin" \
+    --manifest-json "$POROUSDIFF_ROOT/data/carbon_virgin/bundle_manifest.json" \
+    --run-openimpala
 python scripts/evaluation/optimize_clamping_pressure.py \
     --experiments porousdiff=beamtime_fewshot_96 \
     --data-root "$POROUSDIFF_ROOT/data/carbon_virgin" \
     --manifest-json "$POROUSDIFF_ROOT/data/carbon_virgin/bundle_manifest.json"
 
-# MultiDiffusion >96^3 synthesis (e.g. 96x96x192 or 160^3) to test OpenImpala REV domain-size convergence:
+# MultiDiffusion >96^3 synthesis + automated OpenImpala REV sub-volume convergence study:
 python scripts/evaluation/sample_carbon_conditional_96.py \
     --experiment beamtime_fewshot_96 \
     --manifest-json "$POROUSDIFF_ROOT/data/carbon_virgin/bundle_manifest.json" \
-    --tiled-shape 96,96,192 --num-samples 5 --export-openimpala
+    --tiled-shape 96,96,192 --num-samples 5 --export-openimpala --run-rev-study
 
-# Conditional DDIM transfer of a real low-load (in-range, e.g. 68 kPa) 3D scan to higher target stresses:
+# Mass-conserving Lagrangian slab virtual compression of a tall low-load scan across target stresses:
 python scripts/evaluation/virtual_compress_scan.py \
-    --input "$POROUSDIFF_ROOT/data/low_load_68kpa.tif" \
+    --input "$POROUSDIFF_ROOT/data/low_load_68kpa_tall.tif" \
     --experiment beamtime_fewshot_96 \
+    --mode lagrangian_slab --target-compression-ratios "0.85,0.72,0.60" \
     --source-load 68.0 --target-loads "150,300,450" \
     --material tio2_anode --export-openimpala
 ```
@@ -160,7 +163,8 @@ Earlier unconditional baselines (`TiO₂`, `Op001mVV` / `Op026mVV`) established 
 | Exp 6–11 | Grayscale 3D DDPM (`epsilon`, std linear) | `64³` | — | — | Completed — blurry boundaries & horizontal banding |
 | Exp 12 | Unconditional Binary DDPM (`epsilon`, std schedule) | `64³` | `0.1318` | `0.3948` | Completed — non-zero terminal SNR shifts sparse binary mean ~3× toward `0.50` |
 | Exp 13 | Unconditional Binary DDPM (`epsilon`, std schedule) | `96³` | `0.0984` | `0.2806` | Completed — `96³` feasible on GH200, motivating Zero-SNR & conditioning fixes |
-| **Exp 14–16 (`v0.4`)** | **Multi-Electrode 3-Phase Load-Conditioned DDPM (`v`-pred + Zero-SNR + OpenImpala ASR)** | **`96³` (`2×` binned)** | **Virgin + $\text{TiO}_2$ + CuHCF + DIAD** | **Pending full GH200 benchmark** | **Software pipeline & unit/methodology guards verified; ready for held-out synchrotron evaluation** |
+| Exp 14–16 (`v0.4`) | Multi-Electrode 3-Phase Load-Conditioned DDPM (`v`-pred + Zero-SNR + Newman ASR) | `96³` (`2×` binned) | Virgin + $\text{TiO}_2$ + CuHCF + DIAD | Verified on synthetic & unit suites | Unit/methodology safeguards, mirror-free slabs & 26-conn tortuosity |
+| **Exp 17 (`v0.5`)** | **Native OpenImpala v4.6 PDE + Cauchy–Crofton ASR + Constriction $\beta_Z$ + Lagrangian Slab DDIM** | **`96³` & $>96^3$ REV** | **Virgin + $\text{TiO}_2$ + CuHCF + DIAD** | **Pending full GH200 campaign** | **In-process OpenImpala v4.6 PDE, Euler/EDT/$W_1$ metrics & Lagrangian slab verified in CI** |
 
 ---
 

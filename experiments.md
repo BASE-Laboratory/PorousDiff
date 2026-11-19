@@ -492,3 +492,23 @@ Existing 3D diffusion papers for porous electrodes generate static microstructur
    - **26-Connected Euclidean Geodesic Tortuosity:** Upgraded `geodesic_pore_tortuosity` from 6-neighbour Manhattan BFS to 26-neighbour Euclidean Dijkstra (`1, sqrt(2), sqrt(3)` step weights, recovering $\tau = \sqrt{2}$ on $45^\circ$ diagonal channels).
    - **3-Phase Partial-Volume Halo Cleanup & Thin-Scan XY Split:** Strips 1–2 px Paganin/PSF phase-`1` blur rinds at `0–2` pore boundaries (`strip_partial_volume_carbon_halo`) and falls back to buffered XY-sector splitting (`split_xy_positions_with_buffer`) on thin compressed stacks.
 
+
+## Experiment 17: Native `OpenImpala` v4.6 Python Coupling, Unbiased Cauchy–Crofton Morphology, Constriction $\beta_Z(\sigma)$ & Mass-Conserving Lagrangian Slab DDIM (`v0.5`)
+
+**Status:** Software tracks `v0.5a`–`v0.5d` implemented and verified with `OpenImpala` v4.6 in CI (`feature/paper-ready-conditional`) — staged for Isambard-AI GH200 production campaign (`v1.0`)
+
+### Key `v0.5` Upgrades (`porousdiff/`)
+1. **In-Process `OpenImpala` v4.6 Python Facade Integration (`porousdiff/transport_and_xrd.py`, `evaluate_beamtime_multiplier.py --run-openimpala`):**
+   - `compute_openimpala_volume_transport` and `run_openimpala_python_suite` execute steady-state PDE transport directly on `(Z, Y, X)` NumPy arrays (`openimpala.tortuosity_all(..., strict=False)` and optional $3 \times 3$ `openimpala.effective_diffusivity`) across ionic pores (`phase=0`), graphitic carbon (`phase=1`), active coating (`phase=2`), and composite 3-phase solid conduction (`phase_diffusivities={0: 0.0, 1: 1.0, 2: sigma_coat_rel}`), recording `d_eff = 0.0` cleanly on pinched non-percolating directions.
+   - `run_openimpala_rev_convergence` (`sample_carbon_conditional_96.py --run-rev-study`) wraps `openimpala.rev_study` + `through_thickness_profile` to audit sub-volume variance decay ($\text{CoV}(D_{zz}) \le 5\%$) and Z-direction compaction uniformity.
+2. **Cauchy–Crofton $2/3$ Stereology, Continuum Constriction $\beta_Z(\sigma)$, 3D Euler Genus & Ensemble $W_1$ (`metrics.py`, `optimization.py`):**
+   - Emits isotropic $2/3$ Cauchy–Crofton interfacial areas (`ssa_total_cc`, `ssa_pore_coating_cc`, `ssa_pore_carbon_cc`, `ssa_carbon_coating_cc`) matching `openimpala.specific_surface_area(..., ssa_corrected)`, and uses Cauchy–Crofton kinetic area by default in 1D Newman & Tobias $R_{\text{ASR}}(\sigma)$ (`"kinetic_area_convention": "cauchy_crofton_2_3"`).
+   - Computes continuum pore-throat constriction $\beta_Z(\sigma) = \left(D_{\text{eff},Z}^{\text{PDE}} / D_0\right) \tau_{\text{geo},Z}^2(\sigma) / \varepsilon(\sigma)$, exact digital-topology 3D cubical Euler characteristic density $\chi_V = (V - E + F - C) / (N \Delta x^3)$, EDT inscribed pore radii (`pore_radius_median_um`, `pore_radius_p90_um`), and ensemble Wasserstein-1 ($W_1$) / two-sample KS fidelity distances.
+3. **Mass-Conserving Lagrangian Slab Virtual Compression (`virtual_compress_lagrangian_slab`, `virtual_compress_scan.py --mode lagrangian_slab`):**
+   - Maps tall uncompressed scans `(Z_0, Y, X)` via volume-fraction-matched affine Z-compression to physical compressed height $Z(\sigma)$ and refines local morphology via overlapped 3D Hann MultiDiffusion DDIM (`refine_strength = 0.35`) with solid/coating mass conservation.
+4. **Stage-Gated Isambard-AI GH200 Paper Campaign (`v1.0` Milestone):**
+   - **Exp 17a (Dense Single-Material Baselines):** 3 seeds (`42, 43, 44`) $\times$ Virgin Carbon, $\text{TiO}_2$ Anode, CuHCF Cathode (`--physics-loss` ablation on/off).
+   - **Exp 17b (Beamtime Multiplier Few-Shot Transfer):** Dense Virgin Carbon + `{2, 3}` sparse coated loads predicting held-out intermediate loads vs. `noop_uncompressed`, `affine_z_squash`, `pillar_pore_deletion`, Eulerian DDIM, and Lagrangian Slab DDIM.
+   - **Exp 17c (Full OpenImpala GH200 PDE + K11 DIAD XRD Closure):** Compiled C++/CUDA OpenImpala $3 \times 3$ $D_{\text{eff}}$ & REV study ($96^3 \to 192^3$), constriction factor $\beta_Z(\sigma)$, Newman $R_{\text{ASR}}(\sigma)$ $\sigma^*$ with bootstrap CIs, and partial correlation against K11 DIAD microstrain.
+
+

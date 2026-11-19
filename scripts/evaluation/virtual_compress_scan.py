@@ -43,6 +43,7 @@ from porousdiff.models import (
 from porousdiff.virtual_compression import (
     check_load_extrapolation,
     compute_virtual_compression_fidelity,
+    virtual_compress_lagrangian_slab,
     virtual_compress_volumes,
 )
 
@@ -89,7 +90,7 @@ def _save_virtual_panel(
         axes[0, col].axis("off")
 
         axes[1, col].imshow(vol[:, my, :], cmap=cmap, vmin=0, vmax=vmax, interpolation="nearest")
-        axes[1, col].set_title("XZ (Compression ↓)", fontsize=9)
+        axes[1, col].set_title(f"XZ (Z={vol.shape[0]} ↓)", fontsize=9)
         axes[1, col].axis("off")
 
     fig.suptitle("Conditional DDIM Microstructure Transfer Across Compressive Loads", fontsize=12)
@@ -116,6 +117,17 @@ def main() -> None:
         help="Comma-separated target loads/stresses (e.g. '50,150,300,500' or '0.018,0.033,0.053')",
     )
     parser.add_argument(
+        "--mode",
+        choices=["eulerian_ddim", "lagrangian_slab"],
+        default="eulerian_ddim",
+        help="eulerian_ddim: fixed-box DDIM ODE inversion; lagrangian_slab: mass-conserving Z-shrinking slab MultiDiffusion",
+    )
+    parser.add_argument(
+        "--target-compression-ratios",
+        default="",
+        help="Optional comma-separated H_comp/H_0 ratios matching --target-loads when --mode lagrangian_slab",
+    )
+    parser.add_argument(
         "--material",
         default="virgin_carbon",
         choices=["virgin_carbon", "tio2_anode", "cuhcf_cathode"],
@@ -123,6 +135,7 @@ def main() -> None:
     parser.add_argument("--voxel-size-um", type=float, default=0.0)
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--invert-strength", type=float, default=0.60)
+    parser.add_argument("--refine-strength", type=float, default=0.35)
     parser.add_argument("--guidance-scale", type=float, default=1.5)
     parser.add_argument("--export-openimpala", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
@@ -150,6 +163,7 @@ def main() -> None:
 
     saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = saved["config"]
+    patch_size = int(cfg.get("patch_size", 96))
     num_phases = int(cfg.get("num_phases", 2))
     num_materials = int(cfg.get("num_materials", 1))
     ref_vox = float(cfg.get("ref_voxel_size_um", 1.0))
@@ -207,25 +221,75 @@ def main() -> None:
         else torch.float16
     )
 
-    all_eval_loads = list(dict.fromkeys([float(args.source_load), *target_loads]))
-    all_compressed = virtual_compress_volumes(
-        model=active_model,
-        alphas_cumprod=scheduler.alphas_cumprod,
-        source_volumes=source_vol,
-        source_load=args.source_load,
-        target_loads=all_eval_loads,
-        prediction_type=str(cfg["prediction_type"]),
-        num_steps=args.steps,
-        invert_strength=args.invert_strength,
-        guidance_scale=args.guidance_scale,
-        material_id=mat_id,
-        voxel_size_um=vox_um,
-        batch_size=1,
-        use_amp=use_amp,
-        amp_dtype=amp_dtype,
-    )
-    same_load_vol = all_compressed[float(args.source_load)]
-    compressed = {float(tl): all_compressed[float(tl)] for tl in target_loads}
+    lagrangian_info_by_load: dict[str, dict[str, float]] = {}
+    if args.mode == "lagrangian_slab":
+        if args.target_compression_ratios.strip():
+            ratios = [float(x.strip()) for x in args.target_compression_ratios.split(",") if x.strip()]
+            if len(ratios) != len(target_loads):
+                raise ValueError("--target-compression-ratios must match length of --target-loads")
+        else:
+            l_min = float(cfg["load_min"])
+            l_span = max(float(cfg["load_max"]) - l_min, 1e-6)
+            ratios = [
+                float(np.clip(1.0 - 0.45 * max(0.0, tl - float(args.source_load)) / l_span, 0.40, 1.0))
+                for tl in target_loads
+            ]
+        same_load_vol, _ = virtual_compress_lagrangian_slab(
+            model=active_model,
+            alphas_cumprod=scheduler.alphas_cumprod,
+            source_volume=source_vol,
+            target_load=float(args.source_load),
+            patch_size=patch_size,
+            compression_ratio=1.0,
+            prediction_type=str(cfg["prediction_type"]),
+            num_steps=args.steps,
+            refine_strength=args.refine_strength,
+            guidance_scale=1.0,
+            material_id=mat_id,
+            voxel_size_um=vox_um,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+        )
+        compressed = {}
+        for tl, r_val in zip(target_loads, ratios):
+            c_vol, l_info = virtual_compress_lagrangian_slab(
+                model=active_model,
+                alphas_cumprod=scheduler.alphas_cumprod,
+                source_volume=source_vol,
+                target_load=float(tl),
+                patch_size=patch_size,
+                compression_ratio=float(r_val),
+                prediction_type=str(cfg["prediction_type"]),
+                num_steps=args.steps,
+                refine_strength=args.refine_strength,
+                guidance_scale=args.guidance_scale,
+                material_id=mat_id,
+                voxel_size_um=vox_um,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+            )
+            compressed[float(tl)] = c_vol
+            lagrangian_info_by_load[f"{float(tl):g}"] = l_info
+    else:
+        all_eval_loads = list(dict.fromkeys([float(args.source_load), *target_loads]))
+        all_compressed = virtual_compress_volumes(
+            model=active_model,
+            alphas_cumprod=scheduler.alphas_cumprod,
+            source_volumes=source_vol,
+            source_load=args.source_load,
+            target_loads=all_eval_loads,
+            prediction_type=str(cfg["prediction_type"]),
+            num_steps=args.steps,
+            invert_strength=args.invert_strength,
+            guidance_scale=args.guidance_scale,
+            material_id=mat_id,
+            voxel_size_um=vox_um,
+            batch_size=1,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+        )
+        same_load_vol = all_compressed[float(args.source_load)]
+        compressed = {float(tl): all_compressed[float(tl)] for tl in target_loads}
 
     out_dir = (
         args.out_dir
@@ -235,7 +299,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     rows: list[dict[str, object]] = []
-    fidelity_by_load: dict[str, dict[str, float]] = {}
+    fidelity_by_load: dict[str, dict[str, float | bool]] = {}
     eval_fn = evaluate_multiphase_physics if num_phases == 3 else evaluate_volume_physics
     src_phys = eval_fn(source_vol, voxel_size=vox_um)
     src_fid = compute_virtual_compression_fidelity(
@@ -243,6 +307,8 @@ def main() -> None:
     )
     src_row: dict[str, object] = {
         "kind": "real_source",
+        "mode": args.mode,
+        "depth_z": int(source_vol.shape[0]),
         "load_value": args.source_load,
         "load_unit": unit_label,
         "material": args.material,
@@ -268,6 +334,8 @@ def main() -> None:
         fidelity_by_load[f"{lv:g}"] = fid
         row: dict[str, object] = {
             "kind": "virtual_compressed",
+            "mode": args.mode,
+            "depth_z": int(vol.shape[0]),
             "load_value": lv,
             "load_unit": unit_label,
             "material": args.material,
@@ -283,11 +351,14 @@ def main() -> None:
         writer.writerows(rows)
 
     summary_payload = {
+        "mode": args.mode,
         "load_unit": unit_label,
         "invert_strength": float(args.invert_strength),
+        "refine_strength": float(args.refine_strength),
         "extrapolation_check": extrap,
         "same_load_solid_dice": round(float(src_fid["same_load_solid_dice"]), 6),
         "fidelity_by_load": fidelity_by_load,
+        "lagrangian_slab_diagnostics": lagrangian_info_by_load,
         "records": rows,
     }
     (out_dir / "virtual_compression_summary.json").write_text(json.dumps(summary_payload, indent=2))

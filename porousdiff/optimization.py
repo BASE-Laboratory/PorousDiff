@@ -22,6 +22,8 @@ from typing import Mapping, Sequence
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
+from porousdiff.metrics import CAUCHY_CROFTON_3D_FACTOR
+
 
 def load_openimpala_lookup(
     csv_path: Path,
@@ -75,8 +77,9 @@ def compute_transport_and_fom_record(
     openimpala_metrics: Mapping[str, float] | None = None,
     voxel_size_um: float = 1.0,
     strain_z: float | None = None,
+    use_cauchy_crofton_ssa: bool = True,
 ) -> dict[str, float]:
-    """Compute ionic, electronic, hydraulic, and kinetic observables for a single 3D realization."""
+    """Compute ionic, electronic, hydraulic, kinetic, and constriction observables for a 3D realization."""
     sf = float(phys_metrics.get("solid_fraction", 0.0))
     porosity = float(phys_metrics.get("porosity", max(0.0, 1.0 - sf)))
     coat_frac = float(phys_metrics.get("coating_fraction", 0.0))
@@ -93,6 +96,12 @@ def compute_transport_and_fom_record(
     else:
         d_eff_pore_z = 0.0
         used_openimpala = 0.0
+
+    # Continuum pore-throat constriction factor beta_Z = (D_eff,Z^PDE * tau_geo,Z^2) / porosity
+    if used_openimpala > 0.5 and porosity > 1e-6 and np.isfinite(tau_pore_z) and tau_pore_z >= 1.0:
+        constriction_factor_z = float(d_eff_pore_z * (tau_pore_z**2) / porosity)
+    else:
+        constriction_factor_z = float("nan")
 
     # 2. Through-plane electronic effective conductivity sigma_eff,Z / sigma_0
     is_coated = coat_frac > 1e-6 or float(phys_metrics.get("ssa_pore_coating", 0.0)) > 1e-6
@@ -128,14 +137,23 @@ def compute_transport_and_fom_record(
     else:
         perm_ck_um2 = 0.0
 
-    # 4. Electrochemically active wired interfacial density (1/um)
-    ssa_coat = float(phys_metrics.get("ssa_pore_coating", 0.0))
+    # 4. Electrochemically active wired interfacial density (1/um; Cauchy-Crofton 2/3 default)
+    ssa_coat_raw = float(phys_metrics.get("ssa_pore_coating", 0.0))
+    ssa_coat_cc = float(
+        phys_metrics.get("ssa_pore_coating_cc", ssa_coat_raw * CAUCHY_CROFTON_3D_FACTOR)
+    )
     tpb = float(phys_metrics.get("tpb_density", 0.0))
-    ssa_total = float(phys_metrics.get("ssa_total", 0.0))
+    ssa_total_raw = float(phys_metrics.get("ssa_total", 0.0))
+    ssa_total_cc = float(
+        phys_metrics.get("ssa_total_cc", ssa_total_raw * CAUCHY_CROFTON_3D_FACTOR)
+    )
     if is_coated:
-        active_interface = float(ssa_coat * wired_frac + 0.05 * voxel_size_um * tpb * wired_frac)
+        active_interface_raw = float(ssa_coat_raw * wired_frac + 0.05 * voxel_size_um * tpb * wired_frac)
+        active_interface_cc = float(ssa_coat_cc * wired_frac + 0.05 * voxel_size_um * tpb * wired_frac)
     else:
-        active_interface = float(ssa_total * solid_conn)
+        active_interface_raw = float(ssa_total_raw * solid_conn)
+        active_interface_cc = float(ssa_total_cc * solid_conn)
+    active_interface = active_interface_cc if use_cauchy_crofton_ssa else active_interface_raw
 
     raw_sz = strain_z if strain_z is not None else phys_metrics.get("strain_z", float("nan"))
     strain_val = float(raw_sz) if (raw_sz is not None and np.isfinite(raw_sz)) else float("nan")
@@ -145,9 +163,12 @@ def compute_transport_and_fom_record(
         "porosity": porosity,
         "strain_z": strain_val,
         "d_eff_pore_z": d_eff_pore_z,
+        "constriction_factor_z": constriction_factor_z,
         "sigma_eff_solid_z": sigma_eff_solid_z,
         "permeability_ck_um2": perm_ck_um2,
         "active_wired_interface": active_interface,
+        "active_wired_interface_cc": active_interface_cc,
+        "active_wired_interface_raw": active_interface_raw,
         "wired_coating_fraction": wired_frac if is_coated else solid_conn,
         "tpb_density": tpb,
         "z_pinch_contact_density": float(phys_metrics.get("z_pinch_contact_density", 0.0)),
@@ -559,6 +580,9 @@ def find_optimal_clamping_pressure(
     )
     for i, lv in enumerate(sorted_loads):
         recs = records_by_load[lv]
+        beta_vals = [float(r.get("constriction_factor_z", float("nan"))) for r in recs]
+        beta_fin = [v for v in beta_vals if np.isfinite(v)]
+        mean_beta_z = float(np.mean(beta_fin)) if beta_fin else float("nan")
         discrete_rows.append(
             {
                 "load_value": lv,
@@ -567,6 +591,7 @@ def find_optimal_clamping_pressure(
                 "porosity": float(np.mean([float(r.get("porosity", 1.0 - mean_sf[i])) for r in recs])),
                 "compressed_thickness_cm": float(discrete_thick_cm[i]),
                 "d_eff_pore_z": float(mean_d_eff[i]),
+                "constriction_factor_z": mean_beta_z,
                 "sigma_eff_solid_z": float(mean_sigma[i]),
                 "permeability_ck_um2": float(mean_perm[i]),
                 "active_wired_interface": float(mean_active[i]),
@@ -627,6 +652,7 @@ def find_optimal_clamping_pressure(
                 "kappa_0, sigma_0, interfacial kinetics R_ct, mass-transport R_mt, and pumping/contact terms; "
                 "see regime_sensitivity)."
             ),
+            "kinetic_area_convention": "cauchy_crofton_2_3",
             "uncompressed_thickness_cm": float(uncompressed_thickness_cm),
             "optimal_load_asr": round(opt_load_asr, 6),
             "nearest_discrete_load_asr": round(near_asr_lv, 6),
