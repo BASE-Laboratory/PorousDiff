@@ -71,6 +71,7 @@ from porousdiff.transport_and_xrd import (
 from porousdiff.virtual_compression import (
     check_load_extrapolation,
     compute_virtual_compression_fidelity,
+    virtual_compress_lagrangian_slab,
     virtual_compress_volumes,
 )
 
@@ -173,9 +174,15 @@ def main() -> None:
         action="store_true",
         help="Virtually compress real lowest-load XCT patches via deterministic DDIM ODE inversion + target-stress denoising",
     )
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Optional checkpoint override for --include-virtual-compression")
+    parser.add_argument(
+        "--include-lagrangian-slab",
+        action="store_true",
+        help="Virtually compress tall uncompressed real XCT slabs via mass-conserving Lagrangian prewarping + MultiDiffusion DDIM",
+    )
+    parser.add_argument("--checkpoint", type=Path, default=None, help="Optional checkpoint override for virtual compression")
     parser.add_argument("--virtual-steps", type=int, default=40)
     parser.add_argument("--invert-strength", type=float, default=0.60)
+    parser.add_argument("--refine-strength", type=float, default=0.35)
     parser.add_argument("--guidance-scale", type=float, default=1.5)
     parser.add_argument("--allow-cpu", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
@@ -294,17 +301,21 @@ def main() -> None:
             lowest_state_by_group[(mat, beam)] = st
             lowest_load_by_group[(mat, beam)] = lv
 
-    # Optional: Virtual compression of real lowest-load scans via DDIM ODE inversion
+    # Optional: Virtual compression of real lowest-load scans via DDIM ODE inversion and/or Lagrangian slab DDIM
     virtual_cache_by_state: dict[str, np.ndarray] = {}
     vc_same_load_by_group: dict[tuple[str, str], np.ndarray] = {}
     vc_extrap_by_group: dict[tuple[str, str], dict[str, object]] = {}
-    if args.include_virtual_compression:
+    lagrangian_cache_by_state: dict[str, np.ndarray] = {}
+    lagrangian_info_by_state: dict[str, dict[str, float]] = {}
+    if args.include_virtual_compression or args.include_lagrangian_slab:
         if torch.cuda.is_available():
             vc_device = torch.device("cuda")
         elif args.allow_cpu:
             vc_device = torch.device("cpu")
         else:
-            raise RuntimeError("CUDA GPU required for --include-virtual-compression (or pass --allow-cpu)")
+            raise RuntimeError(
+                "CUDA GPU required for --include-virtual-compression / --include-lagrangian-slab (or pass --allow-cpu)"
+            )
 
         ckpt_path = resolve_checkpoint_path(args.output_root, first_exp, args.checkpoint)
         if ckpt_path is None:
@@ -366,27 +377,63 @@ def main() -> None:
             )
             mat_id = resolve_material_id(mat) if vc_num_materials > 1 else 0
             vox_um = float(grp_specs[0]["voxel_size_um"])  # type: ignore[arg-type]
-            vc_map = virtual_compress_volumes(
-                model=vc_active,
-                alphas_cumprod=vc_sched.alphas_cumprod,
-                source_volumes=ref_vols,
-                source_load=ref_lv,
-                target_loads=target_lvs,
-                prediction_type=str(vc_cfg["prediction_type"]),
-                num_steps=args.virtual_steps,
-                invert_strength=args.invert_strength,
-                guidance_scale=args.guidance_scale,
-                material_id=mat_id,
-                voxel_size_um=vox_um,
-                batch_size=min(4, int(ref_vols.shape[0])),
-                use_amp=vc_use_amp,
-                amp_dtype=vc_amp_dtype,
-            )
-            vc_same_load_by_group[(mat, beam)] = vc_map[ref_lv]
-            for sp in grp_specs:
-                st_k = str(sp["state"])
-                lv_k = float(sp["load_value"])  # type: ignore[arg-type]
-                virtual_cache_by_state[st_k] = vc_map[lv_k]
+            if args.include_virtual_compression:
+                vc_map = virtual_compress_volumes(
+                    model=vc_active,
+                    alphas_cumprod=vc_sched.alphas_cumprod,
+                    source_volumes=ref_vols,
+                    source_load=ref_lv,
+                    target_loads=target_lvs,
+                    prediction_type=str(vc_cfg["prediction_type"]),
+                    num_steps=args.virtual_steps,
+                    invert_strength=args.invert_strength,
+                    guidance_scale=args.guidance_scale,
+                    material_id=mat_id,
+                    voxel_size_um=vox_um,
+                    batch_size=min(4, int(ref_vols.shape[0])),
+                    use_amp=vc_use_amp,
+                    amp_dtype=vc_amp_dtype,
+                )
+                vc_same_load_by_group[(mat, beam)] = vc_map[ref_lv]
+                for sp in grp_specs:
+                    st_k = str(sp["state"])
+                    lv_k = float(sp["load_value"])  # type: ignore[arg-type]
+                    virtual_cache_by_state[st_k] = vc_map[lv_k]
+
+            if args.include_lagrangian_slab:
+                tall_src = tall_ref_cache[ref_st]
+                for sp in grp_specs:
+                    st_k = str(sp["state"])
+                    lv_k = float(sp["load_value"])  # type: ignore[arg-type]
+                    target_sf_k = max(float((real_cache[st_k] >= 1).mean()), 1e-3)
+                    lag_vols: list[np.ndarray] = []
+                    lag_infos: list[dict[str, float]] = []
+                    for s_idx, rv in enumerate(tall_src):
+                        lv_vol, lv_info = virtual_compress_lagrangian_slab(
+                            model=vc_active,
+                            alphas_cumprod=vc_sched.alphas_cumprod,
+                            source_volume=rv,
+                            target_load=lv_k,
+                            patch_size=args.patch_size,
+                            target_solid_fraction=target_sf_k,
+                            output_depth=args.patch_size,
+                            prediction_type=str(vc_cfg["prediction_type"]),
+                            num_steps=args.virtual_steps,
+                            refine_strength=args.refine_strength,
+                            guidance_scale=args.guidance_scale,
+                            material_id=mat_id,
+                            voxel_size_um=vox_um,
+                            use_amp=vc_use_amp,
+                            amp_dtype=vc_amp_dtype,
+                            seed=args.seed + s_idx,
+                        )
+                        lag_vols.append(lv_vol)
+                        lag_infos.append(lv_info)
+                    lagrangian_cache_by_state[st_k] = np.stack(lag_vols, axis=0)
+                    lagrangian_info_by_state[st_k] = {
+                        k: round(float(np.mean([inf[k] for inf in lag_infos])), 6)
+                        for k in lag_infos[0]
+                    }
 
     max_lag = min(32, args.patch_size // 2)
     report: dict[str, object] = {}
@@ -478,6 +525,8 @@ def main() -> None:
         }
         if st in virtual_cache_by_state:
             methods_vols["virtual_compression"] = virtual_cache_by_state[st]
+        if st in lagrangian_cache_by_state:
+            methods_vols["lagrangian_slab"] = lagrangian_cache_by_state[st]
 
         per_seed_vols_by_method: dict[str, list[np.ndarray]] = {}
         provenance_by_method: dict[str, dict[str, object]] = {}
@@ -577,7 +626,7 @@ def main() -> None:
                 "s2_improvement_over_noop": s2_gain_vs_noop,
                 "baseline_mirror_tiled_fraction": (
                     round(mirror_frac, 6)
-                    if m_name in ("affine_z_squash", "pillar_pore_deletion")
+                    if m_name in ("affine_z_squash", "pillar_pore_deletion", "lagrangian_slab")
                     else 0.0
                 ),
             }
@@ -628,6 +677,22 @@ def main() -> None:
                 "s2_improvement_over_noop"
             ]
             st_entry["virtual_compression_diagnostics"] = vc_diag
+        if st in lagrangian_cache_by_state:
+            lag_diag: dict[str, object] = dict(
+                compute_virtual_compression_fidelity(
+                    source_volumes=base_src_vols,
+                    compressed_volumes=lagrangian_cache_by_state[st],
+                    same_load_reconstructions=lagrangian_cache_by_state.get(ref_st),
+                    is_target_same_as_source=(st == ref_st),
+                )
+            )
+            lag_diag.update(lagrangian_info_by_state.get(st, {}))
+            lag_diag.update(vc_extrap_by_group.get((mat, beam), {}))
+            lag_diag["noop_s2_rmse"] = round(noop_s2_err, 6)
+            lag_diag["s2_improvement_over_noop"] = methods_summary["lagrangian_slab"][  # type: ignore[index]
+                "s2_improvement_over_noop"
+            ]
+            st_entry["lagrangian_slab_diagnostics"] = lag_diag
         report[st] = st_entry
         print(
             f"[{st} | {mat} ({beam}) | heldout={is_heldout}] real φ_s={target_sf:.4f} | "

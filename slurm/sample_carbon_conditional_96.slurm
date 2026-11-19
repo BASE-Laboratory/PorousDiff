@@ -34,6 +34,16 @@ echo "Started: $(date -u)"
 echo "Job ID: ${SLURM_JOB_ID:-local}"
 nvidia-smi
 
+REV_ARGS=()
+if [ "${RUN_REV_STUDY:-0}" = "1" ]; then
+    REV_ARGS+=(--tiled-shape "${TILED_SHAPE:-96,192,192}")
+    if python -c "import openimpala" >/dev/null 2>&1; then
+        REV_ARGS+=(--run-rev-study)
+    else
+        echo "Warning: openimpala not installed in $VENV_DIR; generating tiled slab without --run-rev-study."
+    fi
+fi
+
 python -u scripts/evaluation/sample_carbon_conditional_96.py \
     --experiment "$EXPERIMENT" \
     --sampler "${SAMPLER:-ddim}" \
@@ -43,7 +53,8 @@ python -u scripts/evaluation/sample_carbon_conditional_96.py \
     --batch-size "${BATCH_SIZE:-4}" \
     --eval-states "${EVAL_STATES_ARR[@]}" \
     --sweep-loads "$SWEEP_LOADS" \
-    --export-openimpala
+    --export-openimpala \
+    "${REV_ARGS[@]}"
 
 HELDOUT_ARGS=()
 if [ "${#HELDOUT_ARR[@]}" -gt 0 ]; then

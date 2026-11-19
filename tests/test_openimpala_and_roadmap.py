@@ -244,6 +244,44 @@ def test_end_to_end_run_openimpala_cli_and_newman_asr(tmp_path: Path) -> None:
     (out_root / "results" / exp_name / "samples" / "sampling_provenance.json").write_text(
         json.dumps({"weight_source": "EMA"})
     )
+    ckpt_dir = out_root / "checkpoints" / exp_name
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    tiny_model = ContinuousLoadConditionedUNet(
+        channels=(8, 16),
+        attention_levels=(False, True),
+        num_res_blocks=1,
+        norm_num_groups=4,
+        load_min=50.0,
+        load_max=300.0,
+        use_flash_attention=False,
+        num_phases=3,
+        num_materials=3,
+        ref_voxel_size_um=1.0,
+    ).eval()
+    torch.save(
+        {
+            "epoch": 0,
+            "model": tiny_model.state_dict(),
+            "config": {
+                "patch_size": patch_sz,
+                "channels": [8, 16],
+                "attention_levels": [False, True],
+                "num_res_blocks": 1,
+                "norm_groups": 4,
+                "load_min": 50.0,
+                "load_max": 300.0,
+                "conditioning_mode": "multiscale_fourier",
+                "num_phases": 3,
+                "num_materials": 3,
+                "ref_voxel_size_um": 1.0,
+                "use_stress_kpa": True,
+                "timesteps": 100,
+                "schedule": "zero_snr_scaled_linear",
+                "prediction_type": "v_prediction",
+            },
+        },
+        ckpt_dir / "best_val.pth",
+    )
     manifest_path = data_root / "bundle_manifest.json"
     manifest_path.write_text(json.dumps({"version": version, "scans": scans_manifest}, indent=2))
 
@@ -264,6 +302,10 @@ def test_end_to_end_run_openimpala_cli_and_newman_asr(tmp_path: Path) -> None:
             "--patch-size",
             str(patch_sz),
             "--use-stress-kpa",
+            "--include-lagrangian-slab",
+            "--virtual-steps",
+            "4",
+            "--allow-cpu",
             "--max-openimpala-per-method",
             "1",
             "--run-openimpala",
@@ -276,6 +318,8 @@ def test_end_to_end_run_openimpala_cli_and_newman_asr(tmp_path: Path) -> None:
     assert (bench_dir / "openimpala_transport_parity.csv").is_file()
     report = json.loads((bench_dir / "beamtime_multiplier_report.json").read_text())
     assert "distribution_distances" in report["tio2_mid"]["methods"]["porousdiff"]
+    assert "lagrangian_slab" in report["tio2_mid"]["methods"]
+    assert "lagrangian_slab_diagnostics" in report["tio2_mid"]
 
     subprocess.run(
         [

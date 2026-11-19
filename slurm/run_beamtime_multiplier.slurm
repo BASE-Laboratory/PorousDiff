@@ -110,6 +110,21 @@ for SEED_VAL in "${SEED_ARR[@]}"; do
         "${EXCLUDE_ARGS[@]}" \
         "${RESUME_ARGS[@]}"
 
+    HAS_OPENIMPALA=0
+    if python -c "import openimpala" >/dev/null 2>&1; then
+        HAS_OPENIMPALA=1
+    fi
+
+    REV_ARGS=()
+    if [ "${RUN_REV_STUDY:-1}" = "1" ] && [ "$SEED_VAL" = "${SEED_ARR[0]}" ]; then
+        REV_ARGS+=(--tiled-shape "${TILED_SHAPE:-96,192,192}")
+        if [ "$HAS_OPENIMPALA" = "1" ]; then
+            REV_ARGS+=(--run-rev-study)
+        else
+            echo "Warning: openimpala not installed in $VENV_DIR; generating tiled slab without --run-rev-study."
+        fi
+    fi
+
     python -u scripts/evaluation/sample_carbon_conditional_96.py \
         --experiment "$CUR_EXP" \
         --seed "$SEED_VAL" \
@@ -120,12 +135,27 @@ for SEED_VAL in "${SEED_ARR[@]}"; do
         --num-samples "${NUM_SAMPLES:-20}" \
         --batch-size "${BATCH_SIZE:-4}" \
         --sweep-loads "" \
-        --export-openimpala
+        --export-openimpala \
+        "${REV_ARGS[@]}"
 done
 
 EXP_CSV=$(IFS=,; echo "${EXP_LIST[*]}")
 OUT_BENCH="${POROUSDIFF_ROOT}/results/${EXPERIMENT}/beamtime_benchmark"
 OUT_CLAMP="${POROUSDIFF_ROOT}/results/${EXPERIMENT}/clamping_optimization"
+
+VC_ARGS=(--include-virtual-compression)
+if [ "${INCLUDE_LAGRANGIAN_SLAB:-1}" = "1" ]; then
+    VC_ARGS+=(--include-lagrangian-slab --refine-strength "${REFINE_STRENGTH:-0.35}")
+fi
+
+OI_BENCH_ARGS=(--generate-openimpala-suite --export-real-openimpala --max-openimpala-per-method "${MAX_OPENIMPALA_PER_METHOD:-5}")
+if [ "${RUN_OPENIMPALA:-1}" = "1" ]; then
+    if python -c "import openimpala" >/dev/null 2>&1; then
+        OI_BENCH_ARGS+=(--run-openimpala)
+    else
+        echo "Warning: openimpala not installed in $VENV_DIR; exported OpenImpala TIFF/INI suite without in-process PDE solve."
+    fi
+fi
 
 python -u scripts/evaluation/evaluate_beamtime_multiplier.py \
     --experiments "porousdiff=${EXP_CSV}" \
@@ -134,10 +164,14 @@ python -u scripts/evaluation/evaluate_beamtime_multiplier.py \
     --manifest-json "$MANIFEST" \
     --version "$VERSION" \
     --patch-size "$PATCH_SIZE" \
-    --include-virtual-compression \
-    --generate-openimpala-suite \
-    --export-real-openimpala \
+    "${VC_ARGS[@]}" \
+    "${OI_BENCH_ARGS[@]}" \
     "${HELDOUT_ARGS[@]}"
+
+OI_CLAMP_ARGS=()
+if [ -f "${OUT_BENCH}/openimpala_transport_parity.csv" ]; then
+    OI_CLAMP_ARGS+=(--openimpala-csv "${OUT_BENCH}/openimpala_transport_parity.csv")
+fi
 
 python -u scripts/evaluation/optimize_clamping_pressure.py \
     --experiments "porousdiff=${EXP_CSV}" \
@@ -146,6 +180,29 @@ python -u scripts/evaluation/optimize_clamping_pressure.py \
     --manifest-json "$MANIFEST" \
     --version "$VERSION" \
     --patch-size "$PATCH_SIZE" \
-    --dense-sweep-points "${DENSE_SWEEP_POINTS:-15}"
+    --dense-sweep-points "${DENSE_SWEEP_POINTS:-15}" \
+    "${OI_CLAMP_ARGS[@]}"
+
+if [ -n "${SLAB_SCAN_NPY:-}" ] && [ -f "$SLAB_SCAN_NPY" ]; then
+    SLAB_RATIO_ARGS=()
+    if [ -n "${SLAB_COMPRESSION_RATIOS:-}" ]; then
+        SLAB_RATIO_ARGS+=(--target-compression-ratios "$SLAB_COMPRESSION_RATIOS")
+    fi
+    if [ -n "${SLAB_SOLID_FRACTIONS:-}" ]; then
+        SLAB_RATIO_ARGS+=(--target-solid-fractions "$SLAB_SOLID_FRACTIONS")
+    fi
+    python -u scripts/evaluation/virtual_compress_scan.py \
+        --input "$SLAB_SCAN_NPY" \
+        --experiment "$FIRST_SEED_EXP" \
+        --out-dir "${POROUSDIFF_ROOT}/results/${EXPERIMENT}/virtual_compression_lagrangian" \
+        --mode lagrangian_slab \
+        --source-load "${SLAB_SOURCE_LOAD:-50}" \
+        --target-loads "${SLAB_TARGET_LOADS:-100,150,200,300}" \
+        --material "${SLAB_MATERIAL:-virgin_carbon}" \
+        --refine-strength "${REFINE_STRENGTH:-0.35}" \
+        --export-openimpala \
+        "${STRESS_ARGS[@]}" \
+        "${SLAB_RATIO_ARGS[@]}"
+fi
 
 echo "Finished: $(date -u)"
