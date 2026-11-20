@@ -13,8 +13,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import tifffile
 from scipy.stats import pearsonr, spearmanr
+
+from porousdiff.io import load_volume_array, to_basecoat_volume
 
 
 def write_openimpala_ini(
@@ -270,6 +271,7 @@ def _solve_openimpala_phase_transport(
     oi.Session.ensure_active()
     vol = np.asarray(volume, dtype=np.uint8)
     vox = max(float(voxel_size_um), 1e-6)
+    vol_bc = to_basecoat_volume(vol, voxel_size_um=vox, preserve_multiphase=True)
 
     if phase_diffusivities is not None:
         active_labels = [int(k) for k, v in phase_diffusivities.items() if float(v) > 0.0]
@@ -279,10 +281,9 @@ def _solve_openimpala_phase_transport(
 
     try:
         res_all = oi.tortuosity_all(
-            vol,
+            vol_bc,
             phase=int(phase),
             strict=False,
-            voxel_size=vox,
             phase_diffusivities=phase_diffusivities,
         )
     except oi.OpenImpalaError:
@@ -309,9 +310,8 @@ def _solve_openimpala_phase_transport(
     if compute_homogenized_tensor:
         try:
             eff_res = oi.effective_diffusivity(
-                vol,
+                vol_bc,
                 phase=int(phase),
-                voxel_size=vox,
                 phase_diffusivities=phase_diffusivities,
             )
             ten = np.asarray(eff_res.tensor, dtype=np.float64)
@@ -340,7 +340,12 @@ def compute_openimpala_volume_transport(
     coating_rel_conductivity: float = 0.05,
     compute_homogenized_tensor: bool = False,
 ) -> dict[str, object]:
-    """Run in-process OpenImpala v4.6 PDE transport & interfacial characterization on a 3D `(Z, Y, X)` volume."""
+    """Run in-process OpenImpala v5.1+ PDE transport & interfacial characterization on a 3D `(Z, Y, X)` volume.
+
+    Passes calibrated `basecoat.Volume` (`unit='um'`) to OpenImpala via `VolumeProtocol`, so
+    OpenImpala computes SSA in true SI `m^-1` (`spacing_in('m')`), which is reported both in
+    SI `m^-1` (`*_m_inv`) and converted (`* 1e-6`) to `um^-1` for `PorousDiff`'s `1/um` metrics.
+    """
     import openimpala as oi
 
     oi.Session.ensure_active()
@@ -351,6 +356,8 @@ def compute_openimpala_volume_transport(
     n_ph = int(num_phases) if num_phases is not None else (3 if int(np.max(vol)) >= 2 else 2)
 
     vol_bin = (vol > 0).astype(np.uint8)
+    vol_bin_bc = to_basecoat_volume(vol_bin, voxel_size_um=vox, preserve_multiphase=False)
+    vol_mp_bc = to_basecoat_volume(vol, voxel_size_um=vox, preserve_multiphase=True)
     phases_out: dict[str, dict[str, float]] = {}
 
     phases_out["pore_ionic"] = _solve_openimpala_phase_transport(
@@ -381,27 +388,36 @@ def compute_openimpala_volume_transport(
                 compute_homogenized_tensor=compute_homogenized_tensor,
             )
 
-    ssa_bin = oi.specific_surface_area(vol_bin, phase_a=0, phase_b=1, voxel_size=vox)
+    m_inv_to_um_inv = 1e-6
+    ssa_bin = oi.specific_surface_area(vol_bin_bc, phase_a=0, phase_b=1)
     interfacial: dict[str, float] = {
-        "ssa_total_raw": float(ssa_bin.ssa),
-        "ssa_total_cc": float(ssa_bin.ssa_corrected),
+        "ssa_total_raw_m_inv": float(ssa_bin.ssa),
+        "ssa_total_cc_m_inv": float(ssa_bin.ssa_corrected),
+        "ssa_total_raw": float(ssa_bin.ssa) * m_inv_to_um_inv,
+        "ssa_total_cc": float(ssa_bin.ssa_corrected) * m_inv_to_um_inv,
     }
     if n_ph == 3:
-        ssa_pc = oi.specific_surface_area(vol, phase_a=0, phase_b=2, voxel_size=vox)
-        ssa_pcarb = oi.specific_surface_area(vol, phase_a=0, phase_b=1, voxel_size=vox)
-        ssa_cc = oi.specific_surface_area(vol, phase_a=1, phase_b=2, voxel_size=vox)
+        ssa_pc = oi.specific_surface_area(vol_mp_bc, phase_a=0, phase_b=2)
+        ssa_pcarb = oi.specific_surface_area(vol_mp_bc, phase_a=0, phase_b=1)
+        ssa_cc = oi.specific_surface_area(vol_mp_bc, phase_a=1, phase_b=2)
         interfacial.update(
             {
-                "ssa_pore_coating_raw": float(ssa_pc.ssa),
-                "ssa_pore_coating_cc": float(ssa_pc.ssa_corrected),
-                "ssa_pore_carbon_raw": float(ssa_pcarb.ssa),
-                "ssa_pore_carbon_cc": float(ssa_pcarb.ssa_corrected),
-                "ssa_carbon_coating_raw": float(ssa_cc.ssa),
-                "ssa_carbon_coating_cc": float(ssa_cc.ssa_corrected),
+                "ssa_pore_coating_raw_m_inv": float(ssa_pc.ssa),
+                "ssa_pore_coating_cc_m_inv": float(ssa_pc.ssa_corrected),
+                "ssa_pore_carbon_raw_m_inv": float(ssa_pcarb.ssa),
+                "ssa_pore_carbon_cc_m_inv": float(ssa_pcarb.ssa_corrected),
+                "ssa_carbon_coating_raw_m_inv": float(ssa_cc.ssa),
+                "ssa_carbon_coating_cc_m_inv": float(ssa_cc.ssa_corrected),
+                "ssa_pore_coating_raw": float(ssa_pc.ssa) * m_inv_to_um_inv,
+                "ssa_pore_coating_cc": float(ssa_pc.ssa_corrected) * m_inv_to_um_inv,
+                "ssa_pore_carbon_raw": float(ssa_pcarb.ssa) * m_inv_to_um_inv,
+                "ssa_pore_carbon_cc": float(ssa_pcarb.ssa_corrected) * m_inv_to_um_inv,
+                "ssa_carbon_coating_raw": float(ssa_cc.ssa) * m_inv_to_um_inv,
+                "ssa_carbon_coating_cc": float(ssa_cc.ssa_corrected) * m_inv_to_um_inv,
             }
         )
 
-    prof_z = oi.through_thickness_profile(vol_bin, phase=1, direction="z", voxel_size=vox)
+    prof_z = oi.through_thickness_profile(vol_bin_bc, phase=1, direction="z")
     prof_arr = np.asarray(prof_z.profile, dtype=np.float64)
 
     lookup_summary: dict[str, float] = {
@@ -436,7 +452,7 @@ def run_openimpala_python_suite(
     coating_rel_conductivity: float = 0.05,
     compute_homogenized_tensor: bool = False,
 ) -> list[dict[str, object]]:
-    """Execute OpenImpala v4.6 PDE transport directly in-process across Real, Baselines & PorousDiff.
+    """Execute OpenImpala v5.1+ PDE transport directly in-process across Real, Baselines & PorousDiff.
 
     Writes per-job JSON artifacts under `suite_dir / 'outputs'`, `openimpala_jobs.json`, and
     `out_csv` (`openimpala_transport_parity.csv`) directly consumable by `load_openimpala_lookup`.
@@ -455,17 +471,26 @@ def run_openimpala_python_suite(
         beamline = str(entry.get("beamline", "primary"))
         load_val = float(entry.get("load_value", 0.0))  # type: ignore[arg-type]
         n_ph = int(entry.get("num_phases", 2))  # type: ignore[arg-type]
-        vox = float(entry.get("voxel_size_um", 1.0))  # type: ignore[arg-type]
+        explicit_vox = entry.get("voxel_size_um")
 
         if "volume" in entry and entry["volume"] is not None:
             vol = np.asarray(entry["volume"], dtype=np.uint8)
+            vox = float(explicit_vox) if explicit_vox is not None else 1.0  # type: ignore[arg-type]
             stem = str(entry.get("stem", f"vol_{idx:03d}"))
-            tiff_str = str(entry.get("tiff_path", ""))
+            tiff_str = str(entry.get("tiff_path", entry.get("zarr_path", "")))
         else:
-            tiff_path = Path(str(entry["tiff_path"]))
-            vol = np.asarray(tifffile.imread(tiff_path), dtype=np.uint8)
-            stem = tiff_path.stem
-            tiff_str = str(tiff_path.resolve())
+            src_key = "zarr_path" if "zarr_path" in entry and entry["zarr_path"] else "tiff_path"
+            src_path = Path(str(entry[src_key]))
+            vol, loaded_vox = load_volume_array(src_path)
+            vox = (
+                float(explicit_vox)  # type: ignore[arg-type]
+                if explicit_vox is not None
+                else (loaded_vox if loaded_vox is not None else 1.0)
+            )
+            stem = src_path.name.removesuffix(".ome.zarr").removesuffix(".zarr")
+            if src_path.suffix.lower() in (".tif", ".tiff", ".npy", ".h5", ".hdf5", ".nxs"):
+                stem = src_path.stem
+            tiff_str = str(src_path.resolve())
 
         vol_res = compute_openimpala_volume_transport(
             vol,
@@ -542,6 +567,7 @@ def run_openimpala_rev_convergence(
         raise ValueError(f"Expected 3D volume (Z, Y, X), got shape {vol.shape}")
     min_dim = int(min(vol.shape))
     vox = max(float(voxel_size_um), 1e-6)
+    vol_bc = to_basecoat_volume(vol, voxel_size_um=vox, preserve_multiphase=True)
 
     if sizes is None:
         cand_sizes = sorted({max(8, min_dim // 2), max(8, (3 * min_dim) // 4), min_dim})
@@ -557,11 +583,10 @@ def run_openimpala_rev_convergence(
     size_rows: list[dict[str, float]] = []
     try:
         rev_res = oi.rev_study(
-            vol,
+            vol_bc,
             sizes=cand_sizes,
             num_samples=max(1, int(num_samples)),
             phase=int(phase),
-            voxel_size=vox,
             csv_path=csv_path_str,
         )
         for sz in rev_res.sizes:
@@ -617,7 +642,9 @@ def run_openimpala_rev_convergence(
                 writer.writerows(size_rows)
 
     prof = oi.through_thickness_profile(
-        (vol > 0).astype(np.uint8), phase=1, direction="z", voxel_size=vox
+        to_basecoat_volume((vol > 0).astype(np.uint8), voxel_size_um=vox, preserve_multiphase=False),
+        phase=1,
+        direction="z",
     )
     prof_arr = np.asarray(prof.profile, dtype=np.float64)
     largest_cov = float(size_rows[-1]["cov_d_zz"]) if size_rows else float("nan")

@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
-import tifffile
 from scipy.ndimage import distance_transform_edt, label
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
@@ -565,7 +564,14 @@ def export_openimpala_tiff(
     solid_label: int = 1,
     preserve_multiphase: bool = False,
 ) -> Path:
-    """Export a 3D multi-page `uint8` TIFF stack formatted for OpenImpala transport solvers."""
+    """Export a 3D multi-page `uint8` TIFF stack formatted for OpenImpala transport solvers.
+
+    .. deprecated:: 0.5.2
+       Prefer :func:`porousdiff.io.export_volume_ome_zarr`, which writes calibrated OME-Zarr v0.4
+       stores (`unit='um'`, `labels/phase`) consumed directly by `OpenImpala v5.1+` and `SMS`.
+    """
+    import basecoat
+
     vol = np.asarray(volume)
     if vol.ndim != 3:
         raise ValueError(f"Expected 3D volume (Z, Y, X), got shape {vol.shape}")
@@ -575,5 +581,5 @@ def export_openimpala_tiff(
         mapped = np.where(vol > 0, solid_label, pore_label).astype(np.uint8)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    tifffile.imwrite(output_path, mapped)
+    basecoat.write_volume( basecoat.Volume.from_array(mapped), output_path )
     return output_path

@@ -26,12 +26,12 @@ from porousdiff.losses import (
 )
 from porousdiff.metrics import evaluate_multiphase_physics, summarize_metric_records
 from porousdiff.models import ContinuousLoadConditionedUNet, build_noise_scheduler
-from porousdiff.optimization import (
+from porousdiff_workflows.optimization import (
     compute_transport_and_fom_record,
     find_optimal_clamping_pressure,
     load_openimpala_lookup,
 )
-from porousdiff.transport_and_xrd import correlate_xrd_with_microstructure
+from porousdiff_workflows.transport_and_xrd import correlate_xrd_with_microstructure
 from porousdiff.virtual_compression import generate_tiled_3d, virtual_compress_volumes
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -735,7 +735,7 @@ def test_newman_asr_dimensional_sweet_spot_and_regime_sensitivity() -> None:
 
 def test_mixed_unit_manifest_guard_and_openimpala_template_and_tile_symmetry(tmp_path: Path) -> None:
     import pytest
-    from porousdiff.transport_and_xrd import generate_openimpala_job_suite
+    from porousdiff_workflows.transport_and_xrd import generate_openimpala_job_suite
     from porousdiff.virtual_compression import _compute_tile_starts
     from scripts.training.train_carbon_conditional_96 import load_manifest_specs
 
