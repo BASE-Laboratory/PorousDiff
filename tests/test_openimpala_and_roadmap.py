@@ -24,11 +24,11 @@ from porousdiff.metrics import (
     specific_surface_area,
 )
 from porousdiff.models import ContinuousLoadConditionedUNet, build_noise_scheduler
-from porousdiff.optimization import (
+from porousdiff_workflows.optimization import (
     compute_transport_and_fom_record,
     find_optimal_clamping_pressure,
 )
-from porousdiff.transport_and_xrd import (
+from porousdiff_workflows.transport_and_xrd import (
     compute_openimpala_volume_transport,
     has_openimpala_python,
     run_openimpala_rev_convergence,
@@ -651,7 +651,7 @@ def test_redteam_zero_heldout_porosity_leakage_in_lagrangian_slab(tmp_path: Path
 def test_redteam_per_realization_openimpala_bootstrap_and_static_asr(tmp_path: Path) -> None:
     """Verify load_openimpala_records preserves per-patch variance and static-cell Newman ASR has zero pump penalty."""
     import csv
-    from porousdiff.optimization import NEWMAN_REGIMES, load_openimpala_records
+    from porousdiff_workflows.optimization import NEWMAN_REGIMES, load_openimpala_records
 
     # 1. Static Swagelok/coin/pouch primary regimes have zero convective pumping penalty
     for reg_key in ("kinetics_limited", "balanced", "mass_transport_limited"):

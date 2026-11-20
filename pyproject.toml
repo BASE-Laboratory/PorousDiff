@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "porousdiff"
-version = "0.5.1"
+version = "0.5.2"
 description = "Conditional 3D Diffusion Surrogate Modelling for Compressed Porous Battery Electrodes"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
+    "basecoat @ git+https://github.com/BASE-Laboratory/basecoat.git@v0.2.0",
     "numpy>=1.24",
     "scipy>=1.10",
     "scikit-image>=0.21",
@@ -30,7 +31,23 @@ transport = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["porousdiff*"]
+include = ["porousdiff", "porousdiff.*", "porousdiff_workflows", "porousdiff_workflows.*"]
+
+[tool.basecoat.layers]
+layer = 2
+source_dirs = ["porousdiff"]
+banned_imports = [
+    "multimodal_benchmark",
+    "xct_research",
+    "openimpala",
+    "sms",
+    "openlsrx",
+    "x_fuse",
+    "braggtrack",
+    "porousdiff_workflows",
+    "zarr",
+    "numcodecs",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -44,4 +61,3 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W"]
 ignore = ["E501", "E402"]
-

@@ -62,7 +62,7 @@ from porousdiff.models import (
     infer_use_ordinal_material_channel,
 )
 from porousdiff.preprocessing import infer_material_name, parse_load_value
-from porousdiff.transport_and_xrd import (
+from porousdiff_workflows.transport_and_xrd import (
     correlate_xrd_with_microstructure,
     generate_openimpala_job_suite,
     has_openimpala_python,

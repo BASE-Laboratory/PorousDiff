@@ -50,13 +50,13 @@ from porousdiff.models import (
     build_noise_scheduler,
     infer_use_ordinal_material_channel,
 )
-from porousdiff.optimization import (
+from porousdiff_workflows.optimization import (
     compute_transport_and_fom_record,
     find_optimal_clamping_pressure,
     load_openimpala_records,
 )
 from porousdiff.preprocessing import infer_material_name, parse_load_value
-from porousdiff.transport_and_xrd import (
+from porousdiff_workflows.transport_and_xrd import (
     compute_openimpala_volume_transport,
     has_openimpala_python,
 )

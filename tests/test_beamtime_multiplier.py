@@ -583,7 +583,7 @@ def test_nested_discovery_group_calibration_append_and_resume(tmp_path: Path) ->
 def test_openimpala_suite_and_diad_xrd_correlation(tmp_path: Path) -> None:
     """Verify OpenImpala output ingestion CLI and K11 DIAD XRD correlation analysis."""
     from porousdiff.metrics import export_openimpala_tiff
-    from porousdiff.transport_and_xrd import (
+    from porousdiff_workflows.transport_and_xrd import (
         correlate_xrd_with_microstructure,
         generate_openimpala_job_suite,
     )

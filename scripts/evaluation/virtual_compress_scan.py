@@ -21,7 +21,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import tifffile
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -29,6 +28,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from porousdiff.data import default_project_root, resolve_material_id
+from porousdiff.io import export_volume_ome_zarr, load_volume_array
 from porousdiff.metrics import (
     evaluate_multiphase_physics,
     evaluate_volume_physics,
@@ -50,19 +50,8 @@ from porousdiff.virtual_compression import (
 PHASE_CMAP = ListedColormap(["#0b0e14", "#38bdf8", "#facc15"])
 
 
-def _load_input_volume(path: Path) -> np.ndarray:
-    ext = path.suffix.lower()
-    if ext == ".npy":
-        arr = np.load(path)
-    elif ext in (".tif", ".tiff"):
-        arr = tifffile.imread(path)
-    else:
-        raise ValueError(f"Unsupported input volume format {path}; expected .npy or .tif/.tiff")
-    if arr.ndim == 4:
-        arr = arr[0]
-    if arr.ndim != 3:
-        raise ValueError(f"Expected 3D volume (Z, Y, X), got shape {arr.shape}")
-    return arr.astype(np.uint8)
+def _load_input_volume(path: Path) -> tuple[np.ndarray, float | None]:
+    return load_volume_array(path)
 
 
 def _save_virtual_panel(
@@ -138,6 +127,7 @@ def main() -> None:
     parser.add_argument("--refine-strength", type=float, default=0.35)
     parser.add_argument("--guidance-scale", type=float, default=1.5)
     parser.add_argument("--export-openimpala", action="store_true")
+    parser.add_argument("--export-ome-zarr", action="store_true")
     parser.add_argument("--allow-cpu", action="store_true")
     args = parser.parse_args()
 
@@ -161,13 +151,19 @@ def main() -> None:
     if not ckpt_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
+    source_vol, loaded_vox_um = _load_input_volume(args.input)
+
     saved = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg = saved["config"]
     patch_size = int(cfg.get("patch_size", 96))
     num_phases = int(cfg.get("num_phases", 2))
     num_materials = int(cfg.get("num_materials", 1))
     ref_vox = float(cfg.get("ref_voxel_size_um", 1.0))
-    vox_um = args.voxel_size_um if args.voxel_size_um > 0 else ref_vox
+    vox_um = (
+        args.voxel_size_um
+        if args.voxel_size_um > 0
+        else (loaded_vox_um if loaded_vox_um is not None else ref_vox)
+    )
     unit_label = "kPa" if bool(cfg.get("use_stress_kpa", False)) else "mV/V"
 
     model = ContinuousLoadConditionedUNet(
@@ -200,7 +196,6 @@ def main() -> None:
         prediction_type=str(cfg["prediction_type"]),
     )
 
-    source_vol = _load_input_volume(args.input)
     target_loads = [float(x.strip()) for x in args.target_loads.split(",") if x.strip()]
     extrap = check_load_extrapolation(
         [float(args.source_load), *target_loads],
@@ -327,6 +322,19 @@ def main() -> None:
                 vol,
                 out_dir / "openimpala" / f"virtual_{args.material}_{tag}.tif",
                 preserve_multiphase=(num_phases == 3),
+            )
+        if args.export_ome_zarr:
+            export_volume_ome_zarr(
+                vol,
+                out_dir / "ome_zarr" / f"virtual_{args.material}_{tag}.ome.zarr",
+                voxel_size_um=vox_um,
+                preserve_multiphase=(num_phases == 3),
+                metadata={
+                    "material": args.material,
+                    "load_value": float(lv),
+                    "load_unit": unit_label,
+                    "mode": args.mode,
+                },
             )
         phys = eval_fn(vol, voxel_size=vox_um)
         fid = compute_virtual_compression_fidelity(
