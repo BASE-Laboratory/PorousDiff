@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feature/**"
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Syntax, Layer Lint, Slurm & End-to-End Pytest Suite (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      TORCH_NUM_THREADS: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install CPU PyTorch, PorousDiff, basecoat, and pure-Python OpenImpala v5.1
+        run: |
+          uv venv --clear .venv
+          uv pip install --python .venv/bin/python torch --index-url https://download.pytorch.org/whl/cpu
+          uv pip install --python .venv/bin/python -e ".[dev]" cmake
+          SKBUILD_CMAKE_DEFINE="OPENIMPALA_PURE_PYTHON=ON" SKBUILD_WHEEL_PLATLIB="false" \
+            uv pip install --python .venv/bin/python "git+https://github.com/BASE-Laboratory/OpenImpala.git"
+
+      - name: Validate Python syntax across packages, scripts, and tests
+        run: .venv/bin/python -m compileall -q porousdiff porousdiff_workflows scripts tests
+
+      - name: Check Layer 2 architectural import boundaries
+        run: .venv/bin/python -m basecoat.layers
+
+      - name: Run Ruff static lint checks
+        run: .venv/bin/ruff check porousdiff porousdiff_workflows scripts tests
+
+      - name: Validate Slurm batch script syntax
+        run: bash -n slurm/*.slurm
+
+      - name: Run unit, basecoat OME-Zarr, OpenImpala v5.1 PDE, and 5-stage end-to-end CLI pipeline tests
+        run: .venv/bin/pytest -v

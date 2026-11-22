@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "porousdiff"
+version = "0.5.2"
+description = "Conditional 3D Diffusion Surrogate Modelling for Compressed Porous Battery Electrodes"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Asif Ali" },
+    { name = "James Le Houx" },
+]
+maintainers = [
+    { name = "James Le Houx" },
+    { name = "BASE Laboratory" },
+]
+dependencies = [
+    "basecoat @ git+https://github.com/BASE-Laboratory/basecoat.git@v0.3.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "scikit-image>=0.21",
+    "tifffile>=2023.7",
+    "matplotlib>=3.7",
+    "torch>=2.1",
+    "monai>=1.3",
+    "einops>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.4",
+]
+transport = [
+    "porespy>=2.3",
+]
+
+[tool.setuptools.packages.find]
+include = ["porousdiff", "porousdiff.*", "porousdiff_workflows", "porousdiff_workflows.*"]
+
+[tool.basecoat.layers]
+layer = 2
+source_dirs = ["porousdiff"]
+banned_imports = [
+    "multimodal_benchmark",
+    "xct_research",
+    "openimpala",
+    "sms",
+    "openlsrx",
+    "x_fuse",
+    "braggtrack",
+    "porousdiff_workflows",
+    "zarr",
+    "numcodecs",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501", "E402"]
