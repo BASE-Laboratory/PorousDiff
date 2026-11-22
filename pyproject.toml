@@ -10,7 +10,7 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 dependencies = [
-    "basecoat @ git+https://github.com/BASE-Laboratory/basecoat.git@v0.2.0",
+    "basecoat @ git+https://github.com/BASE-Laboratory/basecoat.git@v0.3.0",
     "numpy>=1.24",
     "scipy>=1.10",
     "scikit-image>=0.21",

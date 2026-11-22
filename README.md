@@ -40,8 +40,9 @@ PorousDiff is designed to evaluate two core hypotheses on held-out synchrotron c
 
 ```text
 PorousDiff/
-├── porousdiff/
+├── porousdiff/                  # Layer 2: Conditional 3D diffusion & virtual compression (basecoat I/O)
 │   ├── __init__.py
+│   ├── io.py                    # Calibrated basecoat Volume / VolumeSet OME-Zarr & TIFF I/O
 │   ├── preprocessing.py         # Circular ROI, 2/3-phase segmentation, halo cleanup, 2x binning + topology audit, kPa calibration
 │   ├── baselines.py             # Literature heuristics: affine Z-rescaling, pillar pore-deletion & mirror-tiling audit
 │   ├── data.py                  # Hierarchical {0,1,2} <-> [-1,1]^2 encoding, load-unit source-of-truth helpers, symmetries
@@ -49,8 +50,10 @@ PorousDiff/
 │   ├── losses.py                # Conditional-masked x0_hat loss (Min-SNR, 3D gradients, support, uncoated-safe loading)
 │   ├── virtual_compression.py   # Eulerian DDIM & Lagrangian slab virtual compression + >96^3 Hann MultiDiffusion
 │   ├── optimization.py          # Static-cell Cauchy-Crofton 1D Newman ASR, per-patch OpenImpala CIs & constriction beta_Z
-│   ├── metrics.py               # Cauchy-Crofton SSA, EASA, TPB, Euler chi_V, EDT pore radii, W1/KS & 26-conn tortuosity
-│   └── transport_and_xrd.py     # Native OpenImpala v4.6 Python bridge, REV study, batch INI suite & K11 DIAD XRD analysis
+│   └── metrics.py               # Cauchy-Crofton SSA, EASA, TPB, Euler chi_V, EDT pore radii, W1/KS & 26-conn tortuosity
+├── porousdiff_workflows/        # Layer 4: Coupled OpenImpala v5.1 PDE & K11 DIAD XRD clamping workflows
+│   ├── __init__.py
+│   └── transport_and_xrd.py     # Calibrated VolumeProtocol OpenImpala bridge, REV study, batch INI suite & DIAD XRD analysis
 ├── scripts/
 │   ├── preprocessing/
 │   │   ├── prepare_local_drive_bundle.py   # Spyder/CLI multi-electrode stream-bundler + tall baseline slabs + --preview-only
@@ -60,16 +63,17 @@ PorousDiff/
 │   │   └── train_carbon_conditional_96.py  # Multi-electrode 3-phase training + load_only CFG + --resume config guard
 │   └── evaluation/
 │       ├── audit_bundle_readiness.py       # Gate 0 pre-flight checker (units, patches, zero-overlap, phi_s monotonicity)
-│       ├── sample_carbon_conditional_96.py # Standard & >96^3 (--tiled-shape, --run-rev-study) 3D sampling + OpenImpala TIFFs
-│       ├── virtual_compress_scan.py        # Eulerian DDIM & Lagrangian slab virtual compression + XY fidelity audit
+│       ├── sample_carbon_conditional_96.py # Standard & >96^3 (--tiled-shape, --run-rev-study) 3D sampling + OME-Zarr/TIFF export
+│       ├── virtual_compress_scan.py        # Eulerian DDIM & Lagrangian slab virtual compression (--export-ome-zarr)
 │       ├── evaluate_carbon_physics.py
 │       ├── evaluate_beamtime_multiplier.py # Zero-leakage benchmark: Baselines vs. Lagrangian Slab vs. PorousDiff + OpenImpala
 │       ├── parse_openimpala_suite.py       # Ingest OpenImpala solver outputs into openimpala_transport_parity.csv
 │       └── optimize_clamping_pressure.py   # Static-cell Newman ASR & FoM sigma* + in-process dense-sweep OpenImpala PDE
 ├── legacy/scripts/              # Archived pre-conditional v0.1-v0.2 prototype scripts (Exps 1-8)
 ├── slurm/                       # Isambard-AI GH200 Slurm batch scripts (including run_v06_staged_campaign.slurm)
-├── tests/                       # Automated pytest unit, OpenImpala v4.6 PDE, Red-Team regression, and CLI verification
+├── tests/                       # Automated pytest unit, OpenImpala PDE, Red-Team regression, and CLI verification
 ├── experiments.md               # Chronological experimental log
+├── AGENTS.md                    # Layer 2 / Layer 4 boundary rules (-> basecoat/ECOSYSTEM.md)
 ├── pyproject.toml
 ├── environment.yml
 └── requirements-isambard.txt
@@ -118,7 +122,7 @@ OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 pytest -v
        --beamline "DLS_K11_DIAD" --append --resume --zip
    ```
 
-### 3. Stage-Gated 3-Arm Beamtime Multiplier Campaign, `OpenImpala` v4.6 PDE & Static-Cell $\sigma^*$
+### 3. Stage-Gated 3-Arm Beamtime Multiplier Campaign, `OpenImpala` PDE & Static-Cell $\sigma^*$
 
 ```bash
 # Recommended Staged Campaign (Gate 0 Audit -> Gate 1 1-Seed Virgin LOO -> Gate 2 3-Arm Sparse vs. Few-Shot vs. Oracle -> Gate 3 OpenImpala + Newman ASR):
@@ -130,7 +134,7 @@ python scripts/evaluation/audit_bundle_readiness.py \
     --manifest-json "$POROUSDIFF_ROOT/data/multi_electrode/bundle_manifest.json" \
     --data-root "$POROUSDIFF_ROOT/data/multi_electrode"
 
-# Execute OpenImpala v4.6 PDE transport directly in-process (--run-openimpala) & compute static-cell Newman ASR sigma*:
+# Execute OpenImpala PDE transport directly in-process (--run-openimpala) & compute static-cell Newman ASR sigma*:
 python scripts/evaluation/evaluate_beamtime_multiplier.py \
     --experiments porousdiff=beamtime_fewshot_96 \
     --data-root "$POROUSDIFF_ROOT/data/carbon_virgin" \
@@ -148,20 +152,20 @@ python scripts/evaluation/sample_carbon_conditional_96.py \
     --manifest-json "$POROUSDIFF_ROOT/data/carbon_virgin/bundle_manifest.json" \
     --tiled-shape 96,96,192 --num-samples 5 --export-openimpala --run-rev-study
 
-# Mass-conserving Lagrangian slab virtual compression of a tall low-load scan across target stresses:
+# Mass-conserving Lagrangian slab virtual compression of a tall low-load scan across target stresses (--export-ome-zarr):
 python scripts/evaluation/virtual_compress_scan.py \
     --input "$POROUSDIFF_ROOT/data/low_load_68kpa_tall.tif" \
     --experiment beamtime_fewshot_96 \
     --mode lagrangian_slab --target-compression-ratios "0.85,0.72,0.60" \
     --source-load 68.0 --target-loads "150,300,450" \
-    --material tio2_anode --export-openimpala
+    --material tio2_anode --export-ome-zarr "$POROUSDIFF_ROOT/outputs/compressed_slab.ome.zarr"
 ```
 
 ---
 
 ## Experimental & Pipeline Progression
 
-Earlier unconditional baselines (`TiO₂`, `Op001mVV` / `Op026mVV`) established the motivation for the calibrated segmentation and Zero-SNR `v`-prediction formulation (full log in [`experiments.md`](experiments.md)):
+Earlier unconditional and 3-condition binary baselines (`TiO₂` `Op001mVV`/`Op026mVV` and Carbon-Felt `8`/`18`/`33 mV` MONAI DDPM) established the motivation for the calibrated segmentation and Zero-SNR `v`-prediction formulation (full log in [`experiments.md`](experiments.md)):
 
 | Stage | Formulation | Patch Size | Real $\phi_s$ | Generated $\phi_s$ | Status & Diagnostic Takeaway |
 |---|---|---:|---:|---:|---|
@@ -169,8 +173,9 @@ Earlier unconditional baselines (`TiO₂`, `Op001mVV` / `Op026mVV`) established 
 | Exp 6–11 | Grayscale 3D DDPM (`epsilon`, std linear) | `64³` | — | — | Completed — blurry boundaries & horizontal banding |
 | Exp 12 | Unconditional Binary DDPM (`epsilon`, std schedule) | `64³` | `0.1318` | `0.3948` | Completed — non-zero terminal SNR shifts sparse binary mean ~3× toward `0.50` |
 | Exp 13 | Unconditional Binary DDPM (`epsilon`, std schedule) | `96³` | `0.0984` | `0.2806` | Completed — `96³` feasible on GH200, motivating Zero-SNR & conditioning fixes |
+| Carbon-Felt DDPM | 3-Condition (`8, 18, 33 mV`, `2,880` train / `720` val) MONAI UNet | `96³` | Binary felt | 28 epochs (`val 0.0051`) | Completed baseline — noise loss converged; motivated physics-regularised `v`-pred |
 | Exp 14–16 (`v0.4`) | Multi-Electrode 3-Phase Load-Conditioned DDPM (`v`-pred + Zero-SNR + Newman ASR) | `96³` (`2×` binned) | Virgin + $\text{TiO}_2$ + CuHCF + DIAD | Verified on synthetic & unit suites | Unit/methodology safeguards, mirror-free slabs & 26-conn tortuosity |
-| **Exp 17 (`v0.5`)** | **Native OpenImpala v4.6 PDE + Cauchy–Crofton ASR + Constriction $\beta_Z$ + Lagrangian Slab DDIM** | **`96³` & $>96^3$ REV** | **Virgin + $\text{TiO}_2$ + CuHCF + DIAD** | **Pending full GH200 campaign** | **In-process OpenImpala v4.6 PDE, Euler/EDT/$W_1$ metrics & Lagrangian slab verified in CI** |
+| **Exp 17 (`v0.5.2`)** | **`basecoat` OME-Zarr + Layer 4 `OpenImpala v5.1` PDE + Cauchy–Crofton ASR + Lagrangian Slab DDIM** | **`96³` & $>96^3$ REV** | **Virgin + $\text{TiO}_2$ + CuHCF + DIAD** | **Pending full GH200 campaign** | **Calibrated `VolumeProtocol` SI SSA, Euler/EDT/$W_1$ metrics & Lagrangian slab verified in CI** |
 
 ---
 
