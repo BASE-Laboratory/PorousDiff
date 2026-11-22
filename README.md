@@ -4,6 +4,8 @@
 
 Developed by [BASE Laboratory](https://github.com/BASE-Laboratory) using NVIDIA GH200 Grace Hopper accelerators on Isambard-AI.
 
+**Maintainer:** James Le Houx ([BASE Laboratory](https://github.com/BASE-Laboratory))
+
 ---
 
 ## Overview
@@ -16,7 +18,7 @@ PorousDiff is designed to evaluate two core hypotheses on held-out synchrotron c
 
 ---
 
-### Key Capabilities (`v0.5` Multi-Electrode & Native OpenImpala v4.6 Pipeline)
+### Key Capabilities (`v0.5.2` Multi-Electrode, Calibrated `basecoat` OME-Zarr & `OpenImpala` v5.1 Pipeline)
 
 1. **Calibrated 2-Phase & 3-Phase XCT Segmentation, Partial-Volume Halo Cleanup & Mirror-Free Baseline Slabs** (`porousdiff/preprocessing.py`, `scripts/preprocessing/prepare_local_drive_bundle.py`)
    - Masks exterior air outside the circular electrode punch (`--roi-radius-fraction 0.70`), subtracts pore-mode-clamped background, applies shared per-`(material, beamline)` lowest-load thresholds (`delta_carbon`, `delta_coating`), and strips Paganin/PSF partial-volume "carbon rind" blur shells at `0–2` pore–coating boundaries (`--strip-halo-px 1`) while preserving $\ge 3\text{ px}$ carbon fibres and `0–1–2` triple-phase junctions.
@@ -30,8 +32,8 @@ PorousDiff is designed to evaluate two core hypotheses on held-out synchrotron c
    - **Eulerian DDIM (`--mode eulerian_ddim`) & Zero-Leakage Lagrangian Slab (`--mode lagrangian_slab` / `--include-lagrangian-slab`):** Supports both fixed-box conditional DDIM ODE inversion (`invert_strength = 0.60`) and mass-conserving Lagrangian slab compression (`virtual_compress_lagrangian_slab`, affine Z-prewarping $Z_0 \to Z(\sigma)$ + `refine_strength = 0.35` 3D Hann MultiDiffusion refinement). On held-out synchrotron loads, `lagrangian_slab` never peeks at held-out XCT porosity (using PorousDiff blind $\hat{\phi}_s(\sigma)$, mechanical `strain_z`, or non-heldout PCHIP), while tagging `affine_z_squash` / `pillar_pore_deletion` as explicit oracle-porosity upper bounds.
    - **Seamless $>96^3$ 3D MultiDiffusion & OpenImpala REV (`--tiled-shape`, `--run-rev-study`):** Synthesizes larger 3D domains (e.g. `96 × 96 × 192` or `160³`) via 3D raised-cosine (Hann) overlapped denoising with automated OpenImpala sub-volume REV convergence and Z-profile uniformity audits.
 
-4. **Per-Realization `OpenImpala` v4.6 PDE Coupling, Cauchy–Crofton Morphology, Constriction $\beta_Z(\sigma)$ & Static-Cell 1D Newman ASR ($\sigma^*$)** (`porousdiff/transport_and_xrd.py`, `porousdiff/metrics.py`, `porousdiff/optimization.py`)
-   - **Per-realization in-process OpenImpala v4.6 Python API (`--run-openimpala`):** Solves steady-state PDE diffusivity/conductivity directly in Python (`tortuosity_all`, composite 3-phase `phase_diffusivities`, optional $3 \times 3$ `effective_diffusivity`, `rev_study`), pairing each OpenImpala solve 1-to-1 with its exact 3D realization (including `porousdiff_dense` sweeps) to preserve genuine within-load spatial bootstrap CIs on $\sigma^*$.
+4. **Per-Realization `OpenImpala` v5.1 PDE Coupling (`porousdiff_workflows`), Cauchy–Crofton Morphology, Constriction $\beta_Z(\sigma)$ & Static-Cell 1D Newman ASR ($\sigma^*$)** (`porousdiff_workflows/transport_and_xrd.py`, `porousdiff/metrics.py`, `porousdiff/optimization.py`)
+   - **Per-realization in-process OpenImpala v5.1 Python API (`--run-openimpala`):** Solves steady-state PDE diffusivity/conductivity directly in Python over calibrated `basecoat.Volume` / OME-Zarr v0.4 stores (`tortuosity_all`, composite 3-phase `phase_diffusivities`, optional $3 \times 3$ `effective_diffusivity`, `rev_study`), pairing each OpenImpala solve 1-to-1 with its exact 3D realization (including `porousdiff_dense` sweeps) to preserve genuine within-load spatial bootstrap CIs on $\sigma^*$.
    - **Static Swagelok/coin/pouch Newman ASR & unbiased 3D stereology:** Defaults primary 1D Newman–Tobias ASR curves to static Swagelok/coin/pouch cells (`pump_penalty = 0`, thickness-scaled Nernst salt-depletion $R_{\text{mt}}(\sigma) = R_{\text{mt},0}\frac{L(\sigma)/L_0}{D_{\text{eff},Z}(\sigma)/D_0}$, pure $2/3$ Cauchy–Crofton `ssa_*_cc` kinetic area, with in-plane $K_{XY}$ pumping isolated as `flow_pumped_sensitivity`), alongside 3D cubical Euler density (`euler_density`), EDT pore radii, constriction $\beta_Z(\sigma)$, and $W_1$ / KS distances.
 
 ---

@@ -9,6 +9,14 @@ description = "Conditional 3D Diffusion Surrogate Modelling for Compressed Porou
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
+authors = [
+    { name = "Asif Ali" },
+    { name = "James Le Houx" },
+]
+maintainers = [
+    { name = "James Le Houx" },
+    { name = "BASE Laboratory" },
+]
 dependencies = [
     "basecoat @ git+https://github.com/BASE-Laboratory/basecoat.git@v0.3.0",
     "numpy>=1.24",

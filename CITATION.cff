@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+title: "PorousDiff: Conditional 3D Diffusion Surrogate Modelling for Compressed Porous Battery Electrodes"
+message: "If you use PorousDiff in your research, please cite this software using the metadata below."
+type: software
+version: 0.5.2
+date-released: "2026-11-22"
+license: BSD-3-Clause
+repository-code: "https://github.com/BASE-Laboratory/PorousDiff"
+authors:
+  - family-names: Ali
+    given-names: Asif
+    affiliation: "BASE Laboratory, School of Engineering, University of Greenwich, United Kingdom"
+  - family-names: Le Houx
+    given-names: James
+    orcid: "https://orcid.org/0000-0002-1576-0673"
+    affiliation: "BASE Laboratory, School of Engineering, University of Greenwich; ISIS Neutron and Muon Source, Rutherford Appleton Laboratory; The Faraday Institution"
+keywords:
+  - porous media
+  - diffusion models
+  - battery electrodes
+  - x-ray computed tomography
+  - synchrotron
+  - virtual compression
