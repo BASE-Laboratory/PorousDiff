@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -563,6 +564,7 @@ def export_openimpala_tiff(
     pore_label: int = 0,
     solid_label: int = 1,
     preserve_multiphase: bool = False,
+    voxel_size_um: float | None = None,
 ) -> Path:
     """Export a 3D multi-page `uint8` TIFF stack formatted for OpenImpala transport solvers.
 
@@ -572,6 +574,13 @@ def export_openimpala_tiff(
     """
     import basecoat
 
+    warnings.warn(
+        "export_openimpala_tiff is deprecated under ECOSYSTEM.md and scheduled for removal; "
+        "prefer porousdiff.io.export_volume_ome_zarr (or basecoat.write_ome_zarr) so physical "
+        "spacing and labels/phase travel directly into OpenImpala v5.1+ and SMS.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     vol = np.asarray(volume)
     if vol.ndim != 3:
         raise ValueError(f"Expected 3D volume (Z, Y, X), got shape {vol.shape}")
@@ -581,5 +590,10 @@ def export_openimpala_tiff(
         mapped = np.where(vol > 0, solid_label, pore_label).astype(np.uint8)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    basecoat.write_volume( basecoat.Volume.from_array(mapped), output_path )
+    bc_vol = (
+        basecoat.Volume.from_array(mapped, voxel_size_um=float(voxel_size_um))
+        if voxel_size_um is not None
+        else basecoat.Volume.from_array(mapped)
+    )
+    basecoat.write_volume(bc_vol, output_path)
     return output_path

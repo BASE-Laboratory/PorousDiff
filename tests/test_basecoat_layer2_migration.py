@@ -110,3 +110,18 @@ def test_direct_openimpala_v51_handoff_and_si_ssa_calibration(tmp_path: Path) ->
     )
     assert len(rows) == 4
     assert (suite_dir / "parity.csv").is_file()
+
+
+def test_deprecated_export_openimpala_tiff_warns_and_calibrates(tmp_path: Path) -> None:
+    """`export_openimpala_tiff` emits a DeprecationWarning and optionally embeds `voxel_size_um`."""
+    from porousdiff.metrics import export_openimpala_tiff
+
+    vol = np.zeros((8, 8, 8), dtype=np.uint8)
+    vol[:, 2:6, 2:6] = 1
+    out_tif = tmp_path / "legacy_cal.tif"
+    with pytest.warns(DeprecationWarning, match="export_openimpala_tiff is deprecated"):
+        export_openimpala_tiff(vol, out_tif, voxel_size_um=1.25)
+    loaded = basecoat.read_volume(out_tif)
+    assert np.array_equal(loaded.data, vol)
+    assert loaded.spacing_in("um") == pytest.approx((1.25, 1.25, 1.25))
+
